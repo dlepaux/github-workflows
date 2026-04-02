@@ -1,0 +1,48 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      webhook-url:
+        description: Deploy webhook URL
+        type: string
+        default: https://webhook.lepaux.com/deploy
+      retries:
+        description: Number of retry attempts
+        type: number
+        default: 3
+      retry-delay:
+        description: Delay between retries in seconds
+        type: number
+        default: 30
+    secrets:
+      webhook-key:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deploy webhook
+        run: |
+          for attempt in $(seq 1 ${{ inputs.retries }}); do
+            echo "Deploy attempt ${attempt}/${{ inputs.retries }}..."
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 30 -X POST \
+              -H "Authorization: Bearer ${{ secrets.webhook-key }}" \
+              ${{ inputs.webhook-url }})
+
+            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+              echo "Deploy successful (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+
+            echo "Deploy failed (HTTP $HTTP_CODE)"
+            if [ "$attempt" -lt "${{ inputs.retries }}" ]; then
+              echo "Retrying in ${{ inputs.retry-delay }}s..."
+              sleep ${{ inputs.retry-delay }}
+            fi
+          done
+          echo "Deploy failed after ${{ inputs.retries }} attempts"
+          exit 1
+        continue-on-error: true

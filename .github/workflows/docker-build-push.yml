@@ -1,0 +1,49 @@
+name: Docker Build & Push
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Full image name including registry (e.g. ghcr.io/dlepaux/myapp)
+        type: string
+        required: true
+      version:
+        description: Version tag without v prefix (empty = no version tag)
+        type: string
+        default: ''
+      build-args:
+        description: Docker build args as multiline KEY=VALUE (one per line)
+        type: string
+        default: ''
+    secrets:
+      github-token:
+        required: true
+
+jobs:
+  docker:
+    runs-on: [self-hosted, homelab]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.github-token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build Docker image
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          TAGS="-t ${{ inputs.image-name }}:latest -t ${{ inputs.image-name }}:sha-${SHORT_SHA}"
+          if [ -n "${{ inputs.version }}" ]; then
+            TAGS="${TAGS} -t ${{ inputs.image-name }}:${{ inputs.version }}"
+          fi
+          BUILD_ARGS=""
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            BUILD_ARGS="${BUILD_ARGS} --build-arg ${line}"
+          done <<< "${{ inputs.build-args }}"
+          docker build ${BUILD_ARGS} ${TAGS} .
+
+      - name: Push Docker image
+        run: docker push --all-tags ${{ inputs.image-name }}

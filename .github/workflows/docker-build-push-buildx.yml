@@ -1,0 +1,73 @@
+name: Docker Build & Push (Buildx)
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name without registry (e.g. dlepaux/7studio-comfyui)
+        type: string
+        required: true
+      version:
+        description: Version tag without v prefix (empty = no version tag)
+        type: string
+        default: ''
+      platforms:
+        description: Target platforms (e.g. linux/arm64, linux/amd64)
+        type: string
+        default: linux/arm64
+      free-disk-space:
+        description: Free disk space before build (for large images like CUDA)
+        type: boolean
+        default: false
+    secrets:
+      github-token:
+        required: true
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        if: inputs.free-disk-space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.github-token }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ inputs.image-name }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+            ${{ inputs.version != '' && format('type=raw,value={0}', inputs.version) || '' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: ${{ inputs.platforms }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

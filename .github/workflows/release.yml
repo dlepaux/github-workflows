@@ -1,0 +1,64 @@
+name: Semantic Release
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version for semantic-release
+        type: number
+        default: 22
+    outputs:
+      released:
+        description: Whether a new version was released (true/false)
+        value: ${{ jobs.release.outputs.released }}
+      version:
+        description: The new version number (without v prefix)
+        value: ${{ jobs.release.outputs.version }}
+    secrets:
+      github-token:
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.version.outputs.released }}
+      version: ${{ steps.version.outputs.version }}
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Get version before release
+        id: before
+        run: echo "tag=$(git describe --tags --abbrev=0 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+
+      - name: Semantic release
+        env:
+          GITHUB_TOKEN: ${{ secrets.github-token }}
+          HUSKY: '0'
+        run: npx semantic-release
+
+      - name: Get version after release
+        id: version
+        env:
+          GITHUB_TOKEN: ${{ secrets.github-token }}
+        run: |
+          git fetch --tags https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          VERSION=${TAG#v}
+          RELEASED=$( [ "$TAG" != "${{ steps.before.outputs.tag }}" ] && echo true || echo false )
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "released=${RELEASED}" >> "$GITHUB_OUTPUT"
