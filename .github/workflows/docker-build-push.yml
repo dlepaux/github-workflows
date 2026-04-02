@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       image-name:
-        description: Full image name including registry (e.g. ghcr.io/dlepaux/myapp)
+        description: Full image name including registry
         type: string
         required: true
       version:

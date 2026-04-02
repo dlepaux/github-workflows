@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       image-name:
-        description: Image name without registry (e.g. dlepaux/7studio-comfyui)
+        description: Full image name including registry
         type: string
         required: true
       version:
@@ -12,7 +12,7 @@ on:
         type: string
         default: ''
       platforms:
-        description: Target platforms (e.g. linux/arm64, linux/amd64)
+        description: Target platforms
         type: string
         default: linux/arm64
       free-disk-space:
@@ -55,7 +55,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ inputs.image-name }}
+          images: ${{ inputs.image-name }}
           tags: |
             type=raw,value=latest
             type=sha
