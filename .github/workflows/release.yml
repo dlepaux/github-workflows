@@ -14,9 +14,6 @@ on:
       version:
         description: The new version number (without v prefix)
         value: ${{ jobs.release.outputs.version }}
-    secrets:
-      github-token:
-        required: true
 
 jobs:
   release:
@@ -47,14 +44,14 @@ jobs:
 
       - name: Semantic release
         env:
-          GITHUB_TOKEN: ${{ secrets.github-token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HUSKY: '0'
         run: npx semantic-release
 
       - name: Get version after release
         id: version
         env:
-          GITHUB_TOKEN: ${{ secrets.github-token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git fetch --tags https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")

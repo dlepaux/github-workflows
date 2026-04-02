@@ -19,9 +19,6 @@ on:
         description: Free disk space before build (for large images like CUDA)
         type: boolean
         default: false
-    secrets:
-      github-token:
-        required: true
 
 jobs:
   docker:
@@ -49,7 +46,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.github-token }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
