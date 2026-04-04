@@ -27,17 +27,23 @@ jobs:
         run: |
           for attempt in $(seq 1 ${{ inputs.retries }}); do
             echo "Deploy attempt ${attempt}/${{ inputs.retries }}..."
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              --max-time 30 -X POST \
+            RESPONSE=$(mktemp)
+            HTTP_CODE=$(curl -s -o "$RESPONSE" -w "%{http_code}" \
+              --max-time 180 -X POST \
               -H "Authorization: Bearer ${{ secrets.webhook-key }}" \
               ${{ inputs.webhook-url }})
 
             if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
               echo "Deploy successful (HTTP $HTTP_CODE)"
+              cat "$RESPONSE"
+              rm -f "$RESPONSE"
               exit 0
             fi
 
-            echo "Deploy failed (HTTP $HTTP_CODE)"
+            echo "Deploy failed (HTTP $HTTP_CODE):"
+            cat "$RESPONSE"
+            rm -f "$RESPONSE"
+
             if [ "$attempt" -lt "${{ inputs.retries }}" ]; then
               echo "Retrying in ${{ inputs.retry-delay }}s..."
               sleep ${{ inputs.retry-delay }}
@@ -45,4 +51,3 @@ jobs:
           done
           echo "Deploy failed after ${{ inputs.retries }} attempts"
           exit 1
-        continue-on-error: true
