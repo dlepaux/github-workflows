@@ -7,6 +7,10 @@ on:
         description: Deploy webhook URL
         type: string
         default: https://webhook.lepaux.com/deploy
+      environment:
+        description: GitHub environment (triggers protection rules when set)
+        type: string
+        default: ''
       retries:
         description: Number of retry attempts
         type: number
@@ -22,6 +26,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || null }}
     steps:
       - name: Trigger deploy webhook
         run: |
