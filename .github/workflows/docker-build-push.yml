@@ -38,6 +38,9 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Build Docker image
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           TAGS="-t ${{ inputs.image-name }}:latest -t ${{ inputs.image-name }}:sha-${SHORT_SHA}"
@@ -50,7 +53,7 @@ jobs:
             BUILD_ARGS="${BUILD_ARGS} --build-arg ${line}"
           done <<< "${{ inputs.build-args }}"
           if [ "${{ inputs.inject-npm-token }}" = "true" ]; then
-            BUILD_ARGS="${BUILD_ARGS} --build-arg NODE_AUTH_TOKEN=${GITHUB_TOKEN}"
+            BUILD_ARGS="${BUILD_ARGS} --build-arg NODE_AUTH_TOKEN=${NPM_TOKEN:-${GITHUB_TOKEN}}"
           fi
           DOCKER_BUILDKIT=1 docker build ${BUILD_ARGS} ${TAGS} .
 
