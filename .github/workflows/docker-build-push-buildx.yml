@@ -19,29 +19,17 @@ on:
         description: Docker build args as multiline KEY=VALUE (one per line)
         type: string
         default: ''
-      free-disk-space:
-        description: Free disk space before build (for large images like CUDA)
-        type: boolean
-        default: false
 
 jobs:
   docker:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, homelab]
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v6
 
-      - name: Free disk space
-        if: inputs.free-disk-space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: false
+      - uses: docker/setup-qemu-action@v4
 
       - uses: docker/setup-buildx-action@v4
 
@@ -71,5 +59,4 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ inputs.build-args }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No GHA cache on self-hosted — Docker layer cache is local
