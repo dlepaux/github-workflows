@@ -19,10 +19,14 @@ on:
         description: Docker build args as multiline KEY=VALUE (one per line)
         type: string
         default: ''
+      runner:
+        description: Runner to use (default self-hosted ARM64, override with ubuntu-latest for heavy amd64 builds)
+        type: string
+        default: '["self-hosted", "homelab"]'
 
 jobs:
   docker:
-    runs-on: [self-hosted, homelab]
+    runs-on: ${{ fromJSON(inputs.runner) }}
     permissions:
       contents: read
       packages: write
