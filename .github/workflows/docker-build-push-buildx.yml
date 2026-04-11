@@ -15,6 +15,10 @@ on:
         description: Target platforms (comma-separated)
         type: string
         default: linux/amd64,linux/arm64
+      build-args:
+        description: Docker build args as multiline KEY=VALUE (one per line)
+        type: string
+        default: ''
       free-disk-space:
         description: Free disk space before build (for large images like CUDA)
         type: boolean
@@ -66,5 +70,6 @@ jobs:
           platforms: ${{ inputs.platforms }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ inputs.build-args }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
