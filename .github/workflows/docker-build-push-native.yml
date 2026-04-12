@@ -15,10 +15,6 @@ on:
         description: Version tag without v prefix (empty = no version tag)
         type: string
         default: ''
-      platforms:
-        description: Target platforms (comma-separated)
-        type: string
-        default: linux/amd64,linux/arm64
       build-args:
         description: Docker build args as multiline KEY=VALUE (one per line)
         type: string
@@ -35,7 +31,6 @@ jobs:
           - platform: linux/arm64
             runner: '["self-hosted", "homelab", "ARM64"]'
     runs-on: ${{ fromJSON(matrix.runner) }}
-    if: contains(inputs.platforms, matrix.platform)
     permissions:
       contents: read
       packages: write
