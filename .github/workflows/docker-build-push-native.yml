@@ -21,7 +21,11 @@ on:
         default: ''
 
 jobs:
+  wake:
+    uses: dlepaux/github-workflows/.github/workflows/wake-compute.yml@main
+
   build:
+    needs: wake
     strategy:
       fail-fast: true
       matrix:

@@ -68,6 +68,22 @@ docker:
   secrets: inherit
 ```
 
+### wake-compute.yml
+
+Wakes srv-compute via WoL before X64 runner jobs. Runs on srv-core (ARM64, always on), calls the WoL HTTP relay on the Pi 3, polls node_exporter until srv-compute is reachable.
+
+| | |
+|---|---|
+| **Runner** | `[self-hosted, homelab, ARM64]` |
+| **Secrets** | None — token read from `/opt/github-runner/.wol-token` (Ansible-managed) |
+
+Used internally by `docker-build-push-native.yml`. Can also be called directly:
+
+```yaml
+wake:
+  uses: dlepaux/github-workflows/.github/workflows/wake-compute.yml@main
+```
+
 ### deploy.yml
 
 Webhook deploy with configurable retry logic.

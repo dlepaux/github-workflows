@@ -1,0 +1,37 @@
+name: Wake srv-compute
+
+# Reusable workflow to wake srv-compute via WoL before X64 runner jobs.
+# Runs on srv-core (ARM64, always on), calls the WoL HTTP relay on the Pi 3,
+# then polls node_exporter until srv-compute is reachable.
+#
+# No secrets needed — the WoL token is deployed to /opt/github-runner/.wol-token
+# by Ansible (github-runner role with github_runner_wol_token: true).
+
+on:
+  workflow_call:
+
+jobs:
+  wake:
+    runs-on: [self-hosted, homelab, ARM64]
+    timeout-minutes: 5
+    steps:
+      - name: Send wake packet
+        run: |
+          token=$(cat /opt/github-runner/.wol-token)
+          response=$(curl -sf --connect-timeout 5 --max-time 10 \
+            -X POST http://192.168.1.41:9090/wake \
+            -H "Authorization: Bearer ${token}")
+          echo "WoL relay response: ${response}"
+
+      - name: Wait for srv-compute to come online
+        run: |
+          echo "Waiting for srv-compute (192.168.1.40) ..."
+          for i in $(seq 1 30); do
+            if curl -sf --connect-timeout 3 --max-time 5 http://192.168.1.40:9100/metrics > /dev/null 2>&1; then
+              echo "srv-compute is online after ~$((i * 10))s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::srv-compute did not come online within 300s"
+          exit 1
