@@ -68,6 +68,12 @@ jobs:
 
       - name: Export digest
         run: |
+          # Self-hosted runners persist /tmp across jobs; wipe stale digest
+          # files from prior runs so upload-artifact only picks up this
+          # run's digest. Without this, the merge step tries to create a
+          # manifest referencing digests that GHCR has already garbage-
+          # collected, failing with "not found".
+          rm -rf /tmp/digests
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
@@ -87,6 +93,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Clean workspace
+        # Same rationale as the build job's Export digest step — prevent a
+        # previous run's digest files from slipping into the manifest.
+        run: rm -rf /tmp/digests
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
