@@ -64,6 +64,13 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ inputs.build-args }}
+          # Supply-chain attestations: SBOM (what's inside) + provenance
+          # (how it was built). Adds ~30s per arch build; carried into the
+          # final multi-arch manifest because each per-arch image is pushed
+          # with its own attestation manifest, and `imagetools create` in
+          # the merge step preserves them.
+          sbom: true
+          provenance: mode=max
           outputs: type=image,name=${{ inputs.image-name }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
