@@ -108,7 +108,7 @@ Full CI pipeline for Rust services that ship a binary + Docker image to GHCR and
 
 | | |
 |---|---|
-| **Runner** | `[self-hosted, Linux, ARM64, <runner_host>]` |
+| **Runner** | `[self-hosted, Linux, ARM64, homelab]` (floats across srv-core + srv-apps) |
 | **Cache** | Persistent `CARGO_TARGET_DIR` + `CARGO_HOME` from `runner.env` — no `actions/cache` |
 | **Jobs** | `build-and-gate`, `test-coverage`, `asyncapi-drift` (optional), `trivy`, `release`, `docker` |
 
@@ -122,7 +122,6 @@ Full CI pipeline for Rust services that ship a binary + Docker image to GHCR and
 | `has_asyncapi` | boolean | `false` | Enable `asyncapi-drift` job |
 | `coverage_floor` | number | `70` | Workspace line coverage gate (percent) |
 | `deploy_webhook` | boolean | `true` | Trigger homelab-webhook deploy step |
-| `runner_host` | string | `homelab` | Runner label — `homelab` (float), `host-srv-core`, `host-srv-apps` (pinned) |
 
 **Secrets:** `HOMELAB_WEBHOOK_URL`, `WEBHOOK_DEPLOY_KEY` (only consumed when `deploy_webhook: true`).
 
@@ -154,7 +153,7 @@ CI pipeline for kellnr-published Rust library crates. No Docker, no deploy. Used
 
 | | |
 |---|---|
-| **Runner** | `[self-hosted, Linux, ARM64, <runner_host>]` |
+| **Runner** | `[self-hosted, Linux, ARM64, homelab]` (floats across srv-core + srv-apps) |
 | **Cache** | Persistent `CARGO_TARGET_DIR` + `CARGO_HOME` from `runner.env` — no `actions/cache` |
 | **Jobs** | `build-and-gate`, `test-coverage`, `trivy`, `release`, `publish` |
 
@@ -164,7 +163,6 @@ CI pipeline for kellnr-published Rust library crates. No Docker, no deploy. Used
 |---|---|---|---|
 | `crate_name` | string | required | Crate name as in `Cargo.toml`, e.g. `gordon-protocol` |
 | `publish_to_kellnr` | boolean | `true` | Run `cargo publish --registry kellnr` after release |
-| `runner_host` | string | `homelab` | Runner label — same semantics as `rust-service.yml` |
 
 **Secrets:** none — kellnr token lives in `CARGO_HOME/config.toml` on the runner (Ansible-managed, not a GitHub secret).
 

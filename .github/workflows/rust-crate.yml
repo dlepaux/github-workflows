@@ -34,13 +34,10 @@ on:
         description: Run `cargo publish` to kellnr after a successful release
         type: boolean
         default: true
-      runner_host:
-        description: >
-          Runner label segment — 'homelab' floats across all homelab runners,
-          'host-srv-core' or 'host-srv-apps' pins to a specific host
-          (Story 08 mechanism).
-        type: string
-        default: homelab
+    # NOTE: dropped runner_host input in v1.x — mixing literal + ${{ }}
+    # expression in `runs-on: [...]` fails workflow_call validation
+    # (startup_failure). All jobs run on [self-hosted, Linux, ARM64,
+    # homelab] which floats across both srv-core and srv-apps.
 
 permissions:
   contents: write
@@ -59,7 +56,7 @@ jobs:
   # Compile + lint that share warm target/. Persistent CARGO_TARGET_DIR
   # (runner.env) keeps incremental compile state across runs.
   build-and-gate:
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -138,7 +135,7 @@ jobs:
   # Coverage runs in parallel with build-and-gate (no `needs:`). Uses
   # the persistent target-llvm-cov dir provisioned by the runner role.
   test-coverage:
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -171,7 +168,7 @@ jobs:
           fi
 
   trivy:
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     steps:
       - uses: actions/checkout@v6
       - name: Trivy fs scan
@@ -182,7 +179,7 @@ jobs:
     if: |
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push'
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -224,7 +221,7 @@ jobs:
   publish:
     needs: release
     if: needs.release.outputs.released == 'true' && inputs.publish_to_kellnr
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup

@@ -49,13 +49,14 @@ on:
         description: Trigger the homelab-webhook deploy step after docker push
         type: boolean
         default: true
-      runner_host:
-        description: >
-          Runner label segment — 'homelab' floats across all homelab runners,
-          'host-srv-core' or 'host-srv-apps' pins to a specific host
-          (Story 08 mechanism).
-        type: string
-        default: homelab
+    # NOTE on host pinning: dropped the `runner_host` input from v1.x —
+    # mixing literal and ${{ }} expression in `runs-on: [...]` fails GHA
+    # workflow_call validation with startup_failure. The supported shape
+    # is either a plain list (used here) or `${{ fromJSON(inputs.json) }}`
+    # (heavier caller surface). All jobs run on `[self-hosted, Linux,
+    # ARM64, homelab]` — floats across srv-core + srv-apps. Per-host
+    # pinning returns in a future major when the triage daemon (Story 09)
+    # makes the decision and the reusable accepts a JSON-encoded list.
     secrets:
       HOMELAB_WEBHOOK_URL:
         required: false
@@ -82,7 +83,7 @@ jobs:
   # keeps incremental compile state across runs — cargo's fingerprint
   # tracking handles staleness.
   build-and-gate:
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -197,7 +198,7 @@ jobs:
   # the persistent target-llvm-cov dir provisioned by the runner role —
   # second run after a Cargo.lock-unchanged push compiles incrementally.
   test-coverage:
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -268,7 +269,7 @@ jobs:
 
   asyncapi-drift:
     if: inputs.has_asyncapi
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     steps:
       - uses: actions/checkout@v6
       # NODE_AUTH_TOKEN set via runner env (homelab/roles/github-runner).
@@ -289,7 +290,7 @@ jobs:
           fi
 
   trivy:
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     steps:
       - uses: actions/checkout@v6
       - name: Trivy fs scan
@@ -308,7 +309,7 @@ jobs:
       needs.trivy.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push'
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -350,7 +351,7 @@ jobs:
   docker:
     needs: release
     if: needs.release.outputs.released == 'true'
-    runs-on: [self-hosted, Linux, ARM64, "${{ inputs.runner_host }}"]
+    runs-on: [self-hosted, Linux, ARM64, homelab]
     permissions:
       contents: read
       packages: write
