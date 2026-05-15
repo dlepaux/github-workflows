@@ -1,23 +1,433 @@
 name: Rust Service CI
 
+# CI shape for Gordon Rust services (post 2026-05-15 ci-perf-overhaul):
+#
+# - Self-hosted runner on srv-core (Pi5, ARM64). Persistent
+#   /var/cache/gordon-ci/<repo>/target/ + shared /var/cache/gordon-ci/cargo/
+#   are owned by the homelab role (homelab/roles/github-runner). No
+#   actions/cache calls — local SSD is the cache. CARGO_HOME +
+#   CARGO_TARGET_DIR come from runner.env.
+# - build-and-gate: single job — grep lints, fmt, build, clippy, deny,
+#   optional OpenAPI drift, release binary upload. target/ stays warm
+#   in-process via the persistent CARGO_TARGET_DIR.
+# - test-coverage: separate job (instrumented profile is target-
+#   incompatible). Uses its own persistent
+#   /var/cache/gordon-ci/<repo>/target-llvm-cov/. Runs in parallel with
+#   build-and-gate.
+# - asyncapi-drift: optional job, gated on `inputs.has_asyncapi`.
+# - trivy: filesystem scan, runs in parallel.
+# - release: semantic-release on push to main; gates docker.
+# - docker: prebuilt binary from build-and-gate artifact → distroless
+#   image → trivy image scan → homelab-webhook deploy trigger.
+#
+# Caller pins at a tag: uses: dlepaux/github-workflows/.github/workflows/rust-service.yml@v1.0.0
+
 on:
   workflow_call:
     inputs:
-      binary_name: { type: string, required: true }
-      service_port: { type: number, required: true }
-      has_openapi: { type: boolean, default: false }
-      has_asyncapi: { type: boolean, default: false }
-      coverage_floor: { type: number, default: 70 }
-      deploy_webhook: { type: boolean, default: true }
+      binary_name:
+        description: Rust binary name (e.g. gordon-manager)
+        type: string
+        required: true
+      service_port:
+        description: Service HTTP port — passed as SERVICE_PORT Docker build-arg and EXPOSE
+        type: number
+        required: true
+      has_openapi:
+        description: Gate the OpenAPI drift check step in build-and-gate
+        type: boolean
+        default: false
+      has_asyncapi:
+        description: Gate the asyncapi-drift job
+        type: boolean
+        default: false
+      coverage_floor:
+        description: Workspace line coverage gate (percent, integer)
+        type: number
+        default: 70
+      deploy_webhook:
+        description: Trigger the homelab-webhook deploy step after docker push
+        type: boolean
+        default: true
+    # NOTE on host pinning: dropped the `runner_host` input from v1.x —
+    # mixing literal and ${{ }} expression in `runs-on: [...]` fails GHA
+    # workflow_call validation with startup_failure. The supported shape
+    # is either a plain list (used here) or `${{ fromJSON(inputs.json) }}`
+    # (heavier caller surface). All jobs run on `[self-hosted, Linux,
+    # ARM64, homelab]` — floats across srv-core + srv-apps. Per-host
+    # pinning returns in a future major when the triage daemon (Story 09)
+    # makes the decision and the reusable accepts a JSON-encoded list.
     secrets:
-      HOMELAB_WEBHOOK_URL: { required: false }
-      WEBHOOK_DEPLOY_KEY: { required: false }
+      HOMELAB_WEBHOOK_URL:
+        required: false
+      WEBHOOK_DEPLOY_KEY:
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  packages: write
+
+# Serialise per-ref. Different refs (branch PRs vs main) run in parallel;
+# within a single ref, queue rather than overlap — the persistent target/
+# is per-repo, not per-ref, and concurrent builds would contend on cargo's
+# advisory locks.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  smoke:
+  # Compile + lint + drift gates that share warm target/. One job, one
+  # checkout, one target/ pass. Persistent CARGO_TARGET_DIR (runner.env)
+  # keeps incremental compile state across runs — cargo's fingerprint
+  # tracking handles staleness.
+  build-and-gate:
     runs-on: [self-hosted, Linux, ARM64, homelab]
+    env:
+      PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+      RUSTUP_HOME: /home/github-runner/.rustup
+      # CARGO_HOME + CARGO_TARGET_DIR inherited from runner.env (homelab role).
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Sanity check persistent cache paths
+        run: |
+          set -eu
+          test -n "$CARGO_HOME" || { echo "::error::CARGO_HOME not set by runner.env"; exit 1; }
+          test -n "$CARGO_TARGET_DIR" || { echo "::error::CARGO_TARGET_DIR not set by runner.env"; exit 1; }
+          test -w "$CARGO_HOME" -a -w "$CARGO_TARGET_DIR" || { echo "::error::Persistent cache paths not writable"; exit 1; }
+          test -f "$CARGO_HOME/config.toml" || { echo "::error::Missing $CARGO_HOME/config.toml (kellnr registry config)"; exit 1; }
+          echo "CARGO_HOME=$CARGO_HOME"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+
+      # Grep-based lints are tree-only — run them before any compile so
+      # they fail fast on style regressions.
+      - name: Grep-based lints
+        run: |
+          set -e
+          echo "::group::forbid(unsafe_code) check"
+          found=0
+          for lib in src/lib.rs src/main.rs crates/*/src/lib.rs crates/*/src/main.rs; do
+            [ -f "$lib" ] || continue
+            grep -qE '^#!\[forbid\(unsafe_code\)\]' "$lib" || { echo "::error file=$lib::Missing #![forbid(unsafe_code)]"; exit 1; }
+            found=1
+          done
+          [ "$found" = "1" ] || { echo "::error::No crate root found to check for forbid(unsafe_code)"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::banned #[allow] at file/module scope"
+          ! grep -rnE '^#!\[allow' src/ crates/*/src 2>/dev/null || { echo "::error::Crate-level #![allow] is banned"; exit 1; }
+          offending=$(grep -rnE '^#\[allow' src/ crates/*/src 2>/dev/null | grep -v '// allow:' || true)
+          [ -z "$offending" ] || { echo "::error::Module-scope #[allow] without '// allow: <reason>' comment"; echo "$offending"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::no println!/eprintln! (comments + // allow-println: exempt)"
+          if grep -rnE '\b(println|eprintln)!' src/ crates/*/src 2>/dev/null | grep -vE '^\S+:\s*[0-9]+:\s*(//|/\*|\s*\*)' | grep -v '// allow-println:'; then
+            echo "::error::Use tracing, not println!/eprintln! (mark legitimate uses with // allow-println: <reason>)"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::TODO format"
+          bad=$(grep -rnE 'TODO([^(]|$)' src/ crates/*/src 2>/dev/null | grep -vE '^\S+:\s*[0-9]+:\s*(//|/\*|\s*\*)' || true)
+          [ -z "$bad" ] || { echo "::error::TODOs must be formatted TODO(@author, #issue): ..."; echo "$bad"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::module size"
+          find src crates/*/src -name '*.rs' 2>/dev/null | while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            lines=$(wc -l < "$f")
+            if [ "$lines" -gt 1000 ]; then
+              echo "::error file=$f::Module exceeds 1000 lines ($lines). Split it."
+              exit 1
+            fi
+          done
+          echo "::endgroup::"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # Default features only. Research-only feature flags (e.g. monte-carlo)
+      # pull heavy optional deps not provisioned on srv-core ARM64.
+      # --all-features would silently violate that constraint.
+      - name: Build workspace (debug, all-targets)
+        run: cargo build --all-targets --workspace
+
+      - name: Clippy
+        run: cargo clippy --all-targets --workspace -- -D warnings -W clippy::pedantic -W clippy::nursery
+
+      - name: cargo-deny
+        run: cargo deny check
+
+      # Debug binary — OpenAPI export is pure utoipa codegen, no
+      # optimization-sensitive code path. Saves ~5 min vs --release.
+      - name: OpenAPI spec drift check
+        if: inputs.has_openapi
+        run: |
+          set -eu
+          TMP="${RUNNER_TEMP:-/tmp}/openapi-$$.json"
+          cargo run --bin ${{ inputs.binary_name }} -- openapi export "$TMP" 2>/dev/null
+          if ! diff -q "$TMP" openapi.json >/dev/null; then
+            echo "::error::OpenAPI spec drift detected in openapi.json. Run: cargo run --bin ${{ inputs.binary_name }} -- openapi export openapi.json"
+            diff -u openapi.json "$TMP" | head -80 || true
+            exit 1
+          fi
+
+      # Release binary feeds the docker job via workflow artifact.
+      # Dockerfile's `runtime-prebuilt` target COPYs it directly into
+      # distroless — no in-image cargo compile.
+      - name: Build release binary
+        run: |
+          cargo build --release --bin ${{ inputs.binary_name }}
+          # Copy out of CARGO_TARGET_DIR (which lives outside the workspace)
+          # into the workspace so upload-artifact can reach it without an
+          # explicit absolute-path mapping.
+          mkdir -p artifact
+          cp "$CARGO_TARGET_DIR/release/${{ inputs.binary_name }}" artifact/${{ inputs.binary_name }}
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.binary_name }}-release-arm64
+          path: artifact/${{ inputs.binary_name }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # Coverage runs in parallel with build-and-gate (no `needs:`). Uses
+  # the persistent target-llvm-cov dir provisioned by the runner role —
+  # second run after a Cargo.lock-unchanged push compiles incrementally.
+  test-coverage:
+    runs-on: [self-hosted, Linux, ARM64, homelab]
+    env:
+      PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+      RUSTUP_HOME: /home/github-runner/.rustup
+    steps:
+      - uses: actions/checkout@v6
+
+      # Per-run Postgres. Integration tests require a live database; they
+      # short-circuit via test_postgres_available() without it, which
+      # silently drops handlers and reconciler code out of coverage.
+      - name: Start test Postgres
+        id: postgres
+        run: |
+          NAME="gordon-postgres-test-${{ github.run_id }}-${{ github.run_attempt }}"
+          PORT=$((5433 + (${{ github.run_id }} % 1000)))
+          docker rm -f "$NAME" 2>/dev/null || true
+          docker run -d --name "$NAME" \
+            -p "$PORT:5432" \
+            -e POSTGRES_USER=gordon_test \
+            -e POSTGRES_PASSWORD=gordon_test_dev \
+            -e POSTGRES_DB=postgres \
+            postgres:16-alpine \
+            -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+          ready=false
+          for i in {1..30}; do
+            if docker exec "$NAME" pg_isready -U gordon_test -d postgres; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          $ready || { echo "Postgres not ready after 30 attempts"; exit 1; }
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+
+      # cargo-llvm-cov 0.8.5's --fail-under-lines flag silent-passes
+      # regardless of threshold (gate theatre from 2026-04-13 to 2026-04-18).
+      # Parse the JSON summary and assert the threshold ourselves — same
+      # pattern as .githooks/pre-push, version-robust on the JSON schema.
+      #
+      # CARGO_TARGET_DIR overridden in the step env to point at the
+      # persistent llvm-cov dir provisioned by the runner role. (cargo-
+      # llvm-cov has no --target-dir CLI flag; it honours the env var.)
+      # Source-only changes after a warm cache rebuild incrementally
+      # instead of compiling the whole workspace under the instrumented
+      # profile.
+      - name: Coverage (drives test compile + run)
+        env:
+          GORDON_TEST_DATABASE_URL: postgres://gordon_test:gordon_test_dev@localhost:${{ steps.postgres.outputs.port }}/postgres
+          CARGO_TARGET_DIR: /var/cache/gordon-ci/${{ inputs.binary_name }}/target-llvm-cov
+        run: |
+          set -eu
+          test -d "$CARGO_TARGET_DIR" || { echo "::error::Missing persistent target-llvm-cov dir at $CARGO_TARGET_DIR"; exit 1; }
+          COV_JSON=$(cargo llvm-cov --workspace --summary-only --json)
+          COV_PCT=$(printf '%s' "$COV_JSON" | jq '.data[0].totals.lines.percent')
+          if awk "BEGIN { exit ($COV_PCT >= ${{ inputs.coverage_floor }}) ? 0 : 1 }"; then
+            printf 'OK: workspace line coverage %.2f%% >= ${{ inputs.coverage_floor }}%%\n' "$COV_PCT"
+          else
+            printf 'FAIL: workspace line coverage %.2f%% < ${{ inputs.coverage_floor }}%% required\n' "$COV_PCT" >&2
+            printf '%s' "$COV_JSON" | jq -r '.data[0].files[] | [.filename, .summary.lines.percent] | @tsv' \
+              | sort -t$'\t' -k2 -n \
+              | awk -F'\t' '{ printf "  %5.1f%%  %s\n", $2, $1 }' >&2
+            exit 1
+          fi
+
+      - name: Stop test Postgres
+        if: always()
+        run: docker rm -f "${{ steps.postgres.outputs.name }}" || true
+
+  asyncapi-drift:
+    if: inputs.has_asyncapi
+    runs-on: [self-hosted, Linux, ARM64, homelab]
+    steps:
+      - uses: actions/checkout@v6
+      # NODE_AUTH_TOKEN set via runner env (homelab/roles/github-runner).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Bundle drift check
+        if: hashFiles('asyncapi.yaml') != '' && hashFiles('asyncapi.bundled.yaml') != ''
+        run: |
+          set -eu
+          npm install --prefer-offline --no-audit --no-fund
+          TMP="${RUNNER_TEMP:-/tmp}/bundled-$$.yaml"
+          npx -y -p @asyncapi/cli@latest asyncapi bundle asyncapi.yaml -o "$TMP" >/dev/null
+          if ! diff -q "$TMP" asyncapi.bundled.yaml >/dev/null; then
+            echo "::error::asyncapi.bundled.yaml is out of date. Run: npx @asyncapi/cli bundle asyncapi.yaml -o asyncapi.bundled.yaml"
+            diff -u asyncapi.bundled.yaml "$TMP" | head -60 || true
+            exit 1
+          fi
+
+  trivy:
+    runs-on: [self-hosted, Linux, ARM64, homelab]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Trivy fs scan
+        run: trivy fs --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed .
+
+  release:
+    needs: [build-and-gate, test-coverage, asyncapi-drift, trivy]
+    # asyncapi-drift is skipped when has_asyncapi=false; `result` is
+    # 'skipped' not 'success', so always() is required. The actual gate
+    # is the failure of other required jobs.
+    if: |
+      always() &&
+      needs.build-and-gate.result == 'success' &&
+      needs.test-coverage.result == 'success' &&
+      (needs.asyncapi-drift.result == 'success' || needs.asyncapi-drift.result == 'skipped') &&
+      needs.trivy.result == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push'
+    runs-on: [self-hosted, Linux, ARM64, homelab]
+    env:
+      PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+      RUSTUP_HOME: /home/github-runner/.rustup
     permissions:
       contents: write
       packages: write
+    outputs:
+      released: ${{ steps.semrel.outputs.new_release_published }}
+      version: ${{ steps.semrel.outputs.new_release_version }}
+      tag: ${{ steps.semrel.outputs.new_release_git_tag }}
     steps:
-      - run: echo "iter4 — permissions at job level"
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # cargo-edit pre-installed by Ansible ci-toolchain role; this is a
+      # belt-and-braces install for first-run hosts.
+      - name: Ensure cargo-edit
+        run: command -v cargo-set-version >/dev/null 2>&1 || cargo install cargo-edit --locked
+
+      - name: Run semantic-release
+        id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          semantic_version: 24
+          extra_plugins: |
+            @semantic-release/changelog@6
+            @semantic-release/exec@6
+            @semantic-release/git@10
+            conventional-changelog-conventionalcommits@8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: [self-hosted, Linux, ARM64, homelab]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      # Pull the release binary built by build-and-gate. Dockerfile's
+      # `runtime-prebuilt` target COPYs it directly into distroless —
+      # no in-image cargo compile.
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.binary_name }}-release-arm64
+          path: ./artifact
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -eu
+          BASE="ghcr.io/${{ github.repository_owner }}/${{ inputs.binary_name }}"
+          VERSION="${{ needs.release.outputs.version }}"
+          MAJOR_MINOR=$(echo "$VERSION" | awk -F. '{print $1"."$2}')
+          MAJOR=$(echo "$VERSION" | awk -F. '{print $1}')
+          echo "tags=${BASE}:${VERSION},${BASE}:${MAJOR_MINOR},${BASE}:${MAJOR},${BASE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build + push arm64 image (prebuilt binary)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime-prebuilt
+          platforms: linux/arm64
+          push: true
+          load: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ needs.release.outputs.version }}
+            PREBUILT_BINARY=artifact/${{ inputs.binary_name }}
+            SERVICE_PORT=${{ inputs.service_port }}
+          provenance: true
+          sbom: true
+
+      - name: Trivy image scan
+        run: |
+          mkdir -p /tmp/trivy-cache
+          docker run --rm \
+            -v /tmp/trivy-cache:/root/.cache/trivy \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.69.3 \
+            image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed \
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.binary_name }}:${{ needs.release.outputs.version }}
+
+      - name: Trigger blue/green deploy via homelab-webhook
+        # Notifies homelab-webhook that a new image is available. The webhook
+        # forwards to the service POST /deploys/service with the image tag.
+        # auto_deploy=false in webhook.toml means the service records the
+        # intent but does NOT restart until the operator clears the gate.
+        if: inputs.deploy_webhook
+        run: |
+          set -eu
+          HTTP_CODE=$(curl --silent --output /dev/stderr --write-out "%{http_code}" \
+            --max-time 10 \
+            -X POST "${{ secrets.HOMELAB_WEBHOOK_URL }}/deploy" \
+            -H "Authorization: Bearer ${{ secrets.WEBHOOK_DEPLOY_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"target_image_tag\": \"${{ needs.release.outputs.version }}\"}")
+          if [ "$HTTP_CODE" -ne 202 ]; then
+            echo "::error::Webhook returned HTTP $HTTP_CODE (expected 202)"
+            exit 1
+          fi
