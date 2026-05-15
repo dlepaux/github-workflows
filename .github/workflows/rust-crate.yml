@@ -34,6 +34,15 @@ on:
         description: Run `cargo publish` to kellnr after a successful release
         type: boolean
         default: true
+      needs_postgres:
+        description: >
+          Spin up a per-run Postgres container during test-coverage and
+          export GORDON_TEST_DATABASE_URL. Required for crates whose
+          tests integrate against a live DB (gordon-platform's ipc
+          pg-NOTIFY pubsub, gordon-bus's e2e_nats_integration, gordon-
+          test-db's test_db() fixtures).
+        type: boolean
+        default: false
     # NOTE: dropped runner_host input in v1.x — mixing literal + ${{ }}
     # expression in `runs-on: [...]` fails workflow_call validation
     # (startup_failure). All jobs run on [self-hosted, Linux, ARM64,
@@ -142,6 +151,34 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Per-run Postgres for crates whose tests integrate against a live
+      # DB. Gated on `needs_postgres` input. Same shape as rust-service.yml.
+      - name: Start test Postgres
+        id: postgres
+        if: inputs.needs_postgres
+        run: |
+          NAME="gordon-postgres-test-${{ github.run_id }}-${{ github.run_attempt }}"
+          PORT=$((5433 + (${{ github.run_id }} % 1000)))
+          docker rm -f "$NAME" 2>/dev/null || true
+          docker run -d --name "$NAME" \
+            -p "$PORT:5432" \
+            -e POSTGRES_USER=gordon_test \
+            -e POSTGRES_PASSWORD=gordon_test_dev \
+            -e POSTGRES_DB=postgres \
+            postgres:16-alpine \
+            -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+          ready=false
+          for i in {1..30}; do
+            if docker exec "$NAME" pg_isready -U gordon_test -d postgres; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          $ready || { echo "Postgres not ready after 30 attempts"; exit 1; }
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+
       # cargo-llvm-cov 0.8.5's --fail-under-lines flag silent-passes
       # regardless of threshold. Parse JSON and assert ourselves — same
       # pattern as .githooks/pre-push, version-robust on the JSON schema.
@@ -152,6 +189,7 @@ jobs:
       - name: Coverage (drives test compile + run)
         env:
           CARGO_TARGET_DIR: /var/cache/gordon-ci/${{ inputs.crate_name }}/target-llvm-cov
+          GORDON_TEST_DATABASE_URL: ${{ inputs.needs_postgres && format('postgres://gordon_test:gordon_test_dev@localhost:{0}/postgres', steps.postgres.outputs.port) || '' }}
         run: |
           set -eu
           test -d "$CARGO_TARGET_DIR" || { echo "::error::Missing persistent target-llvm-cov dir at $CARGO_TARGET_DIR"; exit 1; }
@@ -166,6 +204,10 @@ jobs:
               | awk -F'\t' '{ printf "  %5.1f%%  %s\n", $2, $1 }' >&2
             exit 1
           fi
+
+      - name: Stop test Postgres
+        if: always() && inputs.needs_postgres
+        run: docker rm -f "${{ steps.postgres.outputs.name }}" || true
 
   trivy:
     runs-on: [self-hosted, Linux, ARM64, homelab]
