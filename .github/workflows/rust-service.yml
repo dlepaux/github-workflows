@@ -1,31 +1,30 @@
 name: Rust Service CI
 
+# Iteration 2: add workflow-level permissions + concurrency.
+# Goal — isolate the startup_failure cause from the original 401-line full version.
+
 on:
   workflow_call:
     inputs:
-      binary_name:
-        type: string
-        required: true
-      service_port:
-        type: number
-        required: true
-      has_openapi:
-        type: boolean
-        default: false
-      has_asyncapi:
-        type: boolean
-        default: false
-      coverage_floor:
-        type: number
-        default: 70
-      deploy_webhook:
-        type: boolean
-        default: true
+      binary_name: { type: string, required: true }
+      service_port: { type: number, required: true }
+      has_openapi: { type: boolean, default: false }
+      has_asyncapi: { type: boolean, default: false }
+      coverage_floor: { type: number, default: 70 }
+      deploy_webhook: { type: boolean, default: true }
     secrets:
-      HOMELAB_WEBHOOK_URL:
-        required: false
-      WEBHOOK_DEPLOY_KEY:
-        required: false
+      HOMELAB_WEBHOOK_URL: { required: false }
+      WEBHOOK_DEPLOY_KEY: { required: false }
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   smoke:
