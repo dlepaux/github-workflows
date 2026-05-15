@@ -96,20 +96,23 @@ jobs:
         run: |
           set -e
           echo "::group::forbid(unsafe_code) check"
-          # Two forms accepted — both enforce the same rustc lint:
-          #   1. File-level   `#![forbid(unsafe_code)]` in src/lib.rs (legacy).
-          #   2. Manifest     `[lints.rust] unsafe_code = "forbid"` in Cargo.toml
-          #                   (modern idiom; matches workspace convention since
-          #                   the 2026-05-15 split crates).
-          # A workspace can opt in once at the manifest level and propagate via
-          # `[lints] workspace = true` from member manifests.
+          # Three forms accepted — all enforce the same rustc lint:
+          #   1. File-level     `#![forbid(unsafe_code)]` in src/lib.rs (legacy).
+          #   2. Conditional    `#![cfg_attr(<cfg>, forbid(unsafe_code))]` in
+          #                     src/lib.rs (e.g. `not(test)` — production-only,
+          #                     used by gordon-exchange so test helpers can carry
+          #                     narrowly-scoped unsafe).
+          #   3. Manifest       `[lints.rust] unsafe_code = "forbid"` in
+          #                     Cargo.toml (modern idiom; workspace convention
+          #                     since the 2026-05-15 split crates).
           if grep -qE '^\s*unsafe_code\s*=\s*"forbid"' Cargo.toml; then
             echo "  manifest-level [lints.rust] unsafe_code = \"forbid\" — ok"
           else
             found=0
             for lib in src/lib.rs src/main.rs crates/*/src/lib.rs crates/*/src/main.rs; do
               [ -f "$lib" ] || continue
-              grep -qE '^#!\[forbid\(unsafe_code\)\]' "$lib" || { echo "::error file=$lib::Missing #![forbid(unsafe_code)] (or [lints.rust] unsafe_code = \"forbid\" in Cargo.toml)"; exit 1; }
+              grep -qE '^#!\[(forbid\(unsafe_code\)|cfg_attr\(.*forbid\(unsafe_code\))' "$lib" \
+                || { echo "::error file=$lib::Missing #![forbid(unsafe_code)] / #![cfg_attr(<cfg>, forbid(unsafe_code))] / [lints.rust] unsafe_code = \"forbid\""; exit 1; }
               found=1
             done
             [ "$found" = "1" ] || { echo "::error::No crate root found to check for forbid(unsafe_code)"; exit 1; }
@@ -171,6 +174,8 @@ jobs:
 
       # Per-run Postgres for crates whose tests integrate against a live
       # DB. Gated on `needs_postgres` input. Same shape as rust-service.yml.
+      #
+      # `docker pull` retried — see NATS sidecar comment for rationale.
       - name: Start test Postgres
         id: postgres
         if: inputs.needs_postgres
@@ -178,6 +183,16 @@ jobs:
           NAME="gordon-postgres-test-${{ github.run_id }}-${{ github.run_attempt }}"
           PORT=$((5433 + (${{ github.run_id }} % 1000)))
           docker rm -f "$NAME" 2>/dev/null || true
+          pulled=false
+          for attempt in 1 2 3 4 5; do
+            if docker pull postgres:16-alpine; then
+              pulled=true
+              break
+            fi
+            echo "::warning::docker pull postgres:16-alpine attempt $attempt failed — retrying"
+            sleep $((attempt * 3))
+          done
+          $pulled || { echo "::error::Failed to pull postgres:16-alpine after 5 attempts"; exit 1; }
           docker run -d --name "$NAME" \
             -p "$PORT:5432" \
             -e POSTGRES_USER=gordon_test \
@@ -200,6 +215,10 @@ jobs:
       # Per-run NATS JetStream broker. Same shape as the Postgres sidecar.
       # Default NATS port 4222 inside the container; bind to a per-run host
       # port to avoid collisions; tests connect via $GORDON_TEST_NATS_URL.
+      #
+      # `docker pull` retried — concurrent pulls have hit transient
+      # containerd ingest-rename races on the self-hosted host
+      # (`failed commit on ref ... no such file or directory`).
       - name: Start test NATS
         id: nats
         if: inputs.needs_nats
@@ -207,6 +226,16 @@ jobs:
           NAME="gordon-nats-test-${{ github.run_id }}-${{ github.run_attempt }}"
           PORT=$((4223 + (${{ github.run_id }} % 1000)))
           docker rm -f "$NAME" 2>/dev/null || true
+          pulled=false
+          for attempt in 1 2 3 4 5; do
+            if docker pull nats:2-alpine; then
+              pulled=true
+              break
+            fi
+            echo "::warning::docker pull nats:2-alpine attempt $attempt failed — retrying"
+            sleep $((attempt * 3))
+          done
+          $pulled || { echo "::error::Failed to pull nats:2-alpine after 5 attempts"; exit 1; }
           docker run -d --name "$NAME" \
             -p "$PORT:4222" \
             nats:2-alpine \
