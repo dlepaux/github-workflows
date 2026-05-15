@@ -124,10 +124,10 @@ jobs:
       # Default features only — same rationale as rust-service: optional
       # feature flags can pull heavy deps not provisioned on srv-core ARM64.
       - name: Build workspace (debug, all-targets)
-        run: cargo build --all-targets --workspace
+        run: cargo build --all-targets --all-features --workspace
 
       - name: Clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings -W clippy::pedantic -W clippy::nursery
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings -W clippy::pedantic -W clippy::nursery
 
       - name: cargo-deny
         run: cargo deny check
@@ -155,7 +155,7 @@ jobs:
         run: |
           set -eu
           test -d "$CARGO_TARGET_DIR" || { echo "::error::Missing persistent target-llvm-cov dir at $CARGO_TARGET_DIR"; exit 1; }
-          COV_JSON=$(cargo llvm-cov --workspace --summary-only --json)
+          COV_JSON=$(cargo llvm-cov --all-features --workspace --summary-only --json)
           COV_PCT=$(printf '%s' "$COV_JSON" | jq '.data[0].totals.lines.percent')
           if awk "BEGIN { exit ($COV_PCT >= 70) ? 0 : 1 }"; then
             printf 'OK: workspace line coverage %.2f%% >= 70%%\n' "$COV_PCT"
