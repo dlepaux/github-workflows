@@ -107,13 +107,22 @@ jobs:
         run: |
           set -e
           echo "::group::forbid(unsafe_code) check"
-          found=0
-          for lib in src/lib.rs src/main.rs crates/*/src/lib.rs crates/*/src/main.rs; do
-            [ -f "$lib" ] || continue
-            grep -qE '^#!\[forbid\(unsafe_code\)\]' "$lib" || { echo "::error file=$lib::Missing #![forbid(unsafe_code)]"; exit 1; }
-            found=1
-          done
-          [ "$found" = "1" ] || { echo "::error::No crate root found to check for forbid(unsafe_code)"; exit 1; }
+          # Two forms accepted — both enforce the same rustc lint:
+          #   1. File-level   `#![forbid(unsafe_code)]` in src/lib.rs/main.rs.
+          #   2. Manifest     `[lints.rust] unsafe_code = "forbid"` in Cargo.toml
+          #                   (modern idiom; matches workspace convention since
+          #                   the 2026-05-15 split crates).
+          if grep -qE '^\s*unsafe_code\s*=\s*"forbid"' Cargo.toml; then
+            echo "  manifest-level [lints.rust] unsafe_code = \"forbid\" — ok"
+          else
+            found=0
+            for lib in src/lib.rs src/main.rs crates/*/src/lib.rs crates/*/src/main.rs; do
+              [ -f "$lib" ] || continue
+              grep -qE '^#!\[forbid\(unsafe_code\)\]' "$lib" || { echo "::error file=$lib::Missing #![forbid(unsafe_code)] (or [lints.rust] unsafe_code = \"forbid\" in Cargo.toml)"; exit 1; }
+              found=1
+            done
+            [ "$found" = "1" ] || { echo "::error::No crate root found to check for forbid(unsafe_code)"; exit 1; }
+          fi
           echo "::endgroup::"
 
           echo "::group::banned #[allow] at file/module scope"

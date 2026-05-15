@@ -43,6 +43,13 @@ on:
           test-db's test_db() fixtures).
         type: boolean
         default: false
+      needs_nats:
+        description: >
+          Spin up a per-run NATS JetStream container during test-coverage
+          and export GORDON_TEST_NATS_URL. Required for gordon-bus's
+          e2e_nats_integration tests against a real broker.
+        type: boolean
+        default: false
     # NOTE: dropped runner_host input in v1.x — mixing literal + ${{ }}
     # expression in `runs-on: [...]` fails workflow_call validation
     # (startup_failure). All jobs run on [self-hosted, Linux, ARM64,
@@ -89,13 +96,24 @@ jobs:
         run: |
           set -e
           echo "::group::forbid(unsafe_code) check"
-          found=0
-          for lib in src/lib.rs src/main.rs crates/*/src/lib.rs crates/*/src/main.rs; do
-            [ -f "$lib" ] || continue
-            grep -qE '^#!\[forbid\(unsafe_code\)\]' "$lib" || { echo "::error file=$lib::Missing #![forbid(unsafe_code)]"; exit 1; }
-            found=1
-          done
-          [ "$found" = "1" ] || { echo "::error::No crate root found to check for forbid(unsafe_code)"; exit 1; }
+          # Two forms accepted — both enforce the same rustc lint:
+          #   1. File-level   `#![forbid(unsafe_code)]` in src/lib.rs (legacy).
+          #   2. Manifest     `[lints.rust] unsafe_code = "forbid"` in Cargo.toml
+          #                   (modern idiom; matches workspace convention since
+          #                   the 2026-05-15 split crates).
+          # A workspace can opt in once at the manifest level and propagate via
+          # `[lints] workspace = true` from member manifests.
+          if grep -qE '^\s*unsafe_code\s*=\s*"forbid"' Cargo.toml; then
+            echo "  manifest-level [lints.rust] unsafe_code = \"forbid\" — ok"
+          else
+            found=0
+            for lib in src/lib.rs src/main.rs crates/*/src/lib.rs crates/*/src/main.rs; do
+              [ -f "$lib" ] || continue
+              grep -qE '^#!\[forbid\(unsafe_code\)\]' "$lib" || { echo "::error file=$lib::Missing #![forbid(unsafe_code)] (or [lints.rust] unsafe_code = \"forbid\" in Cargo.toml)"; exit 1; }
+              found=1
+            done
+            [ "$found" = "1" ] || { echo "::error::No crate root found to check for forbid(unsafe_code)"; exit 1; }
+          fi
           echo "::endgroup::"
 
           echo "::group::banned #[allow] at file/module scope"
@@ -179,6 +197,33 @@ jobs:
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "port=$PORT" >> "$GITHUB_OUTPUT"
 
+      # Per-run NATS JetStream broker. Same shape as the Postgres sidecar.
+      # Default NATS port 4222 inside the container; bind to a per-run host
+      # port to avoid collisions; tests connect via $GORDON_TEST_NATS_URL.
+      - name: Start test NATS
+        id: nats
+        if: inputs.needs_nats
+        run: |
+          NAME="gordon-nats-test-${{ github.run_id }}-${{ github.run_attempt }}"
+          PORT=$((4223 + (${{ github.run_id }} % 1000)))
+          docker rm -f "$NAME" 2>/dev/null || true
+          docker run -d --name "$NAME" \
+            -p "$PORT:4222" \
+            nats:2-alpine \
+            --jetstream --store_dir=/tmp/nats
+          ready=false
+          for i in {1..30}; do
+            if docker exec "$NAME" wget -qO- http://127.0.0.1:8222/healthz 2>/dev/null \
+              || nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          $ready || { echo "NATS not ready after 30 attempts"; docker logs "$NAME" || true; exit 1; }
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+
       # cargo-llvm-cov 0.8.5's --fail-under-lines flag silent-passes
       # regardless of threshold. Parse JSON and assert ourselves — same
       # pattern as .githooks/pre-push, version-robust on the JSON schema.
@@ -190,6 +235,7 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/cache/gordon-ci/${{ inputs.crate_name }}/target-llvm-cov
           GORDON_TEST_DATABASE_URL: ${{ inputs.needs_postgres && format('postgres://gordon_test:gordon_test_dev@localhost:{0}/postgres', steps.postgres.outputs.port) || '' }}
+          GORDON_TEST_NATS_URL: ${{ inputs.needs_nats && format('nats://localhost:{0}', steps.nats.outputs.port) || '' }}
         run: |
           set -eu
           test -d "$CARGO_TARGET_DIR" || { echo "::error::Missing persistent target-llvm-cov dir at $CARGO_TARGET_DIR"; exit 1; }
@@ -208,6 +254,10 @@ jobs:
       - name: Stop test Postgres
         if: always() && inputs.needs_postgres
         run: docker rm -f "${{ steps.postgres.outputs.name }}" || true
+
+      - name: Stop test NATS
+        if: always() && inputs.needs_nats
+        run: docker rm -f "${{ steps.nats.outputs.name }}" || true
 
   trivy:
     runs-on: [self-hosted, Linux, ARM64, homelab]
