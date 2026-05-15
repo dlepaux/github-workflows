@@ -13,14 +13,11 @@ on:
       HOMELAB_WEBHOOK_URL: { required: false }
       WEBHOOK_DEPLOY_KEY: { required: false }
 
-permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-  packages: write
-
 jobs:
   smoke:
     runs-on: [self-hosted, Linux, ARM64, homelab]
+    permissions:
+      contents: write
+      packages: write
     steps:
-      - run: echo "iter3 — permissions only"
+      - run: echo "iter4 — permissions at job level"
