@@ -102,6 +102,88 @@ deploy:
     webhook-key: ${{ secrets.WEBHOOK_DEPLOY_KEY }}
 ```
 
+### rust-service.yml
+
+Full CI pipeline for Rust services that ship a binary + Docker image to GHCR and deploy via homelab-webhook. Jobs run on self-hosted ARM64 runners. Used by: gordon-data, gordon-manager, gordon-risk, gordon-bot, gordon-executor, gordon-migrate.
+
+| | |
+|---|---|
+| **Runner** | `[self-hosted, Linux, ARM64, <runner_host>]` |
+| **Cache** | Persistent `CARGO_TARGET_DIR` + `CARGO_HOME` from `runner.env` — no `actions/cache` |
+| **Jobs** | `build-and-gate`, `test-coverage`, `asyncapi-drift` (optional), `trivy`, `release`, `docker` |
+
+**Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `binary_name` | string | required | Rust binary name, e.g. `gordon-manager` |
+| `service_port` | number | required | HTTP port — `SERVICE_PORT` Docker build-arg |
+| `has_openapi` | boolean | `false` | Enable OpenAPI drift check in `build-and-gate` |
+| `has_asyncapi` | boolean | `false` | Enable `asyncapi-drift` job |
+| `coverage_floor` | number | `70` | Workspace line coverage gate (percent) |
+| `deploy_webhook` | boolean | `true` | Trigger homelab-webhook deploy step |
+| `runner_host` | string | `homelab` | Runner label — `homelab` (float), `host-srv-core`, `host-srv-apps` (pinned) |
+
+**Secrets:** `HOMELAB_WEBHOOK_URL`, `WEBHOOK_DEPLOY_KEY` (only consumed when `deploy_webhook: true`).
+
+**Caller requirements:** Dockerfile must have a `runtime-prebuilt` target that accepts `PREBUILT_BINARY` and `SERVICE_PORT` build-args. See `caller-examples/gordon-manager-ci.yml`.
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+  workflow_dispatch:
+jobs:
+  ci:
+    uses: dlepaux/github-workflows/.github/workflows/rust-service.yml@v1.0.0
+    with:
+      binary_name: gordon-risk
+      service_port: 8082
+      has_openapi: true
+      has_asyncapi: true
+    secrets:
+      HOMELAB_WEBHOOK_URL: ${{ secrets.HOMELAB_WEBHOOK_URL }}
+      WEBHOOK_DEPLOY_KEY: ${{ secrets.WEBHOOK_DEPLOY_KEY }}
+```
+
+### rust-crate.yml
+
+CI pipeline for kellnr-published Rust library crates. No Docker, no deploy. Used by: gordon-protocol, gordon-platform, gordon-kernel, gordon-domain, gordon-bus, gordon-strategy, gordon-exchange, gordon-test-db.
+
+| | |
+|---|---|
+| **Runner** | `[self-hosted, Linux, ARM64, <runner_host>]` |
+| **Cache** | Persistent `CARGO_TARGET_DIR` + `CARGO_HOME` from `runner.env` — no `actions/cache` |
+| **Jobs** | `build-and-gate`, `test-coverage`, `trivy`, `release`, `publish` |
+
+**Inputs:**
+
+| Input | Type | Default | Description |
+|---|---|---|---|
+| `crate_name` | string | required | Crate name as in `Cargo.toml`, e.g. `gordon-protocol` |
+| `publish_to_kellnr` | boolean | `true` | Run `cargo publish --registry kellnr` after release |
+| `runner_host` | string | `homelab` | Runner label — same semantics as `rust-service.yml` |
+
+**Secrets:** none — kellnr token lives in `CARGO_HOME/config.toml` on the runner (Ansible-managed, not a GitHub secret).
+
+**Note:** no Postgres container. Library crates must not have integration tests that require a live database. Tests that genuinely need Postgres belong in the calling service's suite.
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+  workflow_dispatch:
+jobs:
+  ci:
+    uses: dlepaux/github-workflows/.github/workflows/rust-crate.yml@v1.0.0
+    with:
+      crate_name: gordon-protocol
+```
+
 ## Caller conventions
 
 Every consumer repo must:
@@ -114,11 +196,19 @@ Every consumer repo must:
 
 ## Concurrency
 
-All consumers use global queue concurrency — one run at a time, no cancellation:
+Existing Docker/release workflows use a global queue (one run at a time per repo):
 
 ```yaml
 concurrency:
   group: ${{ github.workflow }}
+  cancel-in-progress: false
+```
+
+`rust-service.yml` and `rust-crate.yml` use **per-ref** concurrency instead. Different refs (e.g. a PR branch and main) run in parallel; concurrent runs on the same ref queue rather than overlap — the persistent `CARGO_TARGET_DIR` is per-repo, not per-ref, and concurrent cargo builds contend on advisory locks.
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 ```
 

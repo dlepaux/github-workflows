@@ -1,0 +1,29 @@
+name: CI
+
+# Thin caller for the rust-service reusable workflow.
+# All logic lives in dlepaux/github-workflows — update that repo and
+# cut a new tag to roll out changes to all callers simultaneously.
+#
+# Migration template for Story 07: replace each repo's full ci.yml with
+# a file like this, adjusting binary_name, service_port, has_openapi, and
+# has_asyncapi per-repo. See github-workflows/readme.md for the full
+# input reference.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    uses: dlepaux/github-workflows/.github/workflows/rust-service.yml@v1.0.0
+    with:
+      binary_name: gordon-manager
+      service_port: 8083
+      has_openapi: true
+      has_asyncapi: true
+    secrets:
+      HOMELAB_WEBHOOK_URL: ${{ secrets.HOMELAB_WEBHOOK_URL }}
+      WEBHOOK_DEPLOY_KEY: ${{ secrets.WEBHOOK_DEPLOY_KEY }}
