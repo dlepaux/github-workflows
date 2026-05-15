@@ -1,8 +1,5 @@
 name: Rust Service CI
 
-# Iteration 2: add workflow-level permissions + concurrency.
-# Goal — isolate the startup_failure cause from the original 401-line full version.
-
 on:
   workflow_call:
     inputs:
@@ -22,12 +19,8 @@ permissions:
   pull-requests: write
   packages: write
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   smoke:
     runs-on: [self-hosted, Linux, ARM64, homelab]
     steps:
-      - run: echo "binary=${{ inputs.binary_name }} port=${{ inputs.service_port }}"
+      - run: echo "iter3 — permissions only"
