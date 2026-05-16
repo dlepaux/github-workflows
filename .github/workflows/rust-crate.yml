@@ -15,7 +15,8 @@ name: Rust Crate CI
 #   parallel with build-and-gate.
 # - trivy: filesystem scan, runs in parallel.
 # - release: semantic-release on push to main; gates publish.
-# - publish: `cargo publish` to kellnr on release. No Docker, no deploy.
+# - publish: handled inside the release job via @semantic-release/exec's
+#            publishCmd; no separate job. No Docker, no deploy.
 #
 # No Postgres — library crates must not carry integration tests that
 # depend on a live database. If a test genuinely requires it, it belongs
@@ -31,7 +32,11 @@ on:
         type: string
         required: true
       publish_to_kellnr:
-        description: Run `cargo publish` to kellnr after a successful release
+        description: >
+          DEPRECATED — no-op since v1.2.2. Publication is now driven by
+          `@semantic-release/exec`'s `publishCmd` inside the release
+          job. Kept as an input for caller-compat; remove the field
+          from caller workflows at next chore.
         type: boolean
         default: true
       needs_postgres:
@@ -348,22 +353,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish:
-    needs: release
-    if: needs.release.outputs.released == 'true' && inputs.publish_to_kellnr
-    runs-on: [self-hosted, Linux, ARM64, homelab]
-    env:
-      PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-      RUSTUP_HOME: /home/github-runner/.rustup
-      # CARGO_HOME (and thus the kellnr registry token) inherited from
-      # runner.env — no secret needed here.
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.release.outputs.tag }}
-
-      # All Gordon library crates declare `publish = ["gordon"]` in
-      # Cargo.toml — the registry alias used in runner.env. `kellnr` is
-      # the upstream URL host, not the cargo registry alias.
-      - name: Publish to kellnr
-        run: cargo publish --registry gordon
+  # Publication is handled by `@semantic-release/exec` inside the
+  # release job — its `publishCmd` runs `cargo publish --registry gordon
+  # --token "$KELLNR_TOKEN" --allow-dirty` as part of the same release
+  # transaction (no separate job needed). A duplicate publish job here
+  # fails with `crate already exists` on the second pass.
