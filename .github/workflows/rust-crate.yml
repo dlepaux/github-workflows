@@ -175,9 +175,13 @@ jobs:
       - name: cargo-deny
         run: cargo deny check
 
-  # Coverage runs in parallel with build-and-gate (no `needs:`). Uses
-  # the persistent target-llvm-cov dir provisioned by the runner role.
+  # Serialised against build-and-gate. Both jobs compile the workspace
+  # (separate target dirs — instrumented coverage profile isn't
+  # target-compatible with the regular one), so parallel execution
+  # peaks at ~2× memory and trips the homelab slice cap (12G on
+  # srv-core). Sequential keeps a single crate CI inside the cap.
   test-coverage:
+    needs: build-and-gate
     runs-on: [self-hosted, Linux, ARM64, homelab]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
