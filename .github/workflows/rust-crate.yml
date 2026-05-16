@@ -362,5 +362,8 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
 
+      # All Gordon library crates declare `publish = ["gordon"]` in
+      # Cargo.toml — the registry alias used in runner.env. `kellnr` is
+      # the upstream URL host, not the cargo registry alias.
       - name: Publish to kellnr
-        run: cargo publish --registry kellnr
+        run: cargo publish --registry gordon
