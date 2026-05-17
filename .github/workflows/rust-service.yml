@@ -232,7 +232,14 @@ jobs:
         run: |
           NAME="gordon-postgres-test-${{ github.run_id }}-${{ github.run_attempt }}"
           PORT=$((5433 + (${{ github.run_id }} % 1000)))
-          docker rm -f "$NAME" 2>/dev/null || true
+          # Broader pre-flight cleanup: prior-attempt containers (same run_id,
+          # any attempt suffix) AND anything currently publishing the target
+          # port. Catches the "rerun attempt N collides with attempt N-1's
+          # leaked container on the same stable port" failure mode that
+          # blocked the DP-15 cascade 2026-05-17.
+          docker ps -aq --filter "name=gordon-postgres-test-${{ github.run_id }}-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+          docker ps -aq --filter "publish=$PORT" | xargs -r docker rm -f >/dev/null 2>&1 || true
+          sleep 1  # Let the kernel release the port after docker rm.
           pulled=false
           for attempt in 1 2 3 4 5; do
             if docker pull postgres:16-alpine; then
