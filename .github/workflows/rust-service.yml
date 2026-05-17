@@ -431,6 +431,13 @@ jobs:
           platforms: linux/arm64
           push: true
           load: true
+          # Force a fresh pull of the distroless base on every build. The
+          # `gcr.io/distroless/cc-debian12:nonroot` tag is moving — Google
+          # rolls Debian security updates (e.g. CVE-2026-0861 libc6
+          # 2.36-9+deb12u14) into the same tag. Without `pull: true`, the
+          # runner reuses a stale cached base layer and Trivy fails on
+          # vulnerabilities already patched upstream.
+          pull: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             VERSION=${{ needs.release.outputs.version }}
