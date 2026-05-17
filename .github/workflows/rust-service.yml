@@ -447,13 +447,27 @@ jobs:
           sbom: true
 
       - name: Trivy image scan
+        # Caller repos can pin upstream-unpatched CVEs in `.trivyignore` at
+        # the repo root (one CVE per line, optional inline rationale).
+        # Trivy auto-discovers the file when --ignorefile points at it.
+        # Mount the workspace into /work so the file is reachable from
+        # inside the trivy container, and set --ignorefile explicitly so
+        # the resolution is deterministic.
         run: |
           mkdir -p /tmp/trivy-cache
+          IGNOREFILE_ARG=""
+          if [ -f .trivyignore ]; then
+            echo "Trivy: applying .trivyignore from $(pwd)"
+            cat .trivyignore | sed 's/^/  /'
+            IGNOREFILE_ARG="--ignorefile /work/.trivyignore"
+          fi
           docker run --rm \
             -v /tmp/trivy-cache:/root/.cache/trivy \
             -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$(pwd):/work" \
+            -w /work \
             aquasec/trivy:0.69.3 \
-            image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed \
+            image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed $IGNOREFILE_ARG \
             ghcr.io/${{ github.repository_owner }}/${{ inputs.binary_name }}:${{ needs.release.outputs.version }}
 
       - name: Trigger blue/green deploy via homelab-webhook
