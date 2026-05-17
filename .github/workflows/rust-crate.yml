@@ -271,9 +271,19 @@ jobs:
             -p "$PORT:4222" \
             nats:2-alpine \
             --jetstream --store_dir=/tmp/nats
+          # Readiness probes:
+          # 1. docker logs grep for the NATS-emitted "Server is ready" line —
+          #    the only probe that survives both (a) nats:2-alpine lacking
+          #    wget/curl and (b) the srv-core runner host lacking nc. The
+          #    other two probes stay as fallbacks for environments where they
+          #    work.
+          # 2. docker exec /bin/sh -c "cat < /dev/tcp/127.0.0.1/4222" — bash
+          #    TCP builtin, no external binary needed inside the container.
+          # 3. nc -z on the host — kept for runners with nc installed.
           ready=false
           for i in {1..30}; do
-            if docker exec "$NAME" wget -qO- http://127.0.0.1:8222/healthz 2>/dev/null \
+            if docker logs "$NAME" 2>&1 | grep -q 'Server is ready' \
+              || docker exec "$NAME" sh -c 'exec 3<>/dev/tcp/127.0.0.1/4222' 2>/dev/null \
               || nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
               ready=true
               break
