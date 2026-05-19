@@ -22,7 +22,7 @@ on:
 
 jobs:
   docker:
-    runs-on: [self-hosted, homelab]
+    runs-on: [self-hosted, rootless]
     permissions:
       contents: read
       packages: write

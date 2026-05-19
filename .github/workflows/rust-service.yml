@@ -54,7 +54,7 @@ on:
     # workflow_call validation with startup_failure. The supported shape
     # is either a plain list (used here) or `${{ fromJSON(inputs.json) }}`
     # (heavier caller surface). All jobs run on `[self-hosted, Linux,
-    # ARM64, homelab]` — floats across srv-core + srv-apps. Per-host
+    # ARM64, rootless]` — floats across srv-core + srv-apps. Per-host
     # pinning returns in a future major when the triage daemon (Story 09)
     # makes the decision and the reusable accepts a JSON-encoded list.
     secrets:
@@ -83,7 +83,7 @@ jobs:
   # keeps incremental compile state across runs — cargo's fingerprint
   # tracking handles staleness.
   build-and-gate:
-    runs-on: [self-hosted, Linux, ARM64, homelab]
+    runs-on: [self-hosted, Linux, ARM64, rootless]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -213,7 +213,7 @@ jobs:
   # srv-core). Sequential keeps a single service CI inside the cap.
   test-coverage:
     needs: build-and-gate
-    runs-on: [self-hosted, Linux, ARM64, homelab]
+    runs-on: [self-hosted, Linux, ARM64, rootless]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -305,7 +305,7 @@ jobs:
 
   asyncapi-drift:
     if: inputs.has_asyncapi
-    runs-on: [self-hosted, Linux, ARM64, homelab]
+    runs-on: [self-hosted, Linux, ARM64, rootless]
     steps:
       - uses: actions/checkout@v6
       # NODE_AUTH_TOKEN set via runner env (homelab/roles/github-runner).
@@ -326,7 +326,7 @@ jobs:
           fi
 
   trivy:
-    runs-on: [self-hosted, Linux, ARM64, homelab]
+    runs-on: [self-hosted, Linux, ARM64, rootless]
     steps:
       - uses: actions/checkout@v6
       - name: Trivy fs scan
@@ -345,7 +345,7 @@ jobs:
       needs.trivy.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push'
-    runs-on: [self-hosted, Linux, ARM64, homelab]
+    runs-on: [self-hosted, Linux, ARM64, rootless]
     env:
       PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/github-runner/.rustup
@@ -387,7 +387,7 @@ jobs:
   docker:
     needs: release
     if: needs.release.outputs.released == 'true'
-    runs-on: [self-hosted, Linux, ARM64, homelab]
+    runs-on: [self-hosted, Linux, ARM64, rootless]
     permissions:
       contents: read
       packages: write

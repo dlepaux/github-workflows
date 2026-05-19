@@ -20,7 +20,7 @@ jobs:
     # Self-hosted by policy — every job in this workflow library runs on the
     # homelab fleet, not on GitHub-hosted runners. semantic-release is
     # arch-agnostic; any homelab runner with Node 22 will do.
-    runs-on: [self-hosted, homelab]
+    runs-on: [self-hosted, rootless]
     outputs:
       released: ${{ steps.version.outputs.released }}
       version: ${{ steps.version.outputs.version }}

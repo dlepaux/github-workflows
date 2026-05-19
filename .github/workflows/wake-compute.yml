@@ -12,7 +12,7 @@ on:
 
 jobs:
   wake:
-    runs-on: [self-hosted, homelab, ARM64]
+    runs-on: [self-hosted, rootless, ARM64]
     timeout-minutes: 5
     steps:
       - name: Send wake packet

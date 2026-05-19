@@ -30,7 +30,7 @@ jobs:
     # publicly reachable, so this is operator preference (locality + no
     # GitHub minutes), not a network requirement. Any homelab runner will
     # do — the job is just a curl with retries.
-    runs-on: [self-hosted, homelab]
+    runs-on: [self-hosted, rootless]
     environment: ${{ inputs.environment || null }}
     steps:
       - name: Trigger deploy webhook

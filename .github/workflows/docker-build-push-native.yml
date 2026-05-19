@@ -31,9 +31,9 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: '["self-hosted", "homelab", "X64"]'
+            runner: '["self-hosted", "rootless", "X64"]'
           - platform: linux/arm64
-            runner: '["self-hosted", "homelab", "ARM64"]'
+            runner: '["self-hosted", "rootless", "ARM64"]'
     runs-on: ${{ fromJSON(matrix.runner) }}
     permissions:
       contents: read
@@ -94,7 +94,7 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: [self-hosted, homelab]
+    runs-on: [self-hosted, rootless]
     needs: build
     permissions:
       contents: read
