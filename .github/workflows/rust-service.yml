@@ -85,8 +85,8 @@ jobs:
   build-and-gate:
     runs-on: [self-hosted, Linux, ARM64, rootless]
     env:
-      PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-      RUSTUP_HOME: /home/github-runner/.rustup
+      PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+      RUSTUP_HOME: /home/runner-ci/.rustup
       # CARGO_HOME + CARGO_TARGET_DIR inherited from runner.env (homelab role).
     steps:
       - uses: actions/checkout@v6
@@ -215,8 +215,8 @@ jobs:
     needs: build-and-gate
     runs-on: [self-hosted, Linux, ARM64, rootless]
     env:
-      PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-      RUSTUP_HOME: /home/github-runner/.rustup
+      PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+      RUSTUP_HOME: /home/runner-ci/.rustup
     steps:
       - uses: actions/checkout@v6
 
@@ -347,8 +347,8 @@ jobs:
       github.event_name == 'push'
     runs-on: [self-hosted, Linux, ARM64, rootless]
     env:
-      PATH: /home/github-runner/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-      RUSTUP_HOME: /home/github-runner/.rustup
+      PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+      RUSTUP_HOME: /home/runner-ci/.rustup
     permissions:
       contents: write
       packages: write
