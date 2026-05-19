@@ -461,9 +461,18 @@ jobs:
             cat .trivyignore | sed 's/^/  /'
             IGNOREFILE_ARG="--ignorefile /work/.trivyignore"
           fi
+          # Re-map the runner's docker socket to the canonical path Trivy
+          # expects. Under rootless dockerd $DOCKER_HOST points at
+          # unix:///run/user/<uid>/docker.sock (per-UID socket); under
+          # legacy system dockerd it is unset and we fall back to
+          # /var/run/docker.sock. Either way, mounting it inside the
+          # container as /var/run/docker.sock keeps Trivy and the daemon
+          # agnostic of the host topology.
+          DOCKER_SOCK="${DOCKER_HOST#unix://}"
+          DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
           docker run --rm \
             -v /tmp/trivy-cache:/root/.cache/trivy \
-            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${DOCKER_SOCK}:/var/run/docker.sock" \
             -v "$(pwd):/work" \
             -w /work \
             aquasec/trivy:0.69.3 \
