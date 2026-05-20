@@ -433,6 +433,16 @@ jobs:
           name: ${{ inputs.binary_name }}-release-arm64
           path: ./artifact
 
+      - name: Restore executable bit on release binary
+        if: steps.relout.outputs.released == 'true'
+        # actions/upload-artifact@v4 does not preserve the Unix executable
+        # bit. The binary returns from the upload→download round-trip as
+        # 0644; the Dockerfile `runtime-prebuilt` target COPYs it as-is
+        # into distroless, and the container then fails at start with
+        # `exec: "/usr/local/bin/service": permission denied`. Restore
+        # 0755 before the image build COPYs it in.
+        run: chmod 0755 "artifact/${{ inputs.binary_name }}"
+
       - name: Set up Buildx
         if: steps.relout.outputs.released == 'true'
         uses: docker/setup-buildx-action@v3
