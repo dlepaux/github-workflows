@@ -4,8 +4,8 @@ name: Wake srv-compute
 # Runs on srv-core (ARM64, always on), calls the WoL HTTP relay on the Pi 3,
 # then polls node_exporter until srv-compute is reachable.
 #
-# No secrets needed — the WoL token is deployed to /opt/github-runner/.wol-token
-# by Ansible (github-runner role with github_runner_wol_token: true).
+# No secrets needed — the WoL token is deployed to /opt/runner-rootless/.wol-token
+# by Ansible (runner-rootless role with runner_rootless_wol_token: true).
 
 on:
   workflow_call:
@@ -17,7 +17,7 @@ jobs:
     steps:
       - name: Send wake packet
         run: |
-          token=$(cat /opt/github-runner/.wol-token)
+          token=$(cat /opt/runner-rootless/.wol-token)
           response=$(curl -sf --connect-timeout 5 --max-time 10 \
             -X POST http://192.168.1.41:9090/wake \
             -H "Authorization: Bearer ${token}")
