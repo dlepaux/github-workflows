@@ -352,10 +352,6 @@ jobs:
     permissions:
       contents: write
       packages: write
-    outputs:
-      released: ${{ steps.relout.outputs.released }}
-      version: ${{ steps.relout.outputs.version }}
-      tag: ${{ steps.relout.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -418,30 +414,32 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "release resolved: released=${published} version=${version:-<none>}"
 
-  docker:
-    needs: release
-    if: needs.release.outputs.released == 'true'
-    runs-on: [self-hosted, Linux, ARM64, rootless]
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.release.outputs.tag }}
-
-      # Pull the release binary built by build-and-gate. Dockerfile's
-      # `runtime-prebuilt` target COPYs it directly into distroless —
-      # no in-image cargo compile.
+      # ── Image build + push (same job, only when a release was cut) ────
+      # Merged into the release job deliberately. A separate `docker` job
+      # gated on `needs.release.outputs.released` was skipped by GitHub
+      # even when the release job succeeded and set that output: the
+      # release job carries `if: always()` (asyncapi-drift is optional and
+      # often skipped), and a downstream job without its own
+      # status-function `if` does not reliably see an `always()` upstream
+      # job's outputs. Every gordon image froze 2026-05-15 → 2026-05-20
+      # this way. A same-job `if: steps.relout.outputs.released == 'true'`
+      # has no cross-job handoff and cannot hit that failure mode. The
+      # working tree is already at the release commit semantic-release
+      # created — no re-checkout needed.
       - name: Download release binary
+        if: steps.relout.outputs.released == 'true'
         uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.binary_name }}-release-arm64
           path: ./artifact
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up Buildx
+        if: steps.relout.outputs.released == 'true'
+        uses: docker/setup-buildx-action@v3
 
-      - uses: docker/login-action@v3
+      - name: Log in to GHCR
+        if: steps.relout.outputs.released == 'true'
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -449,15 +447,17 @@ jobs:
 
       - name: Compute image tags
         id: tags
+        if: steps.relout.outputs.released == 'true'
         run: |
           set -eu
           BASE="ghcr.io/${{ github.repository_owner }}/${{ inputs.binary_name }}"
-          VERSION="${{ needs.release.outputs.version }}"
+          VERSION="${{ steps.relout.outputs.version }}"
           MAJOR_MINOR=$(echo "$VERSION" | awk -F. '{print $1"."$2}')
           MAJOR=$(echo "$VERSION" | awk -F. '{print $1}')
           echo "tags=${BASE}:${VERSION},${BASE}:${MAJOR_MINOR},${BASE}:${MAJOR},${BASE}:latest" >> "$GITHUB_OUTPUT"
 
       - name: Build + push arm64 image (prebuilt binary)
+        if: steps.relout.outputs.released == 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -474,13 +474,14 @@ jobs:
           pull: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
-            VERSION=${{ needs.release.outputs.version }}
+            VERSION=${{ steps.relout.outputs.version }}
             PREBUILT_BINARY=artifact/${{ inputs.binary_name }}
             SERVICE_PORT=${{ inputs.service_port }}
           provenance: true
           sbom: true
 
       - name: Trivy image scan
+        if: steps.relout.outputs.released == 'true'
         # Caller repos can pin upstream-unpatched CVEs in `.trivyignore` at
         # the repo root (one CVE per line, optional inline rationale).
         # Trivy auto-discovers the file when --ignorefile points at it.
@@ -511,14 +512,14 @@ jobs:
             -w /work \
             aquasec/trivy:0.69.3 \
             image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed $IGNOREFILE_ARG \
-            ghcr.io/${{ github.repository_owner }}/${{ inputs.binary_name }}:${{ needs.release.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.binary_name }}:${{ steps.relout.outputs.version }}
 
       - name: Trigger blue/green deploy via homelab-webhook
         # Notifies homelab-webhook that a new image is available. The webhook
         # forwards to the service POST /deploys/service with the image tag.
         # auto_deploy=false in webhook.toml means the service records the
         # intent but does NOT restart until the operator clears the gate.
-        if: inputs.deploy_webhook
+        if: inputs.deploy_webhook && steps.relout.outputs.released == 'true'
         run: |
           set -eu
           HTTP_CODE=$(curl --silent --output /dev/stderr --write-out "%{http_code}" \
@@ -526,7 +527,7 @@ jobs:
             -X POST "${{ secrets.HOMELAB_WEBHOOK_URL }}/deploy" \
             -H "Authorization: Bearer ${{ secrets.WEBHOOK_DEPLOY_KEY }}" \
             -H "Content-Type: application/json" \
-            -d "{\"target_image_tag\": \"${{ needs.release.outputs.version }}\"}")
+            -d "{\"target_image_tag\": \"${{ steps.relout.outputs.version }}\"}")
           if [ "$HTTP_CODE" -ne 202 ]; then
             echo "::error::Webhook returned HTTP $HTTP_CODE (expected 202)"
             exit 1
