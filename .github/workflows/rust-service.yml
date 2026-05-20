@@ -489,7 +489,6 @@ jobs:
         # inside the trivy container, and set --ignorefile explicitly so
         # the resolution is deterministic.
         run: |
-          mkdir -p /tmp/trivy-cache
           IGNOREFILE_ARG=""
           if [ -f .trivyignore ]; then
             echo "Trivy: applying .trivyignore from $(pwd)"
@@ -505,8 +504,15 @@ jobs:
           # agnostic of the host topology.
           DOCKER_SOCK="${DOCKER_HOST#unix://}"
           DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
+          # Trivy's vuln-DB cache uses a docker NAMED VOLUME, not a host
+          # bind mount. Under rootless dockerd a host bind mount of
+          # /tmp/trivy-cache is owned by the runner user, but the trivy
+          # container writes as its own (subuid-mapped) root → EACCES on
+          # /root/.cache/trivy/db/trivy.db. A named volume is daemon-
+          # managed and writable by the container, and still persists the
+          # ~93 MB DB across runs on the same runner.
           docker run --rm \
-            -v /tmp/trivy-cache:/root/.cache/trivy \
+            -v trivy-db-cache:/root/.cache/trivy \
             -v "${DOCKER_SOCK}:/var/run/docker.sock" \
             -v "$(pwd):/work" \
             -w /work \
