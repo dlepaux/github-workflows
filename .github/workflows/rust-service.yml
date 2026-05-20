@@ -353,9 +353,9 @@ jobs:
       contents: write
       packages: write
     outputs:
-      released: ${{ steps.semrel.outputs.new_release_published }}
-      version: ${{ steps.semrel.outputs.new_release_version }}
-      tag: ${{ steps.semrel.outputs.new_release_git_tag }}
+      released: ${{ steps.relout.outputs.released }}
+      version: ${{ steps.relout.outputs.version }}
+      tag: ${{ steps.relout.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -383,6 +383,40 @@ jobs:
             conventional-changelog-conventionalcommits@8
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # cycjimmy/semantic-release-action's new_release_* step outputs do
+      # not reliably reach this job's `outputs:` block on the self-hosted
+      # rootless runners — when empty, the docker job's
+      # `if: needs.release.outputs.released == 'true'` silently skips, so a
+      # tagged release ships no image (every gordon image froze from
+      # 2026-05-15 to 2026-05-20 this way). Derive release state from the
+      # authoritative artefact instead: the `vX.Y.Z` tag semantic-release
+      # creates on HEAD. cycjimmy's outputs are consulted first; the
+      # git-tag check is the fallback, and this step writes the job
+      # outputs itself via $GITHUB_OUTPUT — a plain shell append that has
+      # no dependency on a third-party action's output propagation.
+      - name: Resolve release outputs
+        id: relout
+        run: |
+          set -eu
+          published='${{ steps.semrel.outputs.new_release_published }}'
+          version='${{ steps.semrel.outputs.new_release_version }}'
+          if [ "$published" != 'true' ] || [ -z "$version" ]; then
+            tag=$(git tag --points-at HEAD --sort=-v:refname \
+                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+            if [ -n "$tag" ]; then
+              published='true'
+              version="${tag#v}"
+            else
+              published='false'
+            fi
+          fi
+          {
+            echo "released=${published}"
+            echo "version=${version}"
+            [ "$published" = 'true' ] && echo "tag=v${version}" || echo "tag="
+          } >> "$GITHUB_OUTPUT"
+          echo "release resolved: released=${published} version=${version:-<none>}"
 
   docker:
     needs: release
