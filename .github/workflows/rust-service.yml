@@ -41,6 +41,17 @@ on:
         description: Gate the asyncapi-drift job
         type: boolean
         default: false
+      needs_nats:
+        description: >-
+          Provision a JetStream NATS broker in the test-coverage job.
+          Required by repos whose integration tests call
+          gordon_test_db::test_nats() — a panic-loud helper that expects a
+          broker at GORDON_TEST_NATS_URL (default nats://localhost:4223).
+          Mirrors `make test-up`'s nats-test container. Default off:
+          gordon-executor and gordon-manager do not enable the
+          gordon-test-db `nats` feature and need no broker.
+        type: boolean
+        default: false
       coverage_floor:
         description: Workspace line coverage gate (percent, integer)
         type: number
@@ -306,6 +317,60 @@ jobs:
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "port=$PORT" >> "$GITHUB_OUTPUT"
 
+      # Per-run JetStream NATS broker. Provisioned only for repos that
+      # opt in via `needs_nats` — their integration tests call
+      # gordon_test_db::test_nats(), a panic-loud helper that hard-fails
+      # if no broker answers at GORDON_TEST_NATS_URL. This mirrors the
+      # `nats-test` container in the workspace docker-compose.test.yml
+      # (`make test-up`): image `nats:2-alpine`, `-js` (JetStream on —
+      # the bus consumers are durable). The tests bootstrap their own
+      # `gordon-bus` / `gordon-run-events` streams in-process via
+      # get_or_create/update_stream, so no bus-init step is needed here;
+      # the broker only has to be reachable with JetStream enabled.
+      #
+      # `docker pull` retried for the same containerd ingest-rename race
+      # the Postgres step guards against.
+      - name: Start test NATS broker
+        id: nats
+        if: inputs.needs_nats
+        run: |
+          NAME="gordon-nats-test-${{ github.run_id }}-${{ github.run_attempt }}"
+          PORT=$((4223 + (${{ github.run_id }} % 1000)))
+          # Pre-flight cleanup: prior-attempt containers (same run_id, any
+          # attempt suffix) AND anything currently publishing the target
+          # port — same leaked-container failure mode the Postgres step
+          # guards against on reruns.
+          docker ps -aq --filter "name=gordon-nats-test-${{ github.run_id }}-" | xargs -r docker rm -f >/dev/null 2>&1 || true
+          docker ps -aq --filter "publish=$PORT" | xargs -r docker rm -f >/dev/null 2>&1 || true
+          sleep 1  # Let the kernel release the port after docker rm.
+          pulled=false
+          for attempt in 1 2 3 4 5; do
+            if docker pull nats:2-alpine; then
+              pulled=true
+              break
+            fi
+            echo "::warning::docker pull nats:2-alpine attempt $attempt failed — retrying"
+            sleep $((attempt * 3))
+          done
+          $pulled || { echo "::error::Failed to pull nats:2-alpine after 5 attempts"; exit 1; }
+          # `-js` enables JetStream; `-m 8222` exposes the monitoring
+          # endpoint used for the readiness probe below.
+          docker run -d --name "$NAME" \
+            -p "$PORT:4222" \
+            nats:2-alpine \
+            -js -m 8222
+          ready=false
+          for i in {1..30}; do
+            if docker exec "$NAME" wget -qO- http://localhost:8222/healthz >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          $ready || { echo "::error::NATS broker not ready after 30 attempts"; docker logs "$NAME" || true; exit 1; }
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+
       # cargo-llvm-cov 0.8.5's --fail-under-lines flag silent-passes
       # regardless of threshold (gate theatre from 2026-04-13 to 2026-04-18).
       # Parse the JSON summary and assert the threshold ourselves — same
@@ -317,9 +382,16 @@ jobs:
       # Source-only changes after a warm cache rebuild incrementally
       # instead of compiling the whole workspace under the instrumented
       # profile.
+      #
+      # GORDON_TEST_NATS_URL is set unconditionally — when `needs_nats`
+      # is false the `steps.nats.outputs.port` expression is empty, the
+      # var resolves to a harmless `nats://localhost:` that no test in a
+      # non-NATS repo ever reads (the gordon-test-db `nats` feature, and
+      # thus test_nats(), is not compiled for those repos).
       - name: Coverage (drives test compile + run)
         env:
           GORDON_TEST_DATABASE_URL: postgres://gordon_test:gordon_test_dev@localhost:${{ steps.postgres.outputs.port }}/postgres
+          GORDON_TEST_NATS_URL: nats://localhost:${{ steps.nats.outputs.port }}
           CARGO_TARGET_DIR: /var/cache/gordon-ci/${{ inputs.binary_name }}/target-llvm-cov
         run: |
           set -eu
@@ -339,6 +411,10 @@ jobs:
       - name: Stop test Postgres
         if: always()
         run: docker rm -f "${{ steps.postgres.outputs.name }}" || true
+
+      - name: Stop test NATS broker
+        if: always() && inputs.needs_nats
+        run: docker rm -f "${{ steps.nats.outputs.name }}" || true
 
   asyncapi-drift:
     if: inputs.has_asyncapi
