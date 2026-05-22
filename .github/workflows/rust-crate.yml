@@ -63,6 +63,16 @@ on:
           small alpine broker — tracked as backlog).
         type: number
         default: 70
+      require_local_hooks:
+        description: >
+          Fail CI if no `local-hooks/passed` commit-status exists on the
+          pushed SHA — i.e. detect `--no-verify` bypass of the local
+          pre-push gate (see gordon-workspace ENGINEERING.md, banned).
+          Default false during rollout; flip to true per-repo once the
+          template (.githooks + build.rs auto-install) is wired and a
+          first push has confirmed the receipt mechanism works.
+        type: boolean
+        default: false
     # NOTE: dropped runner_host input in v1.x — mixing literal + ${{ }}
     # expression in `runs-on: [...]` fails workflow_call validation
     # (startup_failure). All jobs run on [self-hosted, Linux, ARM64,
@@ -92,6 +102,34 @@ jobs:
       # CARGO_HOME + CARGO_TARGET_DIR inherited from runner.env (homelab role).
     steps:
       - uses: actions/checkout@v6
+
+      # ─────────────────────────────────────────────────────────────────────
+      # Bypass detector — gates further work on the local pre-push gate
+      # having run on this SHA. The local hook posts a
+      # `local-hooks/passed` commit-status via the `gh` CLI; absence of
+      # the status on a push event = `--no-verify` bypass.
+      #
+      # Opt-in per caller via `require_local_hooks: true`. Skipped on
+      # workflow_dispatch and pull_request events (PR HEAD SHAs change
+      # across pushes; the gate fires on the eventual push to main).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Detect local-hooks bypass
+        if: ${{ inputs.require_local_hooks && github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          SHA="${{ github.sha }}"
+          REPO="${{ github.repository }}"
+          state=$(gh api "repos/$REPO/commits/$SHA/status" \
+            --jq '[.statuses[] | select(.context == "local-hooks/passed")] | first | .state // ""')
+          if [ "$state" != "success" ]; then
+            echo "::error::Local pre-push gate was not run on $SHA — --no-verify bypass detected."
+            echo "::error::Charter bans --no-verify pushes (see gordon-workspace ENGINEERING.md)."
+            echo "::error::Install the template: cd <repo> && cargo build (build.rs auto-installs hooks)."
+            exit 1
+          fi
+          echo "OK: local-hooks/passed receipt found for $SHA"
 
       - name: Sanity check persistent cache paths
         run: |
