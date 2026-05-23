@@ -651,13 +651,19 @@ jobs:
         if: inputs.deploy_webhook && steps.relout.outputs.released == 'true'
         run: |
           set -eu
-          HTTP_CODE=$(curl --silent --output /dev/stderr --write-out "%{http_code}" \
+          # `|| true`: a curl transport failure (TLS, DNS, connection refused)
+          # exits non-zero, which under `set -e` would abort the step with a
+          # bare exit code before the HTTP_CODE check — masking the real cause.
+          # --write-out emits "000" on transport failure; --show-error prints
+          # the curl reason to stderr. Let the check below own the failure.
+          HTTP_CODE=$(curl --silent --show-error --output /dev/stderr \
+            --write-out "%{http_code}" \
             --max-time 10 \
             -X POST "${{ secrets.HOMELAB_WEBHOOK_URL }}/deploy" \
             -H "Authorization: Bearer ${{ secrets.WEBHOOK_DEPLOY_KEY }}" \
             -H "Content-Type: application/json" \
-            -d "{\"target_image_tag\": \"${{ steps.relout.outputs.version }}\"}")
-          if [ "$HTTP_CODE" -ne 202 ]; then
-            echo "::error::Webhook returned HTTP $HTTP_CODE (expected 202)"
+            -d "{\"target_image_tag\": \"${{ steps.relout.outputs.version }}\"}" ) || true
+          if [ "$HTTP_CODE" != "202" ]; then
+            echo "::error::Webhook deploy failed — HTTP $HTTP_CODE (expected 202; 000 = curl transport/TLS error, see stderr above)"
             exit 1
           fi
