@@ -644,26 +644,26 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/${{ inputs.binary_name }}:${{ steps.relout.outputs.version }}
 
       - name: Trigger blue/green deploy via homelab-webhook
-        # Notifies homelab-webhook that a new image is available. The webhook
-        # forwards to the service POST /deploys/service with the image tag.
-        # auto_deploy=false in webhook.toml means the service records the
-        # intent but does NOT restart until the operator clears the gate.
+        # Idempotent POST — retries are safe (same image tag, same result).
+        # Transient TLS/DNS failures during heavy CI load on Pi5 runners
+        # are common; 3 attempts with 5s backoff covers the typical burst.
         if: inputs.deploy_webhook && steps.relout.outputs.released == 'true'
         run: |
           set -eu
-          # `|| true`: a curl transport failure (TLS, DNS, connection refused)
-          # exits non-zero, which under `set -e` would abort the step with a
-          # bare exit code before the HTTP_CODE check — masking the real cause.
-          # --write-out emits "000" on transport failure; --show-error prints
-          # the curl reason to stderr. Let the check below own the failure.
-          HTTP_CODE=$(curl --silent --show-error --output /dev/stderr \
-            --write-out "%{http_code}" \
-            --max-time 10 \
-            -X POST "${{ secrets.HOMELAB_WEBHOOK_URL }}/deploy" \
-            -H "Authorization: Bearer ${{ secrets.WEBHOOK_DEPLOY_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d "{\"target_image_tag\": \"${{ steps.relout.outputs.version }}\"}" ) || true
-          if [ "$HTTP_CODE" != "202" ]; then
-            echo "::error::Webhook deploy failed — HTTP $HTTP_CODE (expected 202; 000 = curl transport/TLS error, see stderr above)"
-            exit 1
-          fi
+          for attempt in 1 2 3; do
+            HTTP_CODE=$(curl --silent --show-error --output /dev/stderr \
+              --write-out "%{http_code}" \
+              --max-time 10 \
+              -X POST "${{ secrets.HOMELAB_WEBHOOK_URL }}/deploy" \
+              -H "Authorization: Bearer ${{ secrets.WEBHOOK_DEPLOY_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"target_image_tag\": \"${{ steps.relout.outputs.version }}\"}" ) || true
+            if [ "$HTTP_CODE" = "202" ] || [ "$HTTP_CODE" = "200" ]; then
+              echo "Deploy webhook accepted (HTTP $HTTP_CODE) on attempt $attempt"
+              exit 0
+            fi
+            echo "Attempt $attempt: HTTP $HTTP_CODE (expected 202; 000 = transport error)"
+            [ "$attempt" -lt 3 ] && sleep 5
+          done
+          echo "::error::Webhook deploy failed after 3 attempts — last HTTP $HTTP_CODE"
+          exit 1
