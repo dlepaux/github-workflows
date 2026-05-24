@@ -647,15 +647,39 @@ jobs:
         # Idempotent POST — retries are safe (same image tag, same result).
         # Transient TLS/DNS failures during heavy CI load on Pi5 runners
         # are common; 3 attempts with 5s backoff covers the typical burst.
+        #
+        # Key/URL resolution: prefers workflow secrets (caller-supplied);
+        # falls back to runner process env vars (set by homelab Ansible
+        # role). This lets callers omit secrets: passthrough when the
+        # runner already carries the credentials.
         if: inputs.deploy_webhook && steps.relout.outputs.released == 'true'
+        env:
+          SECRET_DEPLOY_KEY: ${{ secrets.WEBHOOK_DEPLOY_KEY }}
+          SECRET_WEBHOOK_URL: ${{ secrets.HOMELAB_WEBHOOK_URL }}
         run: |
           set -eu
+
+          # Resolve deploy key: secret > runner env
+          DEPLOY_KEY="${SECRET_DEPLOY_KEY:-${WEBHOOK_DEPLOY_KEY:-}}"
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::WEBHOOK_DEPLOY_KEY not available via secrets or runner environment"
+            exit 1
+          fi
+          echo "::add-mask::$DEPLOY_KEY"
+
+          # Resolve webhook URL: secret > runner env
+          DEPLOY_URL="${SECRET_WEBHOOK_URL:-${HOMELAB_WEBHOOK_URL:-}}"
+          if [ -z "$DEPLOY_URL" ]; then
+            echo "::error::HOMELAB_WEBHOOK_URL not available via secrets or runner environment"
+            exit 1
+          fi
+
           for attempt in 1 2 3; do
             HTTP_CODE=$(curl --silent --show-error --output /dev/stderr \
               --write-out "%{http_code}" \
               --max-time 10 \
-              -X POST "${{ secrets.HOMELAB_WEBHOOK_URL }}/deploy" \
-              -H "Authorization: Bearer ${{ secrets.WEBHOOK_DEPLOY_KEY }}" \
+              -X POST "${DEPLOY_URL}/deploy" \
+              -H "Authorization: Bearer ${DEPLOY_KEY}" \
               -H "Content-Type: application/json" \
               -d "{\"target_image_tag\": \"${{ steps.relout.outputs.version }}\"}" ) || true
             if [ "$HTTP_CODE" = "202" ] || [ "$HTTP_CODE" = "200" ]; then

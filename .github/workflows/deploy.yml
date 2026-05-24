@@ -21,7 +21,7 @@ on:
         default: 30
     secrets:
       webhook-key:
-        required: true
+        required: false
 
 jobs:
   deploy:
@@ -33,6 +33,29 @@ jobs:
     runs-on: [self-hosted, rootless]
     environment: ${{ inputs.environment || null }}
     steps:
+      - name: Resolve deploy credentials
+        id: creds
+        run: |
+          # Resolve webhook key: prefer secrets input, fall back to runner env
+          KEY="${{ secrets.webhook-key }}"
+          if [ -z "$KEY" ]; then
+            KEY="${WEBHOOK_DEPLOY_KEY:-}"
+          fi
+          if [ -z "$KEY" ]; then
+            echo "::error::No webhook key available — set secrets.webhook-key or WEBHOOK_DEPLOY_KEY on the runner"
+            exit 1
+          fi
+          echo "::add-mask::${KEY}"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+
+          # Resolve webhook URL: prefer non-default input, fall back to runner env, else hardcoded default
+          # HOMELAB_WEBHOOK_URL stores the base (no /deploy path) — append it here.
+          URL="${{ inputs.webhook-url }}"
+          if [ "$URL" = "https://webhook.lepaux.com/deploy" ] && [ -n "${HOMELAB_WEBHOOK_URL:-}" ]; then
+            URL="${HOMELAB_WEBHOOK_URL}/deploy"
+          fi
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
       - name: Trigger deploy webhook
         run: |
           for attempt in $(seq 1 ${{ inputs.retries }}); do
@@ -40,8 +63,8 @@ jobs:
             RESPONSE=$(mktemp)
             HTTP_CODE=$(curl -s -o "$RESPONSE" -w "%{http_code}" \
               --max-time 180 -X POST \
-              -H "Authorization: Bearer ${{ secrets.webhook-key }}" \
-              ${{ inputs.webhook-url }})
+              -H "Authorization: Bearer ${{ steps.creds.outputs.key }}" \
+              ${{ steps.creds.outputs.url }})
 
             if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
               echo "Deploy successful (HTTP $HTTP_CODE)"
