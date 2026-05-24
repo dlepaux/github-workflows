@@ -33,7 +33,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: docker/setup-qemu-action@v4
+      # QEMU is only needed for cross-architecture emulation (multi-arch builds,
+      # or single-arch builds where target != runner arch). Skip on native
+      # single-arch builds — required on rootless runners where binfmt
+      # registration needs CAP_SYS_ADMIN and would fail with
+      # "cannot mount binfmt_misc filesystem".
+      - name: Set up QEMU
+        if: |
+          !(inputs.platforms == 'linux/arm64' && runner.arch == 'ARM64') &&
+          !(inputs.platforms == 'linux/amd64' && runner.arch == 'X64')
+        uses: docker/setup-qemu-action@v4
 
       - uses: docker/setup-buildx-action@v4
 
