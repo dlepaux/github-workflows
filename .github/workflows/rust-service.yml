@@ -244,7 +244,7 @@ jobs:
           cp "$CARGO_TARGET_DIR/release/${{ inputs.binary_name }}" artifact/${{ inputs.binary_name }}
 
       - name: Upload release binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ inputs.binary_name }}-release-arm64
           path: artifact/${{ inputs.binary_name }}
@@ -422,7 +422,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       # NODE_AUTH_TOKEN set via runner env (homelab/roles/github-runner).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
       - name: Bundle drift check
@@ -471,7 +471,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
 
@@ -482,7 +482,7 @@ jobs:
 
       - name: Run semantic-release
         id: semrel
-        uses: cycjimmy/semantic-release-action@v4
+        uses: cycjimmy/semantic-release-action@v5
         with:
           semantic_version: 24
           extra_plugins: |
@@ -541,14 +541,14 @@ jobs:
       # created — no re-checkout needed.
       - name: Download release binary
         if: steps.relout.outputs.released == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: ${{ inputs.binary_name }}-release-arm64
           path: ./artifact
 
       - name: Restore executable bit on release binary
         if: steps.relout.outputs.released == 'true'
-        # actions/upload-artifact@v4 does not preserve the Unix executable
+        # actions/upload-artifact@v6 does not preserve the Unix executable
         # bit. The binary returns from the upload→download round-trip as
         # 0644; the Dockerfile `runtime-prebuilt` target COPYs it as-is
         # into distroless, and the container then fails at start with
@@ -558,11 +558,11 @@ jobs:
 
       - name: Set up Buildx
         if: steps.relout.outputs.released == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         if: steps.relout.outputs.released == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
