@@ -73,6 +73,13 @@ on:
           first push has confirmed the receipt mechanism works.
         type: boolean
         default: false
+      is_cli_tool:
+        description: >
+          Skip the println!/eprintln! lint gate. CLI tools legitimately
+          use stdout/stderr as their interface — the tracing-only rule
+          applies to library crates and services, not user-facing binaries.
+        type: boolean
+        default: false
     # NOTE: dropped runner_host input in v1.x — mixing literal + ${{ }}
     # expression in `runs-on: [...]` fails workflow_call validation
     # (startup_failure). All jobs run on [self-hosted, Linux, ARM64,
@@ -177,9 +184,13 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::no println!/eprintln! (comments + // allow-println: exempt)"
-          if grep -rnE '\b(println|eprintln)!' src/ crates/*/src 2>/dev/null | grep -vE '^\S+:\s*[0-9]+:\s*(//|/\*|\s*\*)' | grep -v '// allow-println:'; then
-            echo "::error::Use tracing, not println!/eprintln! (mark legitimate uses with // allow-println: <reason>)"
-            exit 1
+          if [ "${{ inputs.is_cli_tool }}" = "true" ]; then
+            echo "  is_cli_tool=true — println!/eprintln! lint skipped (CLI tools use stdout/stderr)"
+          else
+            if grep -rnE '\b(println|eprintln)!' src/ crates/*/src 2>/dev/null | grep -vE '^\S+:\s*[0-9]+:\s*(//|/\*|\s*\*)' | grep -v '// allow-println:'; then
+              echo "::error::Use tracing, not println!/eprintln! (mark legitimate uses with // allow-println: <reason>)"
+              exit 1
+            fi
           fi
           echo "::endgroup::"
 
