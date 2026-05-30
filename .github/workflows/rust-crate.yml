@@ -63,16 +63,6 @@ on:
           small alpine broker — tracked as backlog).
         type: number
         default: 70
-      require_local_hooks:
-        description: >
-          Fail CI if no `local-hooks/passed` commit-status exists on the
-          pushed SHA — i.e. detect `--no-verify` bypass of the local
-          pre-push gate (see gordon-workspace ENGINEERING.md, banned).
-          Default false during rollout; flip to true per-repo once the
-          template (.githooks + build.rs auto-install) is wired and a
-          first push has confirmed the receipt mechanism works.
-        type: boolean
-        default: false
       is_cli_tool:
         description: >
           Skip the println!/eprintln! lint gate. CLI tools legitimately
@@ -111,32 +101,21 @@ jobs:
       - uses: actions/checkout@v6
 
       # ─────────────────────────────────────────────────────────────────────
-      # Bypass detector — gates further work on the local pre-push gate
-      # having run on this SHA. The local hook posts a
-      # `local-hooks/passed` commit-status via the `gh` CLI; absence of
-      # the status on a push event = `--no-verify` bypass.
-      #
-      # Opt-in per caller via `require_local_hooks: true`. Skipped on
-      # workflow_dispatch and pull_request events (PR HEAD SHAs change
-      # across pushes; the gate fires on the eventual push to main).
+      # Gate — no per-test NATS testcontainers. Integration tests must use the
+      # shared test_nats() broker (gordon-test-db) with a delete+recreate
+      # stream for isolation, NOT a fresh `nats:` container per test: per-test
+      # containers race RootlessKit's ephemeral-port allocator on the rootless
+      # runner (EADDRINUSE → chronic flake). Tree-only grep, runs before any
+      # compile. See gordon-bot/tests for the canonical pattern.
       # ─────────────────────────────────────────────────────────────────────
-      - name: Detect local-hooks bypass
-        if: ${{ inputs.require_local_hooks && github.event_name == 'push' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Gate — no NATS testcontainers (use shared test_nats)
         run: |
           set -eu
-          SHA="${{ github.sha }}"
-          REPO="${{ github.repository }}"
-          state=$(gh api "repos/$REPO/commits/$SHA/status" \
-            --jq '[.statuses[] | select(.context == "local-hooks/passed")] | first | .state // ""')
-          if [ "$state" != "success" ]; then
-            echo "::error::Local pre-push gate was not run on $SHA — --no-verify bypass detected."
-            echo "::error::Charter bans --no-verify pushes (see gordon-workspace ENGINEERING.md)."
-            echo "::error::Install the template: cd <repo> && cargo build (build.rs auto-installs hooks)."
+          if grep -rnE 'testcontainers_modules::nats|NatsServerCmd' src tests 2>/dev/null; then
+            echo "::error::NATS testcontainers detected — use the shared test_nats() broker (gordon-test-db) with a delete+recreate stream for isolation. Per-test nats: containers race the rootless-Docker port allocator (chronic EADDRINUSE flake)."
             exit 1
           fi
-          echo "OK: local-hooks/passed receipt found for $SHA"
+          echo "OK: no NATS testcontainers"
 
       - name: Self-provision + sanity-check persistent cache paths
         run: |
