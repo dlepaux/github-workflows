@@ -144,8 +144,16 @@ jobs:
           set -eu
           test -n "$CARGO_HOME" || { echo "::error::CARGO_HOME not set by runner.env"; exit 1; }
           test -n "$CARGO_TARGET_DIR" || { echo "::error::CARGO_TARGET_DIR not set by runner.env"; exit 1; }
-          test -w "$CARGO_HOME" -a -w "$CARGO_TARGET_DIR" || { echo "::error::Persistent cache paths not writable"; exit 1; }
-          test -f "$CARGO_HOME/config.toml" || { echo "::error::Missing $CARGO_HOME/config.toml (kellnr registry config)"; exit 1; }
+          # Self-provision the per-repo target dir: a newly-onboarded repo's
+          # cache dir is created on its first CI run rather than failing the
+          # build — removes the "inventory edited but runner-role never
+          # re-converged" failure class. The runner owns /var/cache/gordon-ci,
+          # so it can create the subdir; it persists across runs. The shared
+          # CARGO_HOME + its kellnr config.toml remain the runner role's job.
+          mkdir -p "$CARGO_TARGET_DIR"
+          test -w "$CARGO_HOME" || { echo "::error::CARGO_HOME ($CARGO_HOME) not writable — runner role must provision the shared cargo home"; exit 1; }
+          test -w "$CARGO_TARGET_DIR" || { echo "::error::CARGO_TARGET_DIR ($CARGO_TARGET_DIR) not writable after mkdir"; exit 1; }
+          test -f "$CARGO_HOME/config.toml" || { echo "::error::Missing $CARGO_HOME/config.toml (kellnr registry config — runner role)"; exit 1; }
           echo "CARGO_HOME=$CARGO_HOME"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 
@@ -395,7 +403,9 @@ jobs:
           CARGO_TARGET_DIR: /var/cache/gordon-ci/${{ inputs.binary_name }}/target-llvm-cov
         run: |
           set -eu
-          test -d "$CARGO_TARGET_DIR" || { echo "::error::Missing persistent target-llvm-cov dir at $CARGO_TARGET_DIR"; exit 1; }
+          # Self-provision the per-repo llvm-cov dir (same rationale as the
+          # build-and-gate cache step — no runner-role re-converge needed).
+          mkdir -p "$CARGO_TARGET_DIR"
           COV_JSON=$(cargo llvm-cov --workspace --summary-only --json)
           COV_PCT=$(printf '%s' "$COV_JSON" | jq '.data[0].totals.lines.percent')
           if awk "BEGIN { exit ($COV_PCT >= ${{ inputs.coverage_floor }}) ? 0 : 1 }"; then
