@@ -1,0 +1,131 @@
+name: Docker Build & Push (GitHub-Hosted Native Multi-Arch)
+
+# Multi-arch Docker builds on GitHub-HOSTED native runners — amd64 on
+# ubuntu-latest, arm64 on ubuntu-24.04-arm — then merge the per-arch digests
+# into one manifest. No QEMU (each arch builds on its native runner), no
+# self-hosted runner.
+#
+# Use this instead of docker-build-push-native.yml when a repo needs an amd64
+# image but cannot reach a self-hosted amd64 runner (srv-compute). docker-exporter
+# already builds this way. Trade-off: GitHub-hosted minutes + a deviation from
+# the "self-hosted by policy" default — deliberate, for repos whose amd64 build
+# would otherwise be blocked.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Full image name including registry
+        type: string
+        required: true
+      version:
+        description: Version tag without v prefix (empty = no version tag)
+        type: string
+        default: ''
+      build-args:
+        description: Docker build args as multiline KEY=VALUE (one per line)
+        type: string
+        default: ''
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ inputs.image-name }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # Re-resolve FROM tags against the registry so base CVE patches land.
+          pull: true
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ inputs.build-args }}
+          # Supply-chain attestations carried into the merged manifest.
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+          outputs: type=image,name=${{ inputs.image-name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v6
+        with:
+          name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v7
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ inputs.image-name }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+            ${{ inputs.version != '' && format('type=raw,value={0}', inputs.version) || '' }}
+
+      - name: Create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ inputs.image-name }}@sha256:%s ' *)
