@@ -68,6 +68,11 @@ jobs:
         with:
           context: .
           push: true
+          # Always re-resolve FROM tags against the registry. Self-hosted
+          # runners persist BuildKit's local image store, so without this a
+          # rebuild reuses a months-old cached base (e.g. nginx:alpine) and
+          # silently ships its CVEs even after a forced rebuild.
+          pull: true
           platforms: ${{ inputs.platforms }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
