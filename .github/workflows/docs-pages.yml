@@ -1,0 +1,79 @@
+name: Docs Pages
+
+# Reusable: build a VitePress docs site from <docs_dir> and publish it to
+# GitHub Pages. Used by every gordon-* repo that ships gordon-analyze-generated
+# module docs. Docs deploy on every push to main, independently of the
+# rust-service / rust-crate release pipeline — a docs change is visible online
+# without cutting a code release.
+#
+# RUNNER DEVIATION (deliberate): every OTHER workflow in this library runs on
+# the self-hosted homelab fleet. This one runs on GitHub-hosted `ubuntu-latest`
+# because the GitHub Pages deployment path (actions/upload-pages-artifact +
+# actions/deploy-pages + the `github-pages` OIDC environment) is brittle on
+# self-hosted ARM64 rootless runners, and a static-docs build needs none of the
+# homelab cache, secrets, or network — it is pure `npm i && vitepress build`.
+# No trading-system coupling, so the policy exception is safe and contained.
+#
+# Caller pins at a tag: uses: dlepaux/github-workflows/.github/workflows/docs-pages.yml@v1
+# and must declare:
+#   permissions: { contents: read, pages: write, id-token: write }
+#   concurrency:  group: pages, cancel-in-progress: false  (recommended)
+# Pages must be enabled on the repo with source = "GitHub Actions".
+
+on:
+  workflow_call:
+    inputs:
+      docs_dir:
+        description: Path to the VitePress docs root (contains .vitepress + package.json).
+        type: string
+        default: docs
+      node_version:
+        description: Node.js version for the VitePress build.
+        type: number
+        default: 22
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install docs dependencies
+        working-directory: ${{ inputs.docs_dir }}
+        # `npm ci` when a committed lockfile is present (reproducible); fall back
+        # to `npm install` otherwise so a freshly-scaffolded docs site still
+        # builds before its first lockfile is committed.
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build VitePress site
+        working-directory: ${{ inputs.docs_dir }}
+        run: npm run build
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # VitePress default outDir is <docs_dir>/.vitepress/dist
+          path: ${{ inputs.docs_dir }}/.vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
