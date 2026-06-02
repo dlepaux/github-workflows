@@ -73,6 +73,15 @@ on:
         required: false
       WEBHOOK_DEPLOY_KEY:
         required: false
+      # kellnr read token (consumers fetch published gordon-* crates) + npm
+      # token (private @dlepaux/gordon-shared-schemas in the asyncapi gate).
+      # Optional during the runner-env→repo-secret migration: when a caller
+      # does not forward them, the jobs fall back to the runner role's ambient
+      # env. See gordon-workspace plan/active/ci-deploy-key-drift.md.
+      KELLNR_TOKEN:
+        required: false
+      NPM_TOKEN:
+        required: false
 
 permissions:
   contents: write
@@ -136,6 +145,26 @@ jobs:
           test -f "$CARGO_HOME/config.toml" || { echo "::error::Missing $CARGO_HOME/config.toml (kellnr registry config — runner role)"; exit 1; }
           echo "CARGO_HOME=$CARGO_HOME"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+
+      # Kellnr token: repo secret → env (else runner ambient). Belt+suspenders
+      # during the runner-env→repo-secret migration: only written when non-empty
+      # so an unforwarded secret falls back to the runner role's ambient
+      # CARGO_REGISTRIES_GORDON_TOKEN (empty would override the fallback).
+      - name: Source kellnr token from repo secret
+        env:
+          KELLNR_TOKEN_SECRET: ${{ secrets.KELLNR_TOKEN }}
+        run: |
+          set -eu
+          if [ -n "${KELLNR_TOKEN_SECRET:-}" ]; then
+            echo "::add-mask::$KELLNR_TOKEN_SECRET"
+            {
+              echo "CARGO_REGISTRIES_GORDON_TOKEN=$KELLNR_TOKEN_SECRET"
+              echo "KELLNR_TOKEN=$KELLNR_TOKEN_SECRET"
+            } >> "$GITHUB_ENV"
+            echo "kellnr token: sourced from repo secret"
+          else
+            echo "kellnr token: repo secret not forwarded — using runner ambient env"
+          fi
 
       # Grep-based lints are tree-only — run them before any compile so
       # they fail fast on style regressions.
@@ -255,6 +284,23 @@ jobs:
       RUSTUP_HOME: /home/runner-ci/.rustup
     steps:
       - uses: actions/checkout@v6
+
+      # Kellnr token: repo secret → env (else runner ambient). See build-and-gate.
+      - name: Source kellnr token from repo secret
+        env:
+          KELLNR_TOKEN_SECRET: ${{ secrets.KELLNR_TOKEN }}
+        run: |
+          set -eu
+          if [ -n "${KELLNR_TOKEN_SECRET:-}" ]; then
+            echo "::add-mask::$KELLNR_TOKEN_SECRET"
+            {
+              echo "CARGO_REGISTRIES_GORDON_TOKEN=$KELLNR_TOKEN_SECRET"
+              echo "KELLNR_TOKEN=$KELLNR_TOKEN_SECRET"
+            } >> "$GITHUB_ENV"
+            echo "kellnr token: sourced from repo secret"
+          else
+            echo "kellnr token: repo secret not forwarded — using runner ambient env"
+          fi
 
       # Per-run Postgres. Integration tests require a live database; they
       # short-circuit via test_postgres_available() without it, which
@@ -411,7 +457,21 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, rootless]
     steps:
       - uses: actions/checkout@v6
-      # NODE_AUTH_TOKEN set via runner env (homelab/roles/github-runner).
+      # npm token: repo secret → NODE_AUTH_TOKEN (else runner ambient). Only
+      # written when non-empty so an unforwarded secret falls back to the
+      # runner role's ambient NODE_AUTH_TOKEN. Migration belt+suspenders.
+      - name: Source npm token from repo secret
+        env:
+          NPM_TOKEN_SECRET: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -eu
+          if [ -n "${NPM_TOKEN_SECRET:-}" ]; then
+            echo "::add-mask::$NPM_TOKEN_SECRET"
+            echo "NODE_AUTH_TOKEN=$NPM_TOKEN_SECRET" >> "$GITHUB_ENV"
+            echo "npm token: sourced from repo secret"
+          else
+            echo "npm token: repo secret not forwarded — using runner ambient env"
+          fi
       - uses: actions/setup-node@v6
         with:
           node-version: "24"

@@ -70,6 +70,13 @@ on:
           applies to library crates and services, not user-facing binaries.
         type: boolean
         default: false
+    secrets:
+      # kellnr token (read to fetch deps; publish for `cargo publish --registry
+      # gordon`). Optional during the runner-env→repo-secret migration: when a
+      # caller does not forward it, jobs fall back to the runner role's ambient
+      # env. See gordon-workspace plan/active/ci-deploy-key-drift.md.
+      KELLNR_TOKEN:
+        required: false
     # NOTE: dropped runner_host input in v1.x — mixing literal + ${{ }}
     # expression in `runs-on: [...]` fails workflow_call validation
     # (startup_failure). All jobs run on [self-hosted, Linux, ARM64,
@@ -135,6 +142,25 @@ jobs:
           test -f "$CARGO_HOME/config.toml" || { echo "::error::Missing $CARGO_HOME/config.toml (kellnr registry config — runner role)"; exit 1; }
           echo "CARGO_HOME=$CARGO_HOME"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+
+      # Kellnr token: repo secret → env (else runner ambient). Belt+suspenders
+      # during the runner-env→repo-secret migration: only written when non-empty
+      # so an unforwarded secret falls back to the runner role's ambient token.
+      - name: Source kellnr token from repo secret
+        env:
+          KELLNR_TOKEN_SECRET: ${{ secrets.KELLNR_TOKEN }}
+        run: |
+          set -eu
+          if [ -n "${KELLNR_TOKEN_SECRET:-}" ]; then
+            echo "::add-mask::$KELLNR_TOKEN_SECRET"
+            {
+              echo "CARGO_REGISTRIES_GORDON_TOKEN=$KELLNR_TOKEN_SECRET"
+              echo "KELLNR_TOKEN=$KELLNR_TOKEN_SECRET"
+            } >> "$GITHUB_ENV"
+            echo "kellnr token: sourced from repo secret"
+          else
+            echo "kellnr token: repo secret not forwarded — using runner ambient env"
+          fi
 
       # Grep-based lints are tree-only — run them before any compile so
       # they fail fast on style regressions.
@@ -225,6 +251,23 @@ jobs:
       RUSTUP_HOME: /home/runner-ci/.rustup
     steps:
       - uses: actions/checkout@v6
+
+      # Kellnr token: repo secret → env (else runner ambient). See build-and-gate.
+      - name: Source kellnr token from repo secret
+        env:
+          KELLNR_TOKEN_SECRET: ${{ secrets.KELLNR_TOKEN }}
+        run: |
+          set -eu
+          if [ -n "${KELLNR_TOKEN_SECRET:-}" ]; then
+            echo "::add-mask::$KELLNR_TOKEN_SECRET"
+            {
+              echo "CARGO_REGISTRIES_GORDON_TOKEN=$KELLNR_TOKEN_SECRET"
+              echo "KELLNR_TOKEN=$KELLNR_TOKEN_SECRET"
+            } >> "$GITHUB_ENV"
+            echo "kellnr token: sourced from repo secret"
+          else
+            echo "kellnr token: repo secret not forwarded — using runner ambient env"
+          fi
 
       # Per-run Postgres for crates whose tests integrate against a live
       # DB. Gated on `needs_postgres` input. Same shape as rust-service.yml.
@@ -407,6 +450,26 @@ jobs:
       # belt-and-braces install for first-run hosts.
       - name: Ensure cargo-edit
         run: command -v cargo-set-version >/dev/null 2>&1 || cargo install cargo-edit --locked
+
+      # Kellnr token for `cargo publish --registry gordon --token "$KELLNR_TOKEN"`
+      # (semantic-release publishCmd). Repo secret → env, else runner ambient.
+      # Only written when non-empty so an unforwarded secret keeps the ambient
+      # publish token (empty would override it and 401 the publish).
+      - name: Source kellnr token from repo secret
+        env:
+          KELLNR_TOKEN_SECRET: ${{ secrets.KELLNR_TOKEN }}
+        run: |
+          set -eu
+          if [ -n "${KELLNR_TOKEN_SECRET:-}" ]; then
+            echo "::add-mask::$KELLNR_TOKEN_SECRET"
+            {
+              echo "CARGO_REGISTRIES_GORDON_TOKEN=$KELLNR_TOKEN_SECRET"
+              echo "KELLNR_TOKEN=$KELLNR_TOKEN_SECRET"
+            } >> "$GITHUB_ENV"
+            echo "kellnr token: sourced from repo secret"
+          else
+            echo "kellnr token: repo secret not forwarded — using runner ambient env"
+          fi
 
       - name: Run semantic-release
         id: semrel
