@@ -665,9 +665,12 @@ jobs:
           fi
 
           for attempt in 1 2 3; do
+            # --max-time sits just above the nginx proxy_read_timeout (360s)
+            # so a genuine slow rollout surfaces as a diagnosable 504, not a
+            # transport-level 000. Sync handler returns 200 on real success.
             HTTP_CODE=$(curl --silent --show-error --output /dev/stderr \
               --write-out "%{http_code}" \
-              --max-time 10 \
+              --max-time 380 \
               -X POST "${DEPLOY_URL}/deploy" \
               -H "Authorization: Bearer ${DEPLOY_KEY}" \
               -H "Content-Type: application/json" \
