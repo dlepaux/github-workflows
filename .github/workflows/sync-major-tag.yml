@@ -1,0 +1,62 @@
+name: sync-major-tag
+
+# Repo housekeeping — NOT a reusable library job (not workflow_call, no consumer).
+#
+# github-workflows is versioned by HAND-CUT lightweight tags: there is no
+# semantic-release on THIS repo (release.yml is workflow_call-only, it releases
+# consumer repos). Consumers pin the floating major — e.g.
+# `uses: dlepaux/github-workflows/.github/workflows/rust-service.yml@v1` — so the
+# `vMAJOR` alias must be moved to every new `vX.Y.Z`. Done by hand it drifts: in
+# 2026-06 `v1` silently sat at v1.7.0's commit while v1.8.0 already existed, so
+# every `@v1` consumer ran stale CI with no signal (gordon
+# webhook-stabilization-tail, item Q). This makes the move automatic: push a
+# version tag → the matching major alias follows.
+#
+# Runs on GitHub-hosted ubuntu-latest by DELIBERATE exception to the library's
+# "self-hosted by policy" convention (see release.yml): a maintenance job must
+# run reliably without the homelab fleet, which has no runners registered for
+# this public repo. GitHub-hosted minutes are free here (public repo).
+
+on:
+  push:
+    tags:
+      # Version tags only — never the vMAJOR alias itself, so the alias push
+      # below can't retrigger this workflow.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write  # default token is read-only; needed to force-push the alias
+
+concurrency:
+  group: sync-major-tag
+  cancel-in-progress: false
+
+jobs:
+  sync-major:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: true
+
+      - name: Move the major alias to this release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          major="${TAG%%.*}"                       # v1.8.1 -> v1
+
+          # Never move the alias backward: only advance if this tag is the
+          # newest vMAJOR.* (a re-pushed old patch must be a no-op).
+          newest="$(git tag -l "${major}.*" | sort -V | tail -1)"
+          if [ "$newest" != "$TAG" ]; then
+            echo "::notice::${TAG} is not the newest ${major}.* (newest=${newest}); leaving ${major} unchanged"
+            exit 0
+          fi
+
+          echo "Pinning ${major} -> ${TAG} ($(git rev-parse --short "$TAG"))"
+          git tag -f "$major" "$TAG"
+          git push -f origin "refs/tags/${major}"
