@@ -7,6 +7,11 @@ on:
         description: Node.js version for semantic-release
         type: number
         default: 22
+      runner:
+        description: Runner to use (JSON array). Default self-hosted; override
+          with '["ubuntu-latest"]' for repos that build/deploy GitHub-hosted.
+        type: string
+        default: '["self-hosted", "rootless"]'
     outputs:
       released:
         description: Whether a new version was released (true/false)
@@ -17,10 +22,11 @@ on:
 
 jobs:
   release:
-    # Self-hosted by policy — every job in this workflow library runs on the
-    # homelab fleet, not on GitHub-hosted runners. semantic-release is
-    # arch-agnostic; any homelab runner with Node 22 will do.
-    runs-on: [self-hosted, rootless]
+    # Self-hosted by default (saves GitHub minutes); semantic-release is
+    # arch-agnostic so any homelab runner with Node 22 works. Repos whose
+    # build/deploy is GitHub-hosted (e.g. dlepaux.github.io, nilufer) pass
+    # runner: '["ubuntu-latest"]' so they don't queue on the Pi pool.
+    runs-on: ${{ fromJSON(inputs.runner) }}
     outputs:
       released: ${{ steps.version.outputs.released }}
       version: ${{ steps.version.outputs.version }}

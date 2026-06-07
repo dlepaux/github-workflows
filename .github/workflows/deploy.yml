@@ -19,18 +19,24 @@ on:
         description: Delay between retries in seconds
         type: number
         default: 30
+      runner:
+        description: Runner to use (JSON array). Default self-hosted; override
+          with '["ubuntu-latest"]' for GitHub-hosted repos. The webhook URL is
+          public, so GitHub-hosted runners reach it fine.
+        type: string
+        default: '["self-hosted", "rootless"]'
     secrets:
       webhook-key:
         required: false
 
 jobs:
   deploy:
-    # Self-hosted by policy — every job in this workflow library runs on the
-    # homelab fleet, not on GitHub-hosted runners. The webhook itself is
-    # publicly reachable, so this is operator preference (locality + no
-    # GitHub minutes), not a network requirement. Any homelab runner will
-    # do — the job is just a curl with retries.
-    runs-on: [self-hosted, rootless]
+    # Self-hosted by default (operator preference: locality + no GitHub
+    # minutes); the webhook is publicly reachable so this is not a network
+    # requirement. Repos on GitHub-hosted runners pass runner:
+    # '["ubuntu-latest"]' — they fall back to the public webhook-url default
+    # (HOMELAB_WEBHOOK_URL is only set on self-hosted runners).
+    runs-on: ${{ fromJSON(inputs.runner) }}
     environment: ${{ inputs.environment || null }}
     steps:
       - name: Resolve deploy credentials
