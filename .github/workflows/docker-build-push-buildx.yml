@@ -23,6 +23,13 @@ on:
         description: Runner to use (default self-hosted ARM64, override with ubuntu-latest for heavy amd64 builds)
         type: string
         default: '["self-hosted", "homelab"]'
+      cache-image:
+        description: >-
+          Registry ref for a buildx layer cache (empty = no cache, unchanged behaviour).
+          E.g. ghcr.io/owner/img:buildcache. Rootless-safe (network write, no host
+          bind-mount EACCES) and host-independent — any runner reads the same cache.
+        type: string
+        default: ''
 
 jobs:
   docker:
@@ -77,4 +84,9 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ inputs.build-args }}
-          # No GHA cache on self-hosted — Docker layer cache is local
+          # Opt-in registry layer cache (cache-image set). type=registry, not type=local:
+          # rootless dockerd writes a host bind-mount as a subuid-mapped root → EACCES,
+          # so a local cache dir fails; a registry cache writes over the network and is
+          # host-independent. Empty cache-image → empty args → no cache (default).
+          cache-from: ${{ inputs.cache-image != '' && format('type=registry,ref={0}', inputs.cache-image) || '' }}
+          cache-to: ${{ inputs.cache-image != '' && format('type=registry,ref={0},mode=max', inputs.cache-image) || '' }}
