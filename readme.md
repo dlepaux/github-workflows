@@ -47,13 +47,14 @@ docker:
 
 ### docker-build-push-buildx.yml
 
-Docker build with buildx on GitHub-hosted runners. For repos needing x86 images or GHA layer caching.
+Multi-arch Docker build with buildx (QEMU for cross-arch emulation). Runs on the self-hosted homelab runner by default; override `runner` to `ubuntu-latest` for heavy amd64 builds.
 
 | | |
 |---|---|
-| **Runner** | `ubuntu-latest` |
-| **Inputs** | `image-name` (required), `version`, `platforms` (default: `linux/arm64`), `free-disk-space` (default: `false`) |
+| **Runner** | `[self-hosted, homelab]` (override via `runner`) |
+| **Inputs** | `image-name` (required), `version`, `platforms` (default: `linux/amd64,linux/arm64`), `build-args`, `runner` (default: `["self-hosted", "homelab"]`) |
 | **Secrets** | Inherited (`GITHUB_TOKEN`) |
+| **Tags** | `:latest`, `:sha-<7chars>`, `:<version>` (if provided) |
 
 ```yaml
 docker:
@@ -63,8 +64,7 @@ docker:
   with:
     image-name: ghcr.io/${{ github.repository }}
     version: ${{ needs.release.outputs.version }}
-    platforms: linux/amd64
-    free-disk-space: true
+    # platforms defaults to linux/amd64,linux/arm64; override to narrow
   secrets: inherit
 ```
 
