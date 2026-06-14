@@ -43,6 +43,16 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Build from the release tag, not github.sha. semantic-release bumps
+          # the version files (Cargo.toml/package.json) in a chore(release)
+          # commit AFTER the triggering SHA, so building from github.sha bakes
+          # the PREVIOUS version into the binary (CARGO_PKG_VERSION) even though
+          # the image is tagged with the new one. refs/tags/v<version> (pushed
+          # by the release job this build `needs:`) makes the compiled-in version
+          # match the image tag. Empty version (non-release build) → '' → default
+          # checkout (github.sha), preserving prior behaviour.
+          ref: ${{ inputs.version != '' && format('refs/tags/v{0}', inputs.version) || '' }}
 
       - uses: docker/setup-buildx-action@v4
 
