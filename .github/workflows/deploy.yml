@@ -63,30 +63,71 @@ jobs:
           echo "url=${URL}" >> "$GITHUB_OUTPUT"
 
       - name: Trigger deploy webhook
+        # NOT `bash -e` (the Actions default): this step's retry loop must own its
+        # own exit code. Under `-e`, `HTTP_CODE=$(curl …)` aborts the WHOLE script
+        # the instant curl returns non-zero on a transport error (connect-refused/
+        # DNS/timeout/TLS) — so the loop died on attempt 1 and the 3× retry never
+        # ran (the very resilience this step exists to provide). `pipefail` + `-u`
+        # keep the safety that matters; the loop handles curl's exit itself.
+        shell: bash
         run: |
-          for attempt in $(seq 1 ${{ inputs.retries }}); do
-            echo "Deploy attempt ${attempt}/${{ inputs.retries }}..."
-            RESPONSE=$(mktemp)
-            HTTP_CODE=$(curl -s -o "$RESPONSE" -w "%{http_code}" \
-              --max-time 180 -X POST \
-              -H "Authorization: Bearer ${{ steps.creds.outputs.key }}" \
-              ${{ steps.creds.outputs.url }})
+          set -uo pipefail
+          RETRIES=${{ inputs.retries }}
+          DELAY=${{ inputs.retry-delay }}
+          URL="${{ steps.creds.outputs.url }}"
 
-            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+          # Translate curl's transport exit codes into a human label so the next
+          # outage is diagnosable at a glance instead of a bare "exit code N".
+          curl_reason() {
+            case "$1" in
+              0)  echo "curl ok (HTTP-level failure, not transport)" ;;
+              6)  echo "could not resolve host (DNS)" ;;
+              7)  echo "failed to connect (host down / refused / firewalled)" ;;
+              28) echo "operation timed out (--connect-timeout/--max-time)" ;;
+              35) echo "TLS handshake failed" ;;
+              52) echo "empty reply from server" ;;
+              56) echo "failure receiving network data (connection reset)" ;;
+              *)  echo "curl error (see https://curl.se/libcurl/c/libcurl-errors.html)" ;;
+            esac
+          }
+
+          for attempt in $(seq 1 "$RETRIES"); do
+            echo "Deploy attempt ${attempt}/${RETRIES} → POST ${URL}"
+            RESPONSE=$(mktemp)
+            # `|| CURL_EXIT=$?` keeps the non-zero transport status without `-e`
+            # tearing the loop down; --connect-timeout fails a black-hole host
+            # fast instead of burning the full --max-time read budget per try.
+            CURL_EXIT=0
+            HTTP_CODE=$(curl -s -o "$RESPONSE" -w "%{http_code}" \
+              --connect-timeout 10 --max-time 180 -X POST \
+              -H "Authorization: Bearer ${{ steps.creds.outputs.key }}" \
+              "$URL") || CURL_EXIT=$?
+
+            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
               echo "Deploy successful (HTTP $HTTP_CODE)"
               cat "$RESPONSE"
               rm -f "$RESPONSE"
               exit 0
             fi
 
-            echo "Deploy failed (HTTP $HTTP_CODE):"
+            # Legible failure: transport-vs-HTTP, the curl exit code + its meaning,
+            # the HTTP status (000 when the request never completed), and the body.
+            if [ "$CURL_EXIT" -ne 0 ]; then
+              echo "::warning::Deploy attempt ${attempt} TRANSPORT failure: curl exit ${CURL_EXIT} ($(curl_reason "$CURL_EXIT")); HTTP_CODE=${HTTP_CODE}"
+            else
+              echo "::warning::Deploy attempt ${attempt} HTTP failure: status ${HTTP_CODE}"
+            fi
+            echo "--- response body ---"
             cat "$RESPONSE"
+            echo ""
+            echo "---------------------"
             rm -f "$RESPONSE"
 
-            if [ "$attempt" -lt "${{ inputs.retries }}" ]; then
-              echo "Retrying in ${{ inputs.retry-delay }}s..."
-              sleep ${{ inputs.retry-delay }}
+            if [ "$attempt" -lt "$RETRIES" ]; then
+              echo "Retrying in ${DELAY}s..."
+              sleep "$DELAY"
             fi
           done
-          echo "Deploy failed after ${{ inputs.retries }} attempts"
+
+          echo "::error::Deploy failed after ${RETRIES} attempts to ${URL} (last: curl exit ${CURL_EXIT:-?} / HTTP ${HTTP_CODE:-?}). If transport (curl 6/7/28), the webhook host was unreachable — this is an infra/homelab outage, not a code regression; re-run once the host is back."
           exit 1
