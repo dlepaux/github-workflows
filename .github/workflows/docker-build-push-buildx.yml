@@ -30,6 +30,13 @@ on:
           bind-mount EACCES) and host-independent — any runner reads the same cache.
         type: string
         default: ''
+      dockerfile:
+        description: >-
+          Path to the Dockerfile (relative to the repo-root build context). Default
+          ./Dockerfile (unchanged behaviour). Set e.g. docker/server.Dockerfile to build a
+          non-root-Dockerfile image (a repo that publishes more than one image).
+        type: string
+        default: ./Dockerfile
 
 jobs:
   docker:
@@ -82,6 +89,9 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          # Default ./Dockerfile (unchanged for existing callers); overridable so a repo can
+          # publish more than one image from distinct Dockerfiles.
+          file: ${{ inputs.dockerfile }}
           push: true
           # Always re-resolve FROM tags against the registry. Self-hosted
           # runners persist BuildKit's local image store, so without this a
