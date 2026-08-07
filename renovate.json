@@ -9,13 +9,18 @@
     {
       "matchUpdateTypes": ["major"],
       "automerge": false
+    },
+    {
+      "description": "Security fixes jump the PR queue. prPriority is ONLY valid inside packageRules — Renovate rejects it under vulnerabilityAlerts, which is where it used to live and what produced the 'Found renovate config warnings' badge on 14 repos.",
+      "matchPackageNames": ["*"],
+      "isVulnerabilityAlert": true,
+      "prPriority": 10
     }
   ],
   "vulnerabilityAlerts": {
     "enabled": true,
     "schedule": ["at any time"],
     "automerge": false,
-    "labels": ["security", "cve"],
-    "prPriority": 10
+    "labels": ["security", "cve"]
   }
 }
