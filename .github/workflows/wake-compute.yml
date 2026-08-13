@@ -1,11 +1,23 @@
 name: Wake srv-compute
 
 # Reusable workflow to wake srv-compute via WoL before X64 runner jobs.
-# Runs on srv-core (ARM64, always on), calls the WoL HTTP relay on the Pi 3,
-# then polls node_exporter until srv-compute is reachable.
+# Runs on ANY always-on ARM64 host — the broker places it, this does not pin srv-core —
+# calls the WoL HTTP relay on srv-compute-wol, then polls until srv-compute is reachable.
 #
-# No secrets needed — the WoL token is deployed to /opt/runner-rootless/.wol-token
-# by Ansible (runner-rootless role with runner_rootless_wol_token: true).
+# No secrets needed: the token is at /opt/runner-rootless/.wol-token, written by the
+# runner-rootless role when runner_rootless_wol_token_enabled is true.
+#
+# That claim was FALSE from 2026-05-20 to 2026-08-13. The variable it named died with the
+# legacy github-runner role and nothing re-created the file, which survived on srv-core
+# alone as a leftover. Since this job selects [self-hosted, rootless, ARM64] and the broker
+# places it on any of three hosts, two placements out of three would have failed on
+# `cat: No such file`. It went unnoticed because the sole caller kept landing on srv-core.
+# The role now provisions it on every always-on ARM64 host; keep it that way.
+#
+# Note github-triage ALSO auto-wakes srv-compute (TRIAGE_X64_HOSTS + TRIAGE_WOL_*), which
+# is why the-beret-game's X64 legs work with no wake job. This workflow is the explicit,
+# bounded, fail-loud variant for pipelines that must not start building before the box
+# answers.
 
 on:
   workflow_call:
