@@ -22,7 +22,15 @@ on:
       runner:
         description: Runner to use (default self-hosted ARM64, override with ubuntu-latest for heavy amd64 builds)
         type: string
-        default: '["self-hosted", "homelab"]'
+        # Was '["self-hosted", "homelab"]' until 2026-08-13. NO runner in the fleet has
+        # ever advertised a `homelab` label — runner-rootless registers
+        # [self-hosted, Linux, ARM64|X64, rootless, instance-N, host-<name>] — so a caller
+        # that omitted `runner:` got a job that queued until it timed out rather than one
+        # that failed fast. It stayed invisible because every live caller passes the input
+        # explicitly; the only repos still on the default were the gordon-* set, archived
+        # the same day. Kept arch-agnostic on purpose: adding ARM64 here would silently
+        # exclude srv-compute for the amd64 callers that do override.
+        default: '["self-hosted", "rootless"]'
       cache-image:
         description: >-
           Registry ref for a buildx layer cache (empty = no cache, unchanged behaviour).
