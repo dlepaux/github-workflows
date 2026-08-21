@@ -21,11 +21,25 @@ on:
         default: ''
 
 jobs:
-  wake:
-    uses: dlepaux/github-workflows/.github/workflows/wake-compute.yml@main
-
+  # NO `wake` JOB, deliberately — removed 2026-08-21.
+  #
+  # This used to call wake-compute.yml and gate the whole matrix on it, because
+  # srv-compute was the fleet's ONLY x86_64 runner and it sleeps. That made every
+  # amd64 leg hard-depend on a WoL relay answering, which CLAUDE.md forbids outright,
+  # and on 2026-08-20 it cost a build: the relay was powered off, `wake` failed with
+  # curl exit 7, and BOTH arch legs were skipped — including arm64, which needs
+  # nothing from that box.
+  #
+  # srv-swiss is now a second x86_64 runner and it is always on, so x64 capacity no
+  # longer depends on waking anything. github-triage still auto-wakes srv-compute when
+  # it routes an x64 job there (TRIAGE_X64_HOSTS + TRIAGE_WOL_HOSTS), so the fast path
+  # is preserved without this workflow gating on it — exactly how the-beret-game's x64
+  # legs have always worked.
+  #
+  # Not `continue-on-error` (unsupported on a reusable-workflow call) and not
+  # `if: always()` (that leaves every run RED when the relay is down, even though the
+  # image built fine — which is how you train someone to ignore CI).
   build:
-    needs: wake
     strategy:
       # fail-fast: FALSE, deliberately. With `true`, an amd64 failure cancels the
       # in-flight arm64 leg, so the run tells you nothing about whether arm64 would
