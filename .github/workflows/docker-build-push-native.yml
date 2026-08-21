@@ -27,7 +27,13 @@ jobs:
   build:
     needs: wake
     strategy:
-      fail-fast: true
+      # fail-fast: FALSE, deliberately. With `true`, an amd64 failure cancels the
+      # in-flight arm64 leg, so the run tells you nothing about whether arm64 would
+      # have built — and on a two-arch matrix that is exactly the question you need
+      # answered when one arch's HOST is the problem rather than the code.
+      # `merge` still needs both, so a partial matrix cannot publish a single-arch
+      # manifest: this changes what you learn from a failure, not what gets shipped.
+      fail-fast: false
       matrix:
         include:
           - platform: linux/amd64
