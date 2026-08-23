@@ -29,11 +29,13 @@ jobs:
     steps:
       - name: Send wake packet
         run: |
+          # wol-http moved to srv-apps :9099 on 2026-08-23 (the .41 Pi relay
+          # is retired — the i9's eno2 WoL NIC is LAN-cabled now).
           token=$(cat /opt/runner-rootless/.wol-token)
           response=$(curl -sf --connect-timeout 5 --max-time 10 \
-            -X POST http://192.168.1.41:9090/wake \
+            -X POST http://192.168.1.30:9099/wake \
             -H "Authorization: Bearer ${token}")
-          echo "WoL relay response: ${response}"
+          echo "wol-http response: ${response}"
 
       - name: Wait for srv-compute to come online
         run: |
