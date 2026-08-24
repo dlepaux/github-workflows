@@ -492,8 +492,40 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, rootless]
     steps:
       - uses: actions/checkout@v6
+      # The DB refresh is best-effort ON PURPOSE, and is SEPARATE from the scan.
+      #
+      # trivy's vuln-DB is an OCI pull from a public mirror through the fleet's
+      # ONE NAT IP. A throttled mirror does not fail fast — it stalls. On
+      # 2026-08-23 that timed out github-triage's job at exactly trivy's 5:00
+      # deadline, and burned ~25 min of mako-bot's arm64 leg, which then blew
+      # its 90-minute job bound: `deploy` and `docker-manifest` were skipped, no
+      # image was published, and the host kept deploying a STALE image. Zero
+      # findings were involved — the gate never got to run.
+      #
+      # The cache is NOT the problem and never was: /home/runner-ci/.cache/trivy
+      # is the persistent runner HOME, not the ephemeral _jit dir, and every
+      # runner already holds a ~1.2 GB trivy.db. What was missing is a bound on
+      # the refresh and a fallback to the DB already on disk.
+      #
+      # A stale-by-hours DB is a fine basis for a gate; NO DB at all is not —
+      # hence the hard failure only on a cold cache. The weekly
+      # roles/trivy-scan host timers keep fleet CVE coverage fresh regardless.
+      # Pattern proven in github-triage's own ci.yml since 2026-08-23.
+      - name: Trivy vuln-DB refresh (best-effort — a stalled mirror must not fail CI)
+        run: |
+          for i in 1 2 3; do
+            trivy fs --download-db-only && exit 0
+            echo "DB refresh attempt $i failed; retrying in 20s"; sleep 20
+          done
+          if [ -e "$HOME/.cache/trivy/db/trivy.db" ]; then
+            echo "::warning::trivy DB refresh failed — scanning with the cached DB"
+          else
+            echo "::error::trivy DB refresh failed and no cached DB exists"; exit 1
+          fi
+      # --skip-db-update so the scan itself can never re-enter the stall the
+      # step above just bounded.
       - name: Trivy fs scan
-        run: trivy fs --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed .
+        run: trivy fs --skip-db-update --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed .
 
   release:
     needs: [build-and-gate, test-coverage, asyncapi-drift, trivy]
@@ -684,13 +716,45 @@ jobs:
           # /root/.cache/trivy/db/trivy.db. A named volume is daemon-
           # managed and writable by the container, and still persists the
           # ~93 MB DB across runs on the same runner.
+          # Refresh the vuln-DB as a BOUNDED, best-effort step before scanning,
+          # for the same reason as the `trivy` job's fs scan above: the DB is an
+          # OCI pull from a public mirror through the fleet's one NAT IP, and a
+          # throttled mirror STALLS rather than failing fast. Unbounded, that
+          # stall is what pushed mako-bot's arm64 leg past its 90-minute job
+          # bound on 2026-08-23 — skipping `deploy` and `docker-manifest`, so no
+          # image was published and the host kept running a stale one.
+          #
+          # The named volume already persists a ~93 MB DB across runs on this
+          # runner, so the fallback below is nearly always available.
+          REFRESHED=0
+          for i in 1 2 3; do
+            if docker run --rm \
+                 -v trivy-db-cache:/root/.cache/trivy \
+                 aquasec/trivy:0.69.3 image --download-db-only; then
+              REFRESHED=1; break
+            fi
+            echo "DB refresh attempt $i failed; retrying in 20s"; sleep 20
+          done
+          # Only probe the volume when the refresh actually failed. On the happy
+          # path this saves a container start, and it keeps a probe failure from
+          # ever being able to fail a build that already has a fresh DB.
+          if [ "$REFRESHED" -eq 0 ]; then
+            if docker run --rm -v trivy-db-cache:/root/.cache/trivy \
+                 --entrypoint sh aquasec/trivy:0.69.3 \
+                 -c 'test -e /root/.cache/trivy/db/trivy.db'; then
+              echo "::warning::trivy DB refresh failed — scanning with the cached DB"
+            else
+              echo "::error::trivy DB refresh failed and no cached DB exists"; exit 1
+            fi
+          fi
+          # --skip-db-update so the scan cannot re-enter the stall just bounded.
           docker run --rm \
             -v trivy-db-cache:/root/.cache/trivy \
             -v "${DOCKER_SOCK}:/var/run/docker.sock" \
             -v "$(pwd):/work" \
             -w /work \
             aquasec/trivy:0.69.3 \
-            image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed $IGNOREFILE_ARG \
+            image --skip-db-update --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed $IGNOREFILE_ARG \
             ghcr.io/${{ github.repository_owner }}/${{ inputs.binary_name }}:${{ steps.relout.outputs.version }}
 
       - name: Trigger blue/green deploy via homelab-webhook

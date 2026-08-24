@@ -417,8 +417,40 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, rootless]
     steps:
       - uses: actions/checkout@v6
+      # The DB refresh is best-effort ON PURPOSE, and is SEPARATE from the scan.
+      #
+      # trivy's vuln-DB is an OCI pull from a public mirror through the fleet's
+      # ONE NAT IP. A throttled mirror does not fail fast — it stalls. On
+      # 2026-08-23 that timed out github-triage's job at exactly trivy's 5:00
+      # deadline, and burned ~25 min of mako-bot's arm64 leg, which then blew
+      # its 90-minute job bound: `deploy` and `docker-manifest` were skipped, no
+      # image was published, and the host kept deploying a STALE image. Zero
+      # findings were involved — the gate never got to run.
+      #
+      # The cache is NOT the problem and never was: /home/runner-ci/.cache/trivy
+      # is the persistent runner HOME, not the ephemeral _jit dir, and every
+      # runner already holds a ~1.2 GB trivy.db. What was missing is a bound on
+      # the refresh and a fallback to the DB already on disk.
+      #
+      # A stale-by-hours DB is a fine basis for a gate; NO DB at all is not —
+      # hence the hard failure only on a cold cache. The weekly
+      # roles/trivy-scan host timers keep fleet CVE coverage fresh regardless.
+      # Pattern proven in github-triage's own ci.yml since 2026-08-23.
+      - name: Trivy vuln-DB refresh (best-effort — a stalled mirror must not fail CI)
+        run: |
+          for i in 1 2 3; do
+            trivy fs --download-db-only && exit 0
+            echo "DB refresh attempt $i failed; retrying in 20s"; sleep 20
+          done
+          if [ -e "$HOME/.cache/trivy/db/trivy.db" ]; then
+            echo "::warning::trivy DB refresh failed — scanning with the cached DB"
+          else
+            echo "::error::trivy DB refresh failed and no cached DB exists"; exit 1
+          fi
+      # --skip-db-update so the scan itself can never re-enter the stall the
+      # step above just bounded.
       - name: Trivy fs scan
-        run: trivy fs --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed .
+        run: trivy fs --skip-db-update --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed .
 
   release:
     needs: [build-and-gate, test-coverage, trivy]
