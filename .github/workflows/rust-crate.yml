@@ -105,7 +105,7 @@ jobs:
       RUSTUP_HOME: /home/runner-ci/.rustup
       # CARGO_HOME + CARGO_TARGET_DIR inherited from runner.env (homelab role).
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # ─────────────────────────────────────────────────────────────────────
       # Gate — no per-test NATS testcontainers. Integration tests must use the
@@ -250,7 +250,7 @@ jobs:
       PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/runner-ci/.rustup
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Kellnr token: repo secret → env (else runner ambient). See build-and-gate.
       - name: Source kellnr token from repo secret
@@ -416,7 +416,7 @@ jobs:
   trivy:
     runs-on: [self-hosted, Linux, ARM64, rootless]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # The DB refresh is best-effort ON PURPOSE, and is SEPARATE from the scan.
       #
       # trivy's vuln-DB is an OCI pull from a public mirror through the fleet's
@@ -469,7 +469,7 @@ jobs:
       version: ${{ steps.semrel.outputs.new_release_version }}
       tag: ${{ steps.semrel.outputs.new_release_git_tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: true

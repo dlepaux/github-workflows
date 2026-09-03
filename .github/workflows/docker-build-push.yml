@@ -27,7 +27,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build from the release tag, not github.sha — semantic-release bumps
           # version files in a chore(release) commit AFTER the triggering SHA, so
