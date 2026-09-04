@@ -99,7 +99,7 @@ jobs:
   # Compile + lint that share warm target/. Persistent CARGO_TARGET_DIR
   # (runner.env) keeps incremental compile state across runs.
   build-and-gate:
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, Linux, ARM64, rootless, ci-heavy]
     env:
       PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/runner-ci/.rustup
@@ -245,7 +245,7 @@ jobs:
   # srv-core). Sequential keeps a single crate CI inside the cap.
   test-coverage:
     needs: build-and-gate
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, Linux, ARM64, rootless, ci-heavy]
     env:
       PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/runner-ci/.rustup
@@ -414,7 +414,7 @@ jobs:
         run: docker rm -f "${{ steps.nats.outputs.name }}" || true
 
   trivy:
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, rootless, arch-any, ci-medium]
     steps:
       - uses: actions/checkout@v6
       # The DB refresh is best-effort ON PURPOSE, and is SEPARATE from the scan.
@@ -457,7 +457,7 @@ jobs:
     if: |
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push'
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, rootless, arch-any, ci-heavy]
     env:
       PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/runner-ci/.rustup

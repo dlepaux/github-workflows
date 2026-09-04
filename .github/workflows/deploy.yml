@@ -24,7 +24,8 @@ on:
           with '["ubuntu-latest"]' for GitHub-hosted repos. The webhook URL is
           public, so GitHub-hosted runners reach it fine.
         type: string
-        default: '["self-hosted", "rootless"]'
+        # ci-medium + arch-any since 2026-09-04 (jit-fleet-scheduling): one webhook POST.
+        default: '["self-hosted", "rootless", "arch-any", "ci-medium"]'
     secrets:
       webhook-key:
         required: false

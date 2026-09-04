@@ -103,7 +103,7 @@ jobs:
   # keeps incremental compile state across runs — cargo's fingerprint
   # tracking handles staleness.
   build-and-gate:
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, Linux, ARM64, rootless, ci-heavy]
     env:
       PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/runner-ci/.rustup
@@ -278,7 +278,7 @@ jobs:
   # srv-core). Sequential keeps a single service CI inside the cap.
   test-coverage:
     needs: build-and-gate
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, Linux, ARM64, rootless, ci-heavy]
     env:
       PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/runner-ci/.rustup
@@ -454,7 +454,7 @@ jobs:
 
   asyncapi-drift:
     if: inputs.has_asyncapi
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, rootless, arch-any, ci-medium]
     steps:
       - uses: actions/checkout@v6
       # npm token: repo secret → NODE_AUTH_TOKEN (else runner ambient). Only
@@ -489,7 +489,7 @@ jobs:
           fi
 
   trivy:
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, rootless, arch-any, ci-medium]
     steps:
       - uses: actions/checkout@v6
       # The DB refresh is best-effort ON PURPOSE, and is SEPARATE from the scan.
@@ -540,7 +540,7 @@ jobs:
       needs.trivy.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push'
-    runs-on: [self-hosted, Linux, ARM64, rootless]
+    runs-on: [self-hosted, rootless, arch-any, ci-heavy]
     env:
       PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
       RUSTUP_HOME: /home/runner-ci/.rustup

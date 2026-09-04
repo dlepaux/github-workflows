@@ -30,7 +30,9 @@ on:
         # explicitly; the only repos still on the default were the gordon-* set, archived
         # the same day. Kept arch-agnostic on purpose: adding ARM64 here would silently
         # exclude srv-compute for the amd64 callers that do override.
-        default: '["self-hosted", "rootless"]'
+        # ci-heavy since 2026-09-04 (jit-fleet-scheduling): an image build is a heavy
+        # job by definition — it gets the heavy per-host slot and its unit ceiling.
+        default: '["self-hosted", "rootless", "ci-heavy"]'
       cache-image:
         description: >-
           Registry ref for a buildx layer cache (empty = no cache, unchanged behaviour).

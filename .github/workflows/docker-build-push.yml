@@ -22,7 +22,7 @@ on:
 
 jobs:
   docker:
-    runs-on: [self-hosted, rootless]
+    runs-on: [self-hosted, rootless, ci-heavy]
     permissions:
       contents: read
       packages: write

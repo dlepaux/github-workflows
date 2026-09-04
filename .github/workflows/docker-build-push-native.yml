@@ -51,9 +51,9 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: '["self-hosted", "rootless", "X64"]'
+            runner: '["self-hosted", "rootless", "X64", "ci-heavy"]'
           - platform: linux/arm64
-            runner: '["self-hosted", "rootless", "ARM64"]'
+            runner: '["self-hosted", "rootless", "ARM64", "ci-heavy"]'
     runs-on: ${{ fromJSON(matrix.runner) }}
     permissions:
       contents: read
@@ -126,7 +126,8 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: [self-hosted, rootless]
+    # Manifest assembly: a few imagetools calls — medium, and arch-neutral.
+    runs-on: [self-hosted, rootless, arch-any, ci-medium]
     needs: build
     permissions:
       contents: read

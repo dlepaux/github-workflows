@@ -11,7 +11,11 @@ on:
         description: Runner to use (JSON array). Default self-hosted; override
           with '["ubuntu-latest"]' for repos that build/deploy GitHub-hosted.
         type: string
-        default: '["self-hosted", "rootless"]'
+        # ci-medium + arch-any since 2026-09-04 (jit-fleet-scheduling): semantic-release
+        # on Node is small and arch-neutral, so it goes to the little hosts first.
+        # Rust callers whose release step drives cargo must pass a ci-heavy runner —
+        # only the heavy hosts carry a toolchain.
+        default: '["self-hosted", "rootless", "arch-any", "ci-medium"]'
     outputs:
       released:
         description: Whether a new version was released (true/false)
