@@ -12,13 +12,21 @@ on:
         type: string
         default: ''
       retries:
-        description: Number of retry attempts
+        description: POST attempts when the request never reached the webhook (curl 6 DNS, 7 connect,
+          35 TLS). Any other failure is not retried, because the deploy may be running.
         type: number
         default: 3
       retry-delay:
-        description: Delay between retries in seconds
+        description: Delay between those attempts in seconds
         type: number
         default: 30
+      deploy-timeout:
+        description: Whole-deploy budget in seconds, from the POST to a final outcome (HL-135). Derived
+          from homelab-webhook's guarded deploy — one-shot budget 600 s + per-service health gates +
+          a make-before-break handover (≤ 120 s standby, ≤ 60 s takeover) — rounded to 900. The job's
+          timeout-minutes (30) sits above it; keep it under 1500.
+        type: number
+        default: 900
       runner:
         description: Runner to use (JSON array). Default self-hosted; override
           with '["ubuntu-latest"]' for GitHub-hosted repos. The webhook URL is
@@ -39,6 +47,9 @@ jobs:
     # (HOMELAB_WEBHOOK_URL is only set on self-hosted runners).
     runs-on: ${{ fromJSON(inputs.runner) }}
     environment: ${{ inputs.environment || null }}
+    # Above deploy-timeout's 900 s default + 3 unreached POSTs (30 s delay + 10 s connect each) + one
+    # 50 s wait: 30 min leaves room for a deploy-timeout up to 1500 s.
+    timeout-minutes: 30
     steps:
       - name: Resolve deploy credentials
         id: creds
@@ -64,21 +75,32 @@ jobs:
           echo "url=${URL}" >> "$GITHUB_OUTPUT"
 
       - name: Trigger deploy webhook
-        # NOT `bash -e` (the Actions default): this step's retry loop must own its
-        # own exit code. Under `-e`, `HTTP_CODE=$(curl …)` aborts the WHOLE script
-        # the instant curl returns non-zero on a transport error (connect-refused/
-        # DNS/timeout/TLS) — so the loop died on attempt 1 and the 3× retry never
-        # ran (the very resilience this step exists to provide). `pipefail` + `-u`
-        # keep the safety that matters; the loop handles curl's exit itself.
+        # The script reads only env: tests/deploy-step/run.sh extracts this exact `run:` block from
+        # this file and runs it against a fake webhook, so what is tested is what runs.
+        #
+        # NOT `bash -e` (the Actions default): the loops own their exit codes. Under `-e`,
+        # `HTTP_CODE=$(curl …)` aborts on curl's first non-zero transport status.
         shell: bash
+        env:
+          URL: ${{ steps.creds.outputs.url }}
+          KEY: ${{ steps.creds.outputs.key }}
+          RETRIES: ${{ inputs.retries }}
+          DELAY: ${{ inputs.retry-delay }}
+          DEPLOY_TIMEOUT: ${{ inputs.deploy-timeout }}
         run: |
           set -uo pipefail
-          RETRIES=${{ inputs.retries }}
-          DELAY=${{ inputs.retry-delay }}
-          URL="${{ steps.creds.outputs.url }}"
+          # How the deploy reaches an outcome (HL-135). Every proxy to a webhook cuts a request at
+          # 360 s, and a guarded deploy can take longer, so the POST opts in to `Prefer:
+          # respond-async`: a current webhook answers within WAIT seconds, with the outcome (200 /
+          # 500) or 202 + deploy_id, and the step polls GET /deploy/{id}. A webhook that predates
+          # it ignores the header and answers synchronously, as before.
+          #
+          # Never a second POST once one may have reached the webhook: a retried deploy re-runs a
+          # whole guarded deploy (a second handover). Only DNS / connect / TLS failures retry.
+          WAIT=${WAIT:-50}                    # under every proxy's 360 s proxy_read_timeout
+          POST_MAX_TIME=${POST_MAX_TIME:-400} # a synchronous (older) webhook still gets the proxies' 360 s
+          POLL_PAUSE=${POLL_PAUSE:-5}         # after a failed poll request, before the next
 
-          # Translate curl's transport exit codes into a human label so the next
-          # outage is diagnosable at a glance instead of a bare "exit code N".
           curl_reason() {
             case "$1" in
               0)  echo "curl ok (HTTP-level failure, not transport)" ;;
@@ -91,44 +113,78 @@ jobs:
               *)  echo "curl error (see https://curl.se/libcurl/c/libcurl-errors.html)" ;;
             esac
           }
+          show_body() { echo "--- response body ---"; cat "$1"; echo ""; echo "---------------------"; }
 
+          STARTED=$(date +%s)
+          RESPONSE=$(mktemp)
+          trap 'rm -f "$RESPONSE"' EXIT
+
+          # ---- POST -------------------------------------------------------------------------
           for attempt in $(seq 1 "$RETRIES"); do
             echo "Deploy attempt ${attempt}/${RETRIES} → POST ${URL}"
-            RESPONSE=$(mktemp)
-            # `|| CURL_EXIT=$?` keeps the non-zero transport status without `-e`
-            # tearing the loop down; --connect-timeout fails a black-hole host
-            # fast instead of burning the full --max-time read budget per try.
             CURL_EXIT=0
             HTTP_CODE=$(curl -s -o "$RESPONSE" -w "%{http_code}" \
-              --connect-timeout 10 --max-time 180 -X POST \
-              -H "Authorization: Bearer ${{ steps.creds.outputs.key }}" \
+              --connect-timeout 10 --max-time "$POST_MAX_TIME" -X POST \
+              -H "Authorization: Bearer ${KEY}" -H "Prefer: respond-async" \
               "$URL") || CURL_EXIT=$?
-
-            if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-              echo "Deploy successful (HTTP $HTTP_CODE)"
-              cat "$RESPONSE"
-              rm -f "$RESPONSE"
-              exit 0
-            fi
-
-            # Legible failure: transport-vs-HTTP, the curl exit code + its meaning,
-            # the HTTP status (000 when the request never completed), and the body.
-            if [ "$CURL_EXIT" -ne 0 ]; then
-              echo "::warning::Deploy attempt ${attempt} TRANSPORT failure: curl exit ${CURL_EXIT} ($(curl_reason "$CURL_EXIT")); HTTP_CODE=${HTTP_CODE}"
-            else
-              echo "::warning::Deploy attempt ${attempt} HTTP failure: status ${HTTP_CODE}"
-            fi
-            echo "--- response body ---"
-            cat "$RESPONSE"
-            echo ""
-            echo "---------------------"
-            rm -f "$RESPONSE"
-
-            if [ "$attempt" -lt "$RETRIES" ]; then
-              echo "Retrying in ${DELAY}s..."
-              sleep "$DELAY"
-            fi
+            case "$CURL_EXIT" in
+              0) break ;;
+              6|7|35)
+                echo "::warning::Deploy attempt ${attempt}: the request never reached the webhook: curl exit ${CURL_EXIT} ($(curl_reason "$CURL_EXIT"))"
+                if [ "$attempt" -lt "$RETRIES" ]; then echo "Retrying in ${DELAY}s..."; sleep "$DELAY"; fi ;;
+              *)
+                echo "::error::Deploy POST failed after it may have reached the webhook: curl exit ${CURL_EXIT} ($(curl_reason "$CURL_EXIT")). NOT retried — a second POST could run the deploy again. The deploy may still be running: check the host (docker logs homelab-webhook)."
+                exit 1 ;;
+            esac
           done
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "::error::Deploy failed: the webhook at ${URL} was unreachable on all ${RETRIES} attempts (last curl exit ${CURL_EXIT}, $(curl_reason "$CURL_EXIT")). This is an infra/homelab outage, not a code regression; re-run once the host is back."
+            exit 1
+          fi
 
-          echo "::error::Deploy failed after ${RETRIES} attempts to ${URL} (last: curl exit ${CURL_EXIT:-?} / HTTP ${HTTP_CODE:-?}). If transport (curl 6/7/28), the webhook host was unreachable — this is an infra/homelab outage, not a code regression; re-run once the host is back."
-          exit 1
+          DEPLOY_ID=$(grep -oE '"deploy_id"[[:space:]]*:[[:space:]]*"[0-9a-f]+"' "$RESPONSE" | grep -oE '[0-9a-f]{16,}' | head -1 || true)
+          case "$HTTP_CODE" in
+            200|201|204)
+              echo "Deploy successful (HTTP $HTTP_CODE)"; cat "$RESPONSE"; echo ""; exit 0 ;;
+            202)
+              if [ -z "$DEPLOY_ID" ]; then
+                # auto_deploy = false answers 202 "accepted": deliberately not deployed. Any other 202
+                # without an id has no outcome to wait for, and must never read as success.
+                if grep -qE '"status"[[:space:]]*:[[:space:]]*"accepted"' "$RESPONSE"; then
+                  echo "Deploy accepted, not run (HTTP 202, auto_deploy = false)"; cat "$RESPONSE"; echo ""; exit 0
+                fi
+                echo "::error::Deploy answered 202 without a deploy_id: no outcome to wait for"; show_body "$RESPONSE"; exit 1
+              fi ;;
+            *)
+              echo "::error::Deploy failed: HTTP ${HTTP_CODE}"; show_body "$RESPONSE"; exit 1 ;;
+          esac
+
+          # ---- poll GET /deploy/{id} ----------------------------------------------------------
+          echo "Deploy ${DEPLOY_ID} running; polling for up to ${DEPLOY_TIMEOUT}s from the POST"
+          while :; do
+            if [ $(( $(date +%s) - STARTED )) -ge "$DEPLOY_TIMEOUT" ]; then
+              echo "::error::Deploy ${DEPLOY_ID} still running after ${DEPLOY_TIMEOUT}s. Not re-POSTed; its outcome is on the host (docker logs homelab-webhook)."
+              exit 1
+            fi
+            CURL_EXIT=0
+            HTTP_CODE=$(curl -s -o "$RESPONSE" -w "%{http_code}" \
+              --connect-timeout 10 --max-time $(( WAIT + 30 )) \
+              -H "Authorization: Bearer ${KEY}" \
+              "${URL}/${DEPLOY_ID}?wait=${WAIT}") || CURL_EXIT=$?
+            if [ "$CURL_EXIT" -ne 0 ]; then
+              # A poll is read-only: retrying it never re-runs the deploy.
+              echo "::warning::Poll failed: curl exit ${CURL_EXIT} ($(curl_reason "$CURL_EXIT")); retrying"
+              sleep "$POLL_PAUSE"; continue
+            fi
+            case "$HTTP_CODE" in
+              200) echo "Deploy ${DEPLOY_ID} successful"; cat "$RESPONSE"; echo ""; exit 0 ;;
+              202) echo "Deploy ${DEPLOY_ID} still running ($(( $(date +%s) - STARTED ))s)" ;;
+              404)
+                echo "::error::Deploy ${DEPLOY_ID} outcome unknown — the webhook no longer knows it (restarted, or the outcome expired). Not re-POSTed; check the host."
+                show_body "$RESPONSE"; exit 1 ;;
+              500) echo "::error::Deploy ${DEPLOY_ID} failed"; show_body "$RESPONSE"; exit 1 ;;
+              *)
+                echo "::warning::Poll got HTTP ${HTTP_CODE} (a proxy between us and the webhook?); retrying"
+                sleep "$POLL_PAUSE" ;;
+            esac
+          done

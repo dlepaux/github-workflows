@@ -1,0 +1,23 @@
+name: test-deploy-step
+
+# Repo housekeeping, not a reusable job: runs deploy.yml's own "Trigger deploy webhook" script against a
+# scripted webhook (tests/deploy-step/run.sh, HL-135) whenever either changes. GitHub-hosted, like
+# sync-major-tag.yml: every repo's deploy runs deploy.yml@main, so this must not depend on the homelab.
+
+on:
+  push:
+    paths: ['.github/workflows/deploy.yml', 'tests/deploy-step/**', '.github/workflows/test-deploy-step.yml']
+  pull_request:
+    paths: ['.github/workflows/deploy.yml', 'tests/deploy-step/**', '.github/workflows/test-deploy-step.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-step:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --quiet pyyaml
+      - run: bash tests/deploy-step/run.sh

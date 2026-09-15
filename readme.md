@@ -86,12 +86,18 @@ wake:
 
 ### deploy.yml
 
-Webhook deploy with configurable retry logic.
+Webhook deploy that waits for the deploy's real outcome (HL-135). The POST asks for `Prefer: respond-async`: a
+current homelab-webhook answers within 50 s with the outcome or `202` + `deploy_id`, and the job polls
+`GET /deploy/{id}` until `deploy-timeout`. An older webhook ignores the header and answers synchronously.
+A POST is retried only when it never reached the webhook (curl 6 / 7 / 35); a failure after that, a `404`
+on a poll (the webhook lost the outcome) or a spent budget fails the job without a second POST, because a
+second POST would run the deploy again. Tested by `tests/deploy-step/run.sh`, which runs this step's
+own `run:` block against a scripted webhook.
 
 | | |
 |---|---|
-| **Runner** | `ubuntu-latest` |
-| **Inputs** | `webhook-url` (default: webhook.lepaux.com), `retries` (default: `3`), `retry-delay` (default: `30`s) |
+| **Runner** | self-hosted by default (`runner` input) |
+| **Inputs** | `webhook-url` (default: webhook.lepaux.com), `retries` (default: `3`, unreached POSTs only), `retry-delay` (default: `30`s), `deploy-timeout` (default: `900`s, the whole deploy; job `timeout-minutes` is 30) |
 | **Secrets** | `webhook-key` (explicit, not inherited) |
 
 ```yaml
