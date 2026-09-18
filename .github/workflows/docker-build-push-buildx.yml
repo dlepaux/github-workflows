@@ -65,15 +65,35 @@ jobs:
           # the image tag. Empty version → '' → default checkout (github.sha).
           ref: ${{ inputs.version != '' && format('refs/tags/v{0}', inputs.version) || '' }}
 
-      # QEMU is only needed for cross-architecture emulation (multi-arch builds,
-      # or single-arch builds where target != runner arch). Skip on native
-      # single-arch builds — required on rootless runners where binfmt
-      # registration needs CAP_SYS_ADMIN and would fail with
-      # "cannot mount binfmt_misc filesystem".
+      # QEMU is only needed when a target platform differs from the runner's arch.
+      # setup-qemu-action registers binfmt, which needs CAP_SYS_ADMIN — a rootless
+      # runner fails it with "cannot mount binfmt_misc filesystem". The x64 fleet
+      # runners therefore register qemu-aarch64 themselves (homelab runner-rootless,
+      # HL-153): when the kernel already holds the interpreter, the action is skipped.
+      # A cross-compiling Dockerfile only emulates its runtime stage's RUN steps; the
+      # compile runs natively on $BUILDPLATFORM.
+      - name: Decide whether QEMU must be registered
+        id: qemu
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          BINFMT_DIR: /proc/sys/fs/binfmt_misc   # overridden by tests/qemu-decision
+        run: |
+          case "$RUNNER_ARCH" in
+            X64)   foreign=linux/arm64; interp=qemu-aarch64 ;;
+            ARM64) foreign=linux/amd64; interp=qemu-x86_64 ;;
+            *)     echo "setup=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          if ! printf '%s' "$PLATFORMS" | tr ',' '\n' | grep -qx "$foreign"; then
+            echo "setup=false" >> "$GITHUB_OUTPUT"   # native build, nothing to emulate
+          elif head -n1 "$BINFMT_DIR/$interp" 2>/dev/null | grep -qx enabled; then
+            echo "setup=false" >> "$GITHUB_OUTPUT"   # host-registered interpreter
+            echo "using the host's $interp binfmt for $foreign"
+          else
+            echo "setup=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up QEMU
-        if: |
-          !(inputs.platforms == 'linux/arm64' && runner.arch == 'ARM64') &&
-          !(inputs.platforms == 'linux/amd64' && runner.arch == 'X64')
+        if: steps.qemu.outputs.setup == 'true'
         uses: docker/setup-qemu-action@v4
 
       - uses: docker/setup-buildx-action@v4

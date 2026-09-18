@@ -1,0 +1,24 @@
+name: test-qemu-decision
+
+# Repo housekeeping, not a reusable job: runs docker-build-push-buildx.yml's own "Decide whether
+# QEMU must be registered" script against a fake binfmt_misc directory (tests/qemu-decision/run.sh,
+# HL-153) whenever either changes. GitHub-hosted, like test-deploy-step.yml: every image build
+# runs this workflow @main, so its test must not depend on the homelab.
+
+on:
+  push:
+    paths: ['.github/workflows/docker-build-push-buildx.yml', 'tests/qemu-decision/**', '.github/workflows/test-qemu-decision.yml']
+  pull_request:
+    paths: ['.github/workflows/docker-build-push-buildx.yml', 'tests/qemu-decision/**', '.github/workflows/test-qemu-decision.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  qemu-decision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --quiet pyyaml
+      - run: bash tests/qemu-decision/run.sh
