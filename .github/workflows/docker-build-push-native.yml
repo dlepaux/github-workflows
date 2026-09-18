@@ -19,6 +19,16 @@ on:
         description: Docker build args as multiline KEY=VALUE (one per line)
         type: string
         default: ''
+      arm64-runner:
+        description: >-
+          JSON runs-on for the linux/arm64 leg. Default = native on the ARM tier. A repo
+          whose Dockerfile cross-compiles from $BUILDPLATFORM passes
+          '["self-hosted","rootless","X64","arch-any","ci-heavy"]' so the leg prefers the
+          x64 hosts, which run its runtime-stage RUN steps through their own qemu binfmt
+          (homelab runner-rootless, HL-153). No QEMU setup step here: the fleet hosts
+          provide it, and setup-qemu-action cannot run on a rootless runner.
+        type: string
+        default: '["self-hosted", "rootless", "ARM64", "ci-heavy"]'
 
 jobs:
   # NO `wake` JOB, deliberately — removed 2026-08-21.
@@ -53,7 +63,7 @@ jobs:
           - platform: linux/amd64
             runner: '["self-hosted", "rootless", "X64", "ci-heavy"]'
           - platform: linux/arm64
-            runner: '["self-hosted", "rootless", "ARM64", "ci-heavy"]'
+            runner: ${{ inputs.arm64-runner }}
     runs-on: ${{ fromJSON(matrix.runner) }}
     permissions:
       contents: read

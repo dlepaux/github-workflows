@@ -19,10 +19,27 @@ on:
         description: Add NODE_AUTH_TOKEN build arg for GitHub Packages auth
         type: boolean
         default: false
+      runner:
+        description: >-
+          JSON runs-on list. Default is the historical hardcoded value (tokenless = the
+          fleet's ARM64 tier). An arm64 image built on x64 passes
+          '["self-hosted","rootless","X64","arch-any","ci-heavy"]' plus `platform` (HL-153).
+        type: string
+        default: '["self-hosted", "rootless", "ci-heavy"]'
+      platform:
+        description: >-
+          Target platform passed to `docker build --platform` (e.g. linux/arm64). Empty =
+          the runner's own arch (unchanged behaviour). Set it whenever `runner` can land on
+          a different arch, or an x64 runner silently ships an amd64 image. A foreign
+          target's RUN steps execute through the host's qemu binfmt (homelab
+          runner-rootless registers it on the x64 runners), so the Dockerfile should build
+          on $BUILDPLATFORM and leave only its runtime stage to emulation.
+        type: string
+        default: ''
 
 jobs:
   docker:
-    runs-on: [self-hosted, rootless, ci-heavy]
+    runs-on: ${{ fromJSON(inputs.runner) }}
     permissions:
       contents: read
       packages: write
@@ -63,7 +80,11 @@ jobs:
           if [ "${{ inputs.inject-npm-token }}" = "true" ]; then
             BUILD_ARGS="${BUILD_ARGS} --build-arg NODE_AUTH_TOKEN=${NPM_TOKEN:-${GITHUB_TOKEN}}"
           fi
-          DOCKER_BUILDKIT=1 docker build ${BUILD_ARGS} ${TAGS} .
+          PLATFORM=""
+          if [ -n "${{ inputs.platform }}" ]; then
+            PLATFORM="--platform ${{ inputs.platform }}"
+          fi
+          DOCKER_BUILDKIT=1 docker build ${PLATFORM} ${BUILD_ARGS} ${TAGS} .
 
       - name: Push Docker image
         run: docker push --all-tags ${{ inputs.image-name }}
