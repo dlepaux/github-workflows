@@ -1,0 +1,143 @@
+name: Notify manifest
+
+# Tells mako-workspace that a component has published a release, so the promotion gate can
+# re-resolve the system tuple (MK-439 / MK-440, Phase 1 of MK-436).
+#
+# Sits beside deploy.yml, which the same five repos already call. In Phase 1 both run: this one
+# notifies, deploy: still deploys. Phase 3 removes deploy: from all five and the promoted manifest
+# becomes the definition of prod.
+#
+# 🚨 THE PAYLOAD IS A NOTIFICATION, NOT DATA. It carries the component name and version for
+# ATTRIBUTION ONLY. The promote job re-resolves all five digests from GHCR at the start of every
+# run and never reads a digest from here. That is what makes the gate's coalescing lossless:
+# `concurrency: { group: mako-promotion, cancel-in-progress: false }` cancels a PENDING run when a
+# newer event lands, so a payload carrying the only copy of a digest would silently drop that
+# component's release. Do not be tempted to "optimise" by sending the digest.
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: The component that released — attribution only, never used as data.
+        required: true
+        type: string
+      version:
+        description: >-
+          Its released version, if the caller's release job exposes one. Attribution only, and
+          deliberately optional: mako-bot's release job outputs `released` but no `version`, while
+          mako-mcp's outputs released/version/tag. An empty value is a fact, not a failure.
+        required: false
+        type: string
+        default: ''
+      target-repo:
+        description: The repo that owns the manifest and receives the dispatch.
+        required: false
+        type: string
+        default: mako-workspace
+      target-owner:
+        required: false
+        type: string
+        default: dlepaux
+      runner:
+        description: Runner to use (JSON array). One API call — ci-medium, as deploy.yml does.
+        required: false
+        type: string
+        default: '["self-hosted", "rootless", "arch-any", "ci-medium"]'
+    secrets:
+      app-id:
+        required: true
+      app-key:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 10
+    steps:
+      # 🚨 `owner` and `repositories` are REQUIRED here and are the whole trick. The App
+      # (`mako-promotion-notifier`) is installed on mako-workspace ONLY — deliberately, so the
+      # credential cannot reach the repo it is invoked from. This action DEFAULTS to scoping the
+      # token to the CALLING repository, where there is no installation, and then fails with a
+      # confusing "installation not found". Naming the target mints a token scoped to the one repo
+      # that matters. Verified 2026-09-21: v3 is the current major (v3.2.0).
+      - name: Mint an installation token for ${{ inputs.target-repo }}
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-key }}
+          owner: ${{ inputs.target-owner }}
+          repositories: ${{ inputs.target-repo }}
+
+      - name: Dispatch component-released
+        env:
+          # Through the environment, never spliced into the program text with ${{ }}. A component
+          # or version containing a quote would otherwise end the string and the rest would run.
+          GH_APP_TOKEN: ${{ steps.token.outputs.token }}
+          COMPONENT: ${{ inputs.component }}
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ inputs.target-owner }}/${{ inputs.target-repo }}
+        run: |
+          set -euo pipefail
+
+          # jq builds the body so the payload is DATA end to end — no string interpolation anywhere
+          # a quote could change the shape of the JSON.
+          body="$(jq -nc --arg c "$COMPONENT" --arg v "$VERSION" \
+            '{event_type: "component-released", client_payload: {component: $c, version: $v}}')"
+
+          # Bounded retry with linear backoff, reading the HTTP CODE DIRECTLY into a variable.
+          # Never `curl … | grep`, never trusting curl's exit status: curl exits 0 for a 401 and a
+          # 404 exactly as it does for the 204 this endpoint returns on success. A wrapper's exit
+          # status is not the request's.
+          ok=false
+          for attempt in 1 2 3; do
+            code="$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer $GH_APP_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -d "$body" \
+              "https://api.github.com/repos/$TARGET/dispatches" || true)"
+
+            if [ "$code" = "204" ]; then
+              echo "dispatched component-released for $COMPONENT ${VERSION:-(no version)} → $TARGET"
+              ok=true
+              break
+            fi
+
+            # 401/403/404 are configuration, not weather: the App is not installed on $TARGET, the
+            # token lacks contents:write, or the secrets did not land. Retrying cannot fix any of
+            # them, and three identical failures just delay a clear error by a minute.
+            case "$code" in
+              401|403|404)
+                echo "::error::notify-manifest: HTTP $code from $TARGET/dispatches — this is a configuration problem, not a transient one."
+                echo "::error::  Check the App is installed on $TARGET with contents:write, and that MAKO_PROMOTION_APP_ID/KEY are set on this repo."
+                cat /tmp/dispatch.out || true
+                exit 1
+                ;;
+            esac
+
+            echo "attempt $attempt: HTTP $code — retrying"
+            cat /tmp/dispatch.out || true
+            [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
+          done
+
+          if [ "$ok" != true ]; then
+            echo "::error::notify-manifest: could not dispatch after 3 attempts (last HTTP $code)"
+            exit 1
+          fi
+
+      # A dispatch that silently goes nowhere is the failure mode this whole epic is about, so say
+      # plainly what was sent and what it does NOT mean.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Notified the promotion gate"
+            echo
+            echo "- component: \`${{ inputs.component }}\`"
+            echo "- version: \`${{ inputs.version }}\`"
+            echo "- target: \`${{ inputs.target-owner }}/${{ inputs.target-repo }}\`"
+            echo
+            echo "_The gate re-resolves every component's digest itself. This payload is attribution only._"
+          } >> "$GITHUB_STEP_SUMMARY"
