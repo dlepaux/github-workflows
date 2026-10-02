@@ -52,7 +52,7 @@ Multi-arch Docker build with buildx (QEMU for cross-arch emulation). Runs on the
 | | |
 |---|---|
 | **Runner** | `[self-hosted, homelab]` (override via `runner`) |
-| **Inputs** | `image-name` (required), `version`, `platforms` (default: `linux/amd64,linux/arm64`), `build-args`, `runner` (default: `["self-hosted", "homelab"]`) |
+| **Inputs** | `image-name` (required), `version`, `platforms` (default: `linux/amd64,linux/arm64`), `build-args`, `runner` (default: `["self-hosted", "homelab"]`), `test-script` |
 | **Secrets** | Inherited (`GITHUB_TOKEN`) |
 | **Tags** | `:latest`, `:sha-<7chars>`, `:<version>` (if provided) |
 
@@ -67,6 +67,12 @@ docker:
     # platforms defaults to linux/amd64,linux/arm64; override to narrow
   secrets: inherit
 ```
+
+`test-script` is the path of a script in the calling repo that runs the image before it is
+published. The image is pushed by digest with no tag, the script is run with bash on the
+runner with `IMAGE=<name>@sha256:...`, and only if it exits 0 do the tags above point at that
+digest. For one platform, built on a runner of that platform. The script shares the runner's
+docker with other jobs: it names what it makes per run and removes it when it fails too.
 
 ### wake-compute.yml
 

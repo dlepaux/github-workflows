@@ -47,6 +47,16 @@ on:
           non-root-Dockerfile image (a repo that publishes more than one image).
         type: string
         default: ./Dockerfile
+      test-script:
+        description: >-
+          Path of a script in the calling repo that runs the image before it is published
+          (empty = no test, unchanged behaviour). The image is pushed by digest, with no tag,
+          and the script is run with bash on the runner with that reference in IMAGE
+          (name@sha256:...). Only if it exits 0 are `latest`, the sha and the version tag
+          pointed at that digest: an image that fails is in the registry and nothing pulls it.
+          For a single platform built on a runner of that platform, since the script runs it.
+        type: string
+        default: ''
 
 jobs:
   docker:
@@ -116,20 +126,26 @@ jobs:
             ${{ inputs.version != '' && format('type=raw,value={0}', inputs.version) || '' }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           # Default ./Dockerfile (unchanged for existing callers); overridable so a repo can
           # publish more than one image from distinct Dockerfiles.
           file: ${{ inputs.dockerfile }}
-          push: true
+          # With a test-script nothing is tagged here: the image goes up by digest (the
+          # `outputs` line, as docker-build-push-native.yml pushes each arch) and the last
+          # step tags it. Without one, `push` and `tags` are what they always were and
+          # `outputs` is empty.
+          push: ${{ inputs.test-script == '' }}
+          outputs: ${{ inputs.test-script != '' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', inputs.image-name) || '' }}
           # Always re-resolve FROM tags against the registry. Self-hosted
           # runners persist BuildKit's local image store, so without this a
           # rebuild reuses a months-old cached base (e.g. nginx:alpine) and
           # silently ships its CVEs even after a forced rebuild.
           pull: true
           platforms: ${{ inputs.platforms }}
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ inputs.test-script == '' && steps.meta.outputs.tags || '' }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ inputs.build-args }}
           # Opt-in registry layer cache (cache-image set). type=registry, not type=local:
@@ -138,3 +154,28 @@ jobs:
           # host-independent. Empty cache-image → empty args → no cache (default).
           cache-from: ${{ inputs.cache-image != '' && format('type=registry,ref={0}', inputs.cache-image) || '' }}
           cache-to: ${{ inputs.cache-image != '' && format('type=registry,ref={0},mode=max', inputs.cache-image) || '' }}
+
+      # The caller's test of the image it just built, on this runner's docker. A build that
+      # passes its unit tests can still ship an image that cannot do its job (dinle,
+      # 2026-10-02: the worker's unpinned compose could start no engine).
+      - name: Test the image before it is tagged
+        if: inputs.test-script != ''
+        timeout-minutes: 15
+        env:
+          IMAGE: ${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          TEST_SCRIPT: ${{ inputs.test-script }}
+        run: bash "$TEST_SCRIPT"
+
+      # By digest, so what is tagged is the image that was tested and not a second build
+      # of it. Tested by tests/tag-tested-image/run.sh against a registry of its own.
+      - name: Tag the tested image
+        if: inputs.test-script != ''
+        env:
+          IMAGE: ${{ inputs.image-name }}@${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          tags=()
+          while IFS= read -r tag; do
+            [ -z "$tag" ] || tags+=(-t "$tag")
+          done <<< "$TAGS"
+          docker buildx imagetools create "${tags[@]}" "$IMAGE"

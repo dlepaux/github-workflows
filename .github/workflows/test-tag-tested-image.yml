@@ -1,0 +1,24 @@
+name: test-tag-tested-image
+
+# Repo housekeeping, not a reusable job: runs docker-build-push-buildx.yml's own "Tag the tested
+# image" script against a registry of its own (tests/tag-tested-image/run.sh) whenever either
+# changes. GitHub-hosted, like test-qemu-decision.yml: every image build runs that workflow @main,
+# so its test must not depend on the homelab.
+
+on:
+  push:
+    paths: ['.github/workflows/docker-build-push-buildx.yml', 'tests/tag-tested-image/**', '.github/workflows/test-tag-tested-image.yml']
+  pull_request:
+    paths: ['.github/workflows/docker-build-push-buildx.yml', 'tests/tag-tested-image/**', '.github/workflows/test-tag-tested-image.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  tag-tested-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --quiet pyyaml
+      - run: bash tests/tag-tested-image/run.sh
