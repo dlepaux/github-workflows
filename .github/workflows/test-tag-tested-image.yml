@@ -19,6 +19,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: python3 -m pip install --quiet pyyaml
       - run: bash tests/tag-tested-image/run.sh
