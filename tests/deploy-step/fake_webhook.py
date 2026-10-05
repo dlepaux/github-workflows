@@ -1,7 +1,8 @@
 """A scripted homelab-webhook for tests/deploy-step/run.sh (HL-135). Usage: fake_webhook.py <port> <scenario> <log>.
 
-Every request is appended to <log> as "METHOD PATH". Scenarios answer POST /deploy and GET /deploy/<id>
-the way the webhook would in that situation."""
+Every request is appended to <log> as "METHOD PATH prefer=… auth=…", the Authorization header kept so
+run.sh can check each request carried the key. Scenarios answer POST /deploy and GET /deploy/<id> the way
+the webhook would in that situation."""
 import http.server
 import json
 import sys
@@ -26,7 +27,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def record(self):
         with open(LOG, "a") as f:
-            f.write(f"{self.command} {self.path} prefer={self.headers.get('Prefer', '')}\n")
+            f.write(f"{self.command} {self.path} prefer={self.headers.get('Prefer', '')}"
+                    f" auth={self.headers.get('Authorization', '')}\n")
 
     def do_POST(self):
         self.record()

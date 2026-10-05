@@ -53,9 +53,14 @@ jobs:
     steps:
       - name: Resolve deploy credentials
         id: creds
+        # The secret and the input arrive in the environment, never pasted into the script's text:
+        # the runner writes that text to a file, and an expression there is also an injection point.
+        env:
+          KEY_INPUT: ${{ secrets.webhook-key }}
+          URL_INPUT: ${{ inputs.webhook-url }}
         run: |
           # Resolve webhook key: prefer secrets input, fall back to runner env
-          KEY="${{ secrets.webhook-key }}"
+          KEY="${KEY_INPUT:-}"
           if [ -z "$KEY" ]; then
             KEY="${WEBHOOK_DEPLOY_KEY:-}"
           fi
@@ -68,7 +73,7 @@ jobs:
 
           # Resolve webhook URL: prefer non-default input, fall back to runner env, else hardcoded default
           # HOMELAB_WEBHOOK_URL stores the base (no /deploy path) — append it here.
-          URL="${{ inputs.webhook-url }}"
+          URL="${URL_INPUT}"
           if [ "$URL" = "https://webhook.lepaux.com/deploy" ] && [ -n "${HOMELAB_WEBHOOK_URL:-}" ]; then
             URL="${HOMELAB_WEBHOOK_URL}/deploy"
           fi
@@ -115,6 +120,17 @@ jobs:
           }
           show_body() { echo "--- response body ---"; cat "$1"; echo ""; echo "---------------------"; }
 
+          # The key reaches curl as a config on its stdin (`-K -`), written by printf, a shell builtin:
+          # never as an argument, because on a self-hosted runner /proc/<pid>/cmdline is readable by
+          # every user. A key that curl's config quoting cannot carry is refused before any request;
+          # the vault's keys are hex.
+          case "$KEY" in
+            *'"'*|*'\'*|*$'\n'*)
+              echo "::error::The webhook key holds a double quote, a backslash or a newline, so it cannot be sent safely"
+              exit 1 ;;
+          esac
+          auth_config() { printf 'header = "Authorization: Bearer %s"\n' "$KEY"; }
+
           STARTED=$(date +%s)
           RESPONSE=$(mktemp)
           trap 'rm -f "$RESPONSE"' EXIT
@@ -123,9 +139,9 @@ jobs:
           for attempt in $(seq 1 "$RETRIES"); do
             echo "Deploy attempt ${attempt}/${RETRIES} → POST ${URL}"
             CURL_EXIT=0
-            HTTP_CODE=$(curl -s -o "$RESPONSE" -w "%{http_code}" \
+            HTTP_CODE=$(auth_config | curl -K - -s -o "$RESPONSE" -w "%{http_code}" \
               --connect-timeout 10 --max-time "$POST_MAX_TIME" -X POST \
-              -H "Authorization: Bearer ${KEY}" -H "Prefer: respond-async" \
+              -H "Prefer: respond-async" \
               "$URL") || CURL_EXIT=$?
             case "$CURL_EXIT" in
               0) break ;;
@@ -167,9 +183,8 @@ jobs:
               exit 1
             fi
             CURL_EXIT=0
-            HTTP_CODE=$(curl -s -o "$RESPONSE" -w "%{http_code}" \
+            HTTP_CODE=$(auth_config | curl -K - -s -o "$RESPONSE" -w "%{http_code}" \
               --connect-timeout 10 --max-time $(( WAIT + 30 )) \
-              -H "Authorization: Bearer ${KEY}" \
               "${URL}/${DEPLOY_ID}?wait=${WAIT}") || CURL_EXIT=$?
             if [ "$CURL_EXIT" -ne 0 ]; then
               # A poll is read-only: retrying it never re-runs the deploy.
