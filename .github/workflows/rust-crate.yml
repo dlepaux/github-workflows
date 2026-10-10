@@ -505,7 +505,7 @@ jobs:
 
       - name: Run semantic-release
         id: semrel
-        uses: cycjimmy/semantic-release-action@v5
+        uses: cycjimmy/semantic-release-action@v7.1.2
         with:
           semantic_version: 24
           extra_plugins: |
