@@ -29,6 +29,13 @@ on:
           provide it, and setup-qemu-action cannot run on a rootless runner.
         type: string
         default: '["self-hosted", "rootless", "ARM64", "ci-heavy"]'
+    secrets:
+      CARGO_GIT_TOKEN:
+        description: >-
+          Read token for a private git dependency, passed to the build as the BuildKit secret
+          `cargo_git_token`. Optional: a caller with no private dependency passes nothing, and a
+          mount that is not `required` reads as empty.
+        required: false
 
 jobs:
   # NO `wake` JOB, deliberately — removed 2026-08-21.
@@ -106,6 +113,8 @@ jobs:
           pull: true
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ inputs.build-args }}
+          secrets: |
+            cargo_git_token=${{ secrets.CARGO_GIT_TOKEN }}
           # Supply-chain attestations: SBOM (what's inside) + provenance
           # (how it was built). Adds ~30s per arch build; carried into the
           # final multi-arch manifest because each per-arch image is pushed
