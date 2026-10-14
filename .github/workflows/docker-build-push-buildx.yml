@@ -124,6 +124,10 @@ jobs:
             type=raw,value=latest
             type=sha
             ${{ inputs.version != '' && format('type=raw,value={0}', inputs.version) || '' }}
+          # metadata-action derives the version label from the FIRST tag, `latest`, and its labels
+          # override the Dockerfile's, so every released image claimed version "latest".
+          labels: |
+            ${{ inputs.version != '' && format('org.opencontainers.image.version={0}', inputs.version) || '' }}
 
       - name: Build and push
         id: build
