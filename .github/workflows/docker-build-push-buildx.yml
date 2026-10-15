@@ -57,6 +57,13 @@ on:
           For a single platform built on a runner of that platform, since the script runs it.
         type: string
         default: ''
+    secrets:
+      CARGO_GIT_TOKEN:
+        description: >-
+          Read token for a private git dependency, passed to the build as the BuildKit secret
+          `cargo_git_token`. Optional: a caller with no private dependency passes nothing, and a
+          mount that is not `required` reads as empty.
+        required: false
 
 jobs:
   docker:
@@ -152,6 +159,9 @@ jobs:
           tags: ${{ inputs.test-script == '' && steps.meta.outputs.tags || '' }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ inputs.build-args }}
+          # A secret, never a build arg: build args land in the image history.
+          secrets: |
+            cargo_git_token=${{ secrets.CARGO_GIT_TOKEN }}
           # Opt-in registry layer cache (cache-image set). type=registry, not type=local:
           # rootless dockerd writes a host bind-mount as a subuid-mapped root → EACCES,
           # so a local cache dir fails; a registry cache writes over the network and is
