@@ -472,7 +472,7 @@ jobs:
           else
             echo "npm token: repo secret not forwarded — using runner ambient env"
           fi
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
       - name: Bundle drift check
@@ -553,7 +553,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
 
