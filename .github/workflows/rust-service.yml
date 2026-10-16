@@ -261,7 +261,7 @@ jobs:
           cp "$CARGO_TARGET_DIR/release/${{ inputs.binary_name }}" artifact/${{ inputs.binary_name }}
 
       - name: Upload release binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.binary_name }}-release-arm64
           path: artifact/${{ inputs.binary_name }}
@@ -623,7 +623,7 @@ jobs:
       # created — no re-checkout needed.
       - name: Download release binary
         if: steps.relout.outputs.released == 'true'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.binary_name }}-release-arm64
           path: ./artifact
