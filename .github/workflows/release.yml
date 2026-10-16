@@ -6,7 +6,7 @@ on:
       node-version:
         description: Node.js version for semantic-release
         type: number
-        default: 22
+        default: 24
       runner:
         description: Runner to use (JSON array). Default self-hosted; override
           with '["ubuntu-latest"]' for repos that build/deploy GitHub-hosted.

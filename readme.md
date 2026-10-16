@@ -11,7 +11,7 @@ Runs `npx semantic-release` with version detection. Requires `package.json` with
 | | |
 |---|---|
 | **Runner** | `ubuntu-latest` |
-| **Inputs** | `node-version` (default: `22`) |
+| **Inputs** | `node-version` (default: `24`) |
 | **Outputs** | `released` (true/false), `version` (without `v` prefix) |
 | **Secrets** | Inherited (`GITHUB_TOKEN`) |
 
