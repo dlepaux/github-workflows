@@ -81,6 +81,21 @@ on:
     # expression in `runs-on: [...]` fails workflow_call validation
     # (startup_failure). All jobs run on [self-hosted, Linux, ARM64,
     # homelab] which floats across both srv-core and srv-apps.
+    # The check jobs below therefore pick their runner with ONE whole-value
+    # expression (`cond && 'label' || fromJSON('[...]')`), never a list.
+
+# Public callers (HL-390). A public repo takes pull requests from forks, and a
+# fork PR on a self-hosted runner is a stranger's shell on the homelab LAN,
+# next to the runner's ambient Kellnr token. So when the CALLER is public,
+# build-and-gate, test-coverage and trivy run on GitHub-hosted
+# ubuntu-24.04-arm (free for public repos) and skip every Kellnr / persistent
+# cache step. release stays self-hosted: it runs only on push to main, which
+# is trusted code. Keyed on visibility rather than an input so a repo that
+# goes public later is covered without anyone remembering a flag. Compared
+# against a STRING on purpose: a payload without `repository` yields null,
+# null != 'public', so it fails closed to the fleet — whereas
+# `repository.private == false` would coerce null to false and send it out.
+# Private callers see exactly the jobs they always had.
 
 permissions:
   contents: write
@@ -99,13 +114,34 @@ jobs:
   # Compile + lint that share warm target/. Persistent CARGO_TARGET_DIR
   # (runner.env) keeps incremental compile state across runs.
   build-and-gate:
-    runs-on: [self-hosted, Linux, ARM64, rootless, ci-heavy]
-    env:
-      PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-      RUSTUP_HOME: /home/runner-ci/.rustup
-      # CARGO_HOME + CARGO_TARGET_DIR inherited from runner.env (homelab role).
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-24.04-arm' || fromJSON('["self-hosted", "Linux", "ARM64", "rootless", "ci-heavy"]') }}
+    # Self-hosted: CARGO_HOME + CARGO_TARGET_DIR inherited from runner.env
+    # (homelab role).
     steps:
+      # A fork PR must never reach a homelab runner. Public callers are already
+      # on GitHub-hosted (see HL-390 above); this catches a fork of a private
+      # repo, and is the backstop if the routing above is ever wrong.
+      - name: Refuse fork pull requests on self-hosted runners
+        if: github.event.repository.visibility != 'public' && github.event.pull_request.head.repo.fork
+        run: |
+          echo "::error::Fork pull request on a self-hosted runner — refused (HL-390)."
+          exit 1
+      # Was job-level env; a job env cannot be conditional, so the self-hosted
+      # path sets it here, before any step that needs cargo.
+      - name: Point at the runner's toolchain (self-hosted only)
+        if: github.event.repository.visibility != 'public'
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
+
+      - name: Install cargo-deny (GitHub-hosted only)
+        if: github.event.repository.visibility == 'public'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
 
       # ─────────────────────────────────────────────────────────────────────
       # Gate — no per-test NATS testcontainers. Integration tests must use the
@@ -125,6 +161,7 @@ jobs:
           echo "OK: no NATS testcontainers"
 
       - name: Self-provision + sanity-check persistent cache paths
+        if: github.event.repository.visibility != 'public'
         run: |
           set -eu
           test -n "$CARGO_HOME" || { echo "::error::CARGO_HOME not set by runner.env"; exit 1; }
@@ -147,6 +184,7 @@ jobs:
       # during the runner-env→repo-secret migration: only written when non-empty
       # so an unforwarded secret falls back to the runner role's ambient token.
       - name: Source kellnr token from repo secret
+        if: github.event.repository.visibility != 'public'
         env:
           KELLNR_TOKEN_SECRET: ${{ secrets.KELLNR_TOKEN }}
         run: |
@@ -245,15 +283,33 @@ jobs:
   # srv-core). Sequential keeps a single crate CI inside the cap.
   test-coverage:
     needs: build-and-gate
-    runs-on: [self-hosted, Linux, ARM64, rootless, ci-heavy]
-    env:
-      PATH: /home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-      RUSTUP_HOME: /home/runner-ci/.rustup
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-24.04-arm' || fromJSON('["self-hosted", "Linux", "ARM64", "rootless", "ci-heavy"]') }}
     steps:
+      # Fork guard: see build-and-gate.
+      - name: Refuse fork pull requests on self-hosted runners
+        if: github.event.repository.visibility != 'public' && github.event.pull_request.head.repo.fork
+        run: |
+          echo "::error::Fork pull request on a self-hosted runner — refused (HL-390)."
+          exit 1
+      # See build-and-gate.
+      - name: Point at the runner's toolchain (self-hosted only)
+        if: github.event.repository.visibility != 'public'
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
+
+      - name: Install cargo-llvm-cov (GitHub-hosted only)
+        if: github.event.repository.visibility == 'public'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       # Kellnr token: repo secret → env (else runner ambient). See build-and-gate.
       - name: Source kellnr token from repo secret
+        if: github.event.repository.visibility != 'public'
         env:
           KELLNR_TOKEN_SECRET: ${{ secrets.KELLNR_TOKEN }}
         run: |
@@ -379,11 +435,12 @@ jobs:
       # pattern as .githooks/pre-push, version-robust on the JSON schema.
       #
       # CARGO_TARGET_DIR overridden to the persistent llvm-cov dir
-      # provisioned by the runner role. cargo-llvm-cov honours the env var
+      # provisioned by the runner role (self-hosted), or a workspace dir that
+      # dies with the VM (GitHub-hosted). cargo-llvm-cov honours the env var
       # (no --target-dir CLI flag).
       - name: Coverage (drives test compile + run)
         env:
-          CARGO_TARGET_DIR: /var/cache/gordon-ci/${{ inputs.crate_name }}/target-llvm-cov
+          CARGO_TARGET_DIR: ${{ github.event.repository.visibility == 'public' && format('{0}/target-llvm-cov', github.workspace) || format('/var/cache/gordon-ci/{0}/target-llvm-cov', inputs.crate_name) }}
           GORDON_TEST_DATABASE_URL: ${{ inputs.needs_postgres && format('postgres://gordon_test:gordon_test_dev@localhost:{0}/postgres', steps.postgres.outputs.port) || '' }}
           GORDON_TEST_NATS_URL: ${{ inputs.needs_nats && format('nats://localhost:{0}', steps.nats.outputs.port) || '' }}
         run: |
@@ -414,9 +471,27 @@ jobs:
         run: docker rm -f "${{ steps.nats.outputs.name }}" || true
 
   trivy:
-    runs-on: [self-hosted, rootless, arch-any, ci-medium]
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-24.04-arm' || fromJSON('["self-hosted", "rootless", "arch-any", "ci-medium"]') }}
     steps:
+      # Fork guard: see build-and-gate.
+      - name: Refuse fork pull requests on self-hosted runners
+        if: github.event.repository.visibility != 'public' && github.event.pull_request.head.repo.fork
+        run: |
+          echo "::error::Fork pull request on a self-hosted runner — refused (HL-390)."
+          exit 1
       - uses: actions/checkout@v7
+      # Same version and checksum as the fleet's runners (homelab
+      # roles/ci-toolchain), so a hosted scan matches a self-hosted one.
+      - name: Install trivy 0.69.3 (GitHub-hosted only)
+        if: github.event.repository.visibility == 'public'
+        run: |
+          set -eu
+          f=trivy_0.69.3_Linux-ARM64.tar.gz
+          mkdir -p "$RUNNER_TEMP/trivy"
+          curl -fsSLo "$RUNNER_TEMP/$f" "https://github.com/aquasecurity/trivy/releases/download/v0.69.3/$f"
+          echo "7e3924a974e912e57b4a99f65ece7931f8079584dae12eb7845024f97087bdfd  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP/trivy" trivy
+          echo "$RUNNER_TEMP/trivy" >> "$GITHUB_PATH"
       # The DB refresh is best-effort ON PURPOSE, and is SEPARATE from the scan.
       #
       # trivy's vuln-DB is an OCI pull from a public mirror through the fleet's
@@ -469,6 +544,13 @@ jobs:
       version: ${{ steps.semrel.outputs.new_release_version }}
       tag: ${{ steps.semrel.outputs.new_release_git_tag }}
     steps:
+      # Fork guard: see build-and-gate. Unreachable while the job's `if:`
+      # admits only pushes; kept so loosening that `if:` cannot open the door.
+      - name: Refuse fork pull requests on self-hosted runners
+        if: github.event.pull_request.head.repo.fork
+        run: |
+          echo "::error::Fork pull request on a self-hosted runner — refused (HL-390)."
+          exit 1
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0

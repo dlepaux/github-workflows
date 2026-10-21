@@ -166,6 +166,7 @@ CI pipeline for kellnr-published Rust library crates. No Docker, no deploy. Used
 | | |
 |---|---|
 | **Runner** | `[self-hosted, Linux, ARM64, homelab]` (floats across srv-core + srv-apps) |
+| **Public callers** | `build-and-gate`, `test-coverage` and `trivy` run on GitHub-hosted `ubuntu-24.04-arm` and skip the Kellnr and cache steps; `release` stays self-hosted (push to main only). Keyed on the caller's visibility, no input. Self-hosted jobs refuse fork pull requests (HL-390). |
 | **Cache** | Persistent `CARGO_TARGET_DIR` + `CARGO_HOME` from `runner.env` — no `actions/cache` |
 | **Jobs** | `build-and-gate`, `test-coverage`, `trivy`, `release`, `publish` |
 
