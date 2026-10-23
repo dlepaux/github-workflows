@@ -84,7 +84,10 @@ jobs:
           if [ -n "${{ inputs.platform }}" ]; then
             PLATFORM="--platform ${{ inputs.platform }}"
           fi
-          DOCKER_BUILDKIT=1 docker build ${PLATFORM} ${BUILD_ARGS} ${TAGS} .
+          # Self-hosted runners keep their image store between jobs; --pull re-resolves
+          # FROM tags against the registry so a rebuild can't reuse a stale cached base
+          # and silently ship its CVEs (HL-521: node:22-alpine before the Node2Shell fix).
+          DOCKER_BUILDKIT=1 docker build --pull ${PLATFORM} ${BUILD_ARGS} ${TAGS} .
 
       - name: Push Docker image
         run: docker push --all-tags ${{ inputs.image-name }}
