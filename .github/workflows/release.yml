@@ -15,7 +15,12 @@ on:
         # on Node is small and arch-neutral, so it goes to the little hosts first.
         # Rust callers whose release step drives cargo must pass a ci-heavy runner —
         # only the heavy hosts carry a toolchain.
-        default: '["self-hosted", "rootless", "arch-any", "ci-medium"]'
+        # `nomad` since 2026-10-24 (HL-413): github-triage places this job through Nomad
+        # on the srv-runner clients instead of by ssh. A repo the Nomad pool is not
+        # provisioned for keeps going by ssh (HL-308). Only the light defaults carry
+        # the label: Nomad's 1 GB placement size would undercount a cargo or docker
+        # job (HL-559). Drop the label to go back to ssh.
+        default: '["self-hosted", "rootless", "arch-any", "ci-medium", "nomad"]'
     outputs:
       released:
         description: Whether a new version was released (true/false)

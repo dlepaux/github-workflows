@@ -42,7 +42,12 @@ on:
         description: Runner to use (JSON array). One API call — ci-medium, as deploy.yml does.
         required: false
         type: string
-        default: '["self-hosted", "rootless", "arch-any", "ci-medium"]'
+        # `nomad` since 2026-10-24 (HL-413): github-triage places this job through Nomad
+        # on the srv-runner clients instead of by ssh. A repo the Nomad pool is not
+        # provisioned for keeps going by ssh (HL-308). Only the light defaults carry
+        # the label: Nomad's 1 GB placement size would undercount a cargo or docker
+        # job (HL-559). Drop the label to go back to ssh.
+        default: '["self-hosted", "rootless", "arch-any", "ci-medium", "nomad"]'
     secrets:
       app-id:
         required: true
