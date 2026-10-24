@@ -11,8 +11,8 @@ name: Rust Crate CI
 # - build-and-gate: grep lints, fmt, build, clippy, deny. One job, warm
 #   target/ in-process.
 # - test-coverage: separate job (instrumented profile is target-
-#   incompatible). Uses its own persistent target-llvm-cov/. Runs in
-#   parallel with build-and-gate.
+#   incompatible). Builds under the job's own target dir (HL-563).
+#   Runs in parallel with build-and-gate.
 # - trivy: filesystem scan, runs in parallel.
 # - release: semantic-release on push to main; gates publish.
 # - publish: handled inside the release job via @semantic-release/exec's
@@ -434,21 +434,21 @@ jobs:
       # regardless of threshold. Parse JSON and assert ourselves — same
       # pattern as .githooks/pre-push, version-robust on the JSON schema.
       #
-      # CARGO_TARGET_DIR overridden to the persistent llvm-cov dir
-      # provisioned by the runner role (self-hosted), or a workspace dir that
-      # dies with the VM (GitHub-hosted). cargo-llvm-cov honours the env var
-      # (no --target-dir CLI flag).
+      # No CARGO_TARGET_DIR override (HL-563): cargo-llvm-cov builds under
+      # <target>/llvm-cov-target. On self-hosted runners <target> is the
+      # job's own dir that github-triage's spawner writes into the runner's
+      # .env (HL-381), so two coverage jobs of one repo on one host never
+      # share a build. The persistent /var/cache/gordon-ci/<crate>/target-llvm-cov
+      # this step used to pin was that last shared dir, and the reason for
+      # triage's one-job-per-repo-per-host hold (HL-161). GitHub-hosted runs
+      # set no CARGO_TARGET_DIR, so they build under the workspace's target/.
       - name: Coverage (drives test compile + run)
         env:
-          CARGO_TARGET_DIR: ${{ github.event.repository.visibility == 'public' && format('{0}/target-llvm-cov', github.workspace) || format('/var/cache/gordon-ci/{0}/target-llvm-cov', inputs.crate_name) }}
           GORDON_TEST_DATABASE_URL: ${{ inputs.needs_postgres && format('postgres://gordon_test:gordon_test_dev@localhost:{0}/postgres', steps.postgres.outputs.port) || '' }}
           GORDON_TEST_NATS_URL: ${{ inputs.needs_nats && format('nats://localhost:{0}', steps.nats.outputs.port) || '' }}
         run: |
           set -eu
-          # Self-provision the per-repo llvm-cov dir (same rationale as the
-          # build-and-gate cache step — no runner-role re-converge needed for
-          # a newly-onboarded repo).
-          mkdir -p "$CARGO_TARGET_DIR"
+          echo "coverage target: ${CARGO_TARGET_DIR:-$PWD/target}/llvm-cov-target"
           COV_JSON=$(cargo llvm-cov --all-features --workspace --summary-only --json)
           COV_PCT=$(printf '%s' "$COV_JSON" | jq '.data[0].totals.lines.percent')
           COV_FLOOR=${{ inputs.coverage_floor }}

@@ -11,9 +11,8 @@ name: Rust Service CI
 #   optional OpenAPI drift, release binary upload. target/ stays warm
 #   in-process via the persistent CARGO_TARGET_DIR.
 # - test-coverage: separate job (instrumented profile is target-
-#   incompatible). Uses its own persistent
-#   /var/cache/gordon-ci/<repo>/target-llvm-cov/. Runs in parallel with
-#   build-and-gate.
+#   incompatible). Builds under the job's own target dir (HL-563).
+#   Runs after build-and-gate.
 # - asyncapi-drift: optional job, gated on `inputs.has_asyncapi`.
 # - trivy: filesystem scan, runs in parallel.
 # - release: semantic-release on push to main; gates docker.
@@ -268,11 +267,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # Coverage runs in parallel with build-and-gate (no `needs:`). Uses
-  # the persistent target-llvm-cov dir provisioned by the runner role —
-  # second run after a Cargo.lock-unchanged push compiles incrementally.
-  # Serialised against build-and-gate. Both jobs compile the workspace
-  # (separate target dirs — instrumented coverage profile isn't
+  # Coverage builds under the job's own target dir (HL-563), so every run
+  # compiles cold. Serialised against build-and-gate. Both jobs compile the
+  # workspace (separate target dirs — instrumented coverage profile isn't
   # target-compatible with the regular one), so running in parallel
   # peaks at ~2× memory and trips the homelab slice cap (12G on
   # srv-core). Sequential keeps a single service CI inside the cap.
@@ -410,12 +407,13 @@ jobs:
       # Parse the JSON summary and assert the threshold ourselves — same
       # pattern as .githooks/pre-push, version-robust on the JSON schema.
       #
-      # CARGO_TARGET_DIR overridden in the step env to point at the
-      # persistent llvm-cov dir provisioned by the runner role. (cargo-
-      # llvm-cov has no --target-dir CLI flag; it honours the env var.)
-      # Source-only changes after a warm cache rebuild incrementally
-      # instead of compiling the whole workspace under the instrumented
-      # profile.
+      # No CARGO_TARGET_DIR override (HL-563): cargo-llvm-cov builds under
+      # $CARGO_TARGET_DIR/llvm-cov-target, the job's own dir that
+      # github-triage's spawner writes into the runner's .env (HL-381), so two
+      # coverage jobs of one repo on one host never share a build. The
+      # persistent /var/cache/gordon-ci/<repo>/target-llvm-cov this step used
+      # to pin was that last shared dir, and the reason for triage's
+      # one-job-per-repo-per-host hold (HL-161).
       #
       # GORDON_TEST_NATS_URL is set unconditionally — when `needs_nats`
       # is false the `steps.nats.outputs.port` expression is empty, the
@@ -426,12 +424,10 @@ jobs:
         env:
           GORDON_TEST_DATABASE_URL: postgres://gordon_test:gordon_test_dev@localhost:${{ steps.postgres.outputs.port }}/postgres
           GORDON_TEST_NATS_URL: nats://localhost:${{ steps.nats.outputs.port }}
-          CARGO_TARGET_DIR: /var/cache/gordon-ci/${{ inputs.binary_name }}/target-llvm-cov
         run: |
           set -eu
-          # Self-provision the per-repo llvm-cov dir (same rationale as the
-          # build-and-gate cache step — no runner-role re-converge needed).
-          mkdir -p "$CARGO_TARGET_DIR"
+          test -n "${CARGO_TARGET_DIR:-}" || { echo "::error::CARGO_TARGET_DIR not set by runner.env"; exit 1; }
+          echo "coverage target: $CARGO_TARGET_DIR/llvm-cov-target"
           COV_JSON=$(cargo llvm-cov --workspace --summary-only --json)
           COV_PCT=$(printf '%s' "$COV_JSON" | jq '.data[0].totals.lines.percent')
           if awk "BEGIN { exit ($COV_PCT >= ${{ inputs.coverage_floor }}) ? 0 : 1 }"; then
