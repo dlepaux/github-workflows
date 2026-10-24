@@ -12,7 +12,7 @@ name: Rust Crate CI
 #   target/ in-process.
 # - test-coverage: separate job (instrumented profile is target-
 #   incompatible). Builds under the job's own target dir (HL-563).
-#   Runs in parallel with build-and-gate.
+#   Runs after build-and-gate.
 # - trivy: filesystem scan, runs in parallel.
 # - release: semantic-release on push to main; gates publish.
 # - publish: handled inside the release job via @semantic-release/exec's
@@ -446,8 +446,12 @@ jobs:
         env:
           GORDON_TEST_DATABASE_URL: ${{ inputs.needs_postgres && format('postgres://gordon_test:gordon_test_dev@localhost:{0}/postgres', steps.postgres.outputs.port) || '' }}
           GORDON_TEST_NATS_URL: ${{ inputs.needs_nats && format('nats://localhost:{0}', steps.nats.outputs.port) || '' }}
+          REPO_VISIBILITY: ${{ github.event.repository.visibility }}
         run: |
           set -eu
+          if [ "$REPO_VISIBILITY" != public ]; then
+            test -n "${CARGO_TARGET_DIR:-}" || { echo "::error::CARGO_TARGET_DIR not set by runner.env"; exit 1; }
+          fi
           echo "coverage target: ${CARGO_TARGET_DIR:-$PWD/target}/llvm-cov-target"
           COV_JSON=$(cargo llvm-cov --all-features --workspace --summary-only --json)
           COV_PCT=$(printf '%s' "$COV_JSON" | jq '.data[0].totals.lines.percent')
