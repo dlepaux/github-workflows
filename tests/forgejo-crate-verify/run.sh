@@ -169,8 +169,11 @@ done < "$ROOT/forgejo/crates.tsv"
 export RENDER_REF=HEAD  # CI's checkout is shallow and carries no v1 tag
 if "$ROOT/forgejo/sync.sh" "$clones" >/dev/null; then ok; else no "sync.sh write"; fi
 if "$ROOT/forgejo/sync.sh" --check "$clones" >/dev/null; then ok; else no "--check after write"; fi
-crons=$(grep -h -A1 'schedule:' "$clones"/*/.forgejo/workflows/ci.yml | grep cron | sort)
-if [ "$(printf '%s\n' "$crons" | wc -l)" -eq "$(printf '%s\n' "$crons" | uniq | wc -l)" ]; then ok; else no "crons not distinct"; fi
+# One nightly line for every crate (spec §1 Triggers): the in-flight cap serialises them.
+crons=$(grep -h -A1 'schedule:' "$clones"/*/.forgejo/workflows/ci.yml | grep cron | sed 's/^ *//' | sort -u)
+ncrates=$(find "$clones" -mindepth 1 -maxdepth 1 -type d | wc -l)
+nscheduled=$(grep -l -A1 'schedule:' "$clones"/*/.forgejo/workflows/ci.yml | wc -l)
+if [ "$crons" = "- cron: 30 0 * * *" ] && [ "$nscheduled" -eq "$ncrates" ]; then ok; else no "not one 00:30 line for every crate: $crons"; fi
 first=$(ls "$clones" | head -1)
 echo '# hand edit' >> "$clones/$first/.forgejo/workflows/ci.yml"
 if out=$("$ROOT/forgejo/sync.sh" --check "$clones"); then no "--check missed a hand edit"; else
