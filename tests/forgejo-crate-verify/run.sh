@@ -55,6 +55,11 @@ for word in ("semantic-release", "cargo publish", "trivy", "packages: write", "c
     check(f"no {word!r} in the workflow body", word not in body)
 check("no permissions block", "permissions" not in out)
 
+# GitHub runs a step with no `shell:` as `bash -e {0}`; forgejo-runner adds pipefail, which
+# failed cargo-boundary's module-size gate on a `find` over a glob with no match. Pinned whole.
+check("shell pinned to GitHub's default", out.get("defaults") == {"run": {"shell": "bash -e {0}"}})
+check("shell pin documented", "shell-default" in out_text.split("\nname:")[0])
+
 # Triggers: push to main, the schedule, a manual dispatch; never a pull request.
 on = out["on"]
 check("triggers", set(on) == {"push", "schedule", "workflow_dispatch"})

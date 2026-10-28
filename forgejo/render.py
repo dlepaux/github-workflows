@@ -41,7 +41,12 @@ TRANSFORMS = (
     ("inputs-literal", "a standalone workflow has no inputs; the caller's values are inlined"),
     ("triggers", "push to main plus a staggered nightly schedule (spec §1 Triggers)"),
     ("drop-permissions-concurrency", "GitHub token scopes; the in-flight cap of 1 serialises"),
+    ("shell-default", "GitHub runs a step with no shell as `bash -e {0}`; forgejo-runner adds pipefail"),
 )
+# GitHub's default for a `run:` step with no `shell:`. forgejo-runner maps "" to
+# `bash --noprofile --norc -e -o pipefail {0}` (act/runner/step_run.go, v13.2.0) and passes any
+# other string through, so pinning this one gives the shadow GitHub's semantics.
+GITHUB_DEFAULT_SHELL = "bash -e {0}"
 
 FORK_GUARD = PRIVATE_ONLY + " && github.event.pull_request.head.repo.fork"
 # Conditions matched whole, never by substring: a new condition that merely mentions one of
@@ -163,6 +168,7 @@ def render(source, inputs, cron):
             "schedule": [{"cron": cron}],
             "workflow_dispatch": {},
         },
+        "defaults": {"run": {"shell": GITHUB_DEFAULT_SHELL}},
         "jobs": jobs,
     }
     text = yaml.dump(out, Dumper=BlockDumper, sort_keys=False, width=1000, allow_unicode=True)
