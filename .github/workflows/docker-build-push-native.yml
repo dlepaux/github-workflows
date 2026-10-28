@@ -100,6 +100,11 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ inputs.image-name }}
+          # This leg pushes by digest with no tags, so metadata-action derives the version
+          # label from the git ref, and its labels override the Dockerfile's: every released
+          # image claimed version "main". As in docker-build-push-buildx.yml.
+          labels: |
+            ${{ inputs.version != '' && format('org.opencontainers.image.version={0}', inputs.version) || '' }}
 
       - name: Build and push by digest
         id: build
@@ -173,6 +178,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # X.Y follows the newest release of its minor line, so a host can pin a minor version
+      # and still take its patches. A prerelease or build version does not move it.
+      - name: Minor version tag
+        id: minor
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            echo "tag=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -182,6 +200,7 @@ jobs:
             type=raw,value=latest
             type=sha
             ${{ inputs.version != '' && format('type=raw,value={0}', inputs.version) || '' }}
+            ${{ steps.minor.outputs.tag != '' && format('type=raw,value={0}', steps.minor.outputs.tag) || '' }}
 
       - name: Create multi-arch manifest
         working-directory: /tmp/digests
