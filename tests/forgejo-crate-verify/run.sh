@@ -137,6 +137,24 @@ for bad in "Bad_Name 40 true x" "demo forty true x" "demo 40 yes x"; do
   if python3 "$ROOT/forgejo/render.py" $bad >/dev/null 2>&1; then no "accepted: $bad"; else ok; fi
 done
 
+# The real checkout script, against a local repo standing in for the forge.
+python3 - "$ROOT" "$WORK/checkout.sh" <<'PY'
+import sys
+sys.path.insert(0, f"{sys.argv[1]}/forgejo")
+import render
+open(sys.argv[2], "w").write(render.CHECKOUT["run"])
+PY
+src_repo="$WORK/src"
+git init -q -b main "$src_repo"
+git -C "$src_repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m one
+sha=$(git -C "$src_repo" rev-parse HEAD)
+checkout() {  # <dir> -> runs the step there, as the runner would
+  (cd "$1" && REPO_URL="$src_repo" REF=refs/heads/main SHA=$sha GIT_CONFIG_COUNT=0 bash "$WORK/checkout.sh") >/dev/null 2>&1
+}
+mkdir -p "$WORK/ws-empty" "$WORK/ws-dirty"; : > "$WORK/ws-dirty/leftover"
+if checkout "$WORK/ws-empty" && [ "$(git -C "$WORK/ws-empty" rev-parse HEAD)" = "$sha" ]; then ok; else no "checkout into an empty workspace"; fi
+if checkout "$WORK/ws-dirty"; then no "checkout over a non-empty workspace"; else ok; fi
+
 # sync.sh against fake clones: write, then --check clean, then --check catches a hand edit.
 clones="$WORK/clones"
 while IFS=$'\t' read -r repo _; do
