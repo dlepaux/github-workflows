@@ -50,7 +50,8 @@ out = yaml.safe_load(out_text)
 # Verify only: the two verify jobs and nothing that can publish.
 check("only the verify jobs", list(out["jobs"]) == ["build-and-gate", "test-coverage"])
 body = "".join(l for l in out_text.splitlines(True) if not l.startswith("#"))
-for word in ("semantic-release", "cargo publish", "trivy", "packages: write", "contents: write"):
+for word in ("semantic-release", "cargo publish", "trivy", "packages: write", "contents: write",
+             "git push", "git tag", "releases", "--registry", "npm publish"):
     check(f"no {word!r} in the workflow body", word not in body)
 check("no permissions block", "permissions" not in out)
 
@@ -86,11 +87,17 @@ gate = next(s for s in out["jobs"]["build-and-gate"]["steps"] if s["name"] == "G
 check("is_cli_tool inlined", '[ "false" = "true" ]' in gate["run"])
 cov = next(s for s in out["jobs"]["test-coverage"]["steps"] if s["name"].startswith("Coverage"))
 check("coverage floor inlined", "COV_FLOOR=40\n" in cov["run"])
-check("visibility pinned private", cov["env"] == {"REPO_VISIBILITY": "private"})
-check("every source script step carried", sum("run" in s for s in steps) ==
-      sum(1 for j in r.KEPT_JOBS for s in src["jobs"][j]["steps"]
-          if "run" in s and not r.fork_guard(s) and r.PUBLIC_ONLY not in str(s.get("if", ""))
-          and s.get("name") not in r.SIDECARS) + 2)
+check("visibility pinned private, sidecar URLs empty as on GitHub", cov["env"] == {
+    "GORDON_TEST_DATABASE_URL": "", "GORDON_TEST_NATS_URL": "", "REPO_VISIBILITY": "private"})
+# Exactly these steps are dropped, by name: a rename or a new drop must be seen here.
+for job, want in {
+    "build-and-gate": ["Refuse fork pull requests on self-hosted runners", "Install cargo-deny (GitHub-hosted only)"],
+    "test-coverage": ["Refuse fork pull requests on self-hosted runners", "Install cargo-llvm-cov (GitHub-hosted only)",
+                      "Start test Postgres", "Start test NATS", "Stop test Postgres", "Stop test NATS"],
+}.items():
+    kept = {s["name"] for s in out["jobs"][job]["steps"]}
+    named = [s["name"] for s in src["jobs"][job]["steps"] if "name" in s]  # checkout has none
+    check(f"{job} drops exactly its known steps", sorted(n for n in named if n not in kept) == sorted(want))
 
 # Fail closed on what the render does not know.
 refuses("a new node action", lambda wf: wf["jobs"]["build-and-gate"]["steps"].append(
@@ -103,6 +110,18 @@ refuses("an unknown job key", lambda wf: wf["jobs"]["build-and-gate"].__setitem_
 refuses("an input with no value", lambda wf: wf["jobs"]["build-and-gate"]["steps"].append(
     {"name": "x", "run": "echo ${{ inputs.brand_new }}"}))
 refuses("sidecars asked for", lambda wf: None, inputs(needs_postgres=True))
+refuses("a workflow-level env", lambda wf: wf.__setitem__("env", {"RUSTFLAGS": "-D warnings"}))
+refuses("workflow-level defaults", lambda wf: wf.__setitem__("defaults", {"run": {"shell": "bash"}}))
+refuses("a condition mentioning the fork guard", lambda wf: wf["jobs"]["build-and-gate"]["steps"].append(
+    {"name": "x", "if": "${{ !github.event.pull_request.head.repo.fork }}", "run": "true"}))
+refuses("a condition widening public-only", lambda wf: wf["jobs"]["build-and-gate"]["steps"].append(
+    {"name": "x", "if": "github.event.repository.visibility == 'public' || github.event_name == 'push'", "run": "true"}))
+# Dropping goes by condition, never by name: an unconditional step named like a sidecar runs.
+wf = copy.deepcopy(src)
+wf["jobs"]["test-coverage"]["steps"].append({"name": "Start test NATS", "run": "echo kept"})
+again = yaml.safe_load(r.render(yaml.safe_dump(wf, sort_keys=False), inputs(), "0 1 * * *"))
+check("a sidecar's name alone drops nothing",
+      any(s.get("run") == "echo kept" for s in again["jobs"]["test-coverage"]["steps"]))
 
 print(f"render: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
@@ -124,6 +143,7 @@ while IFS=$'\t' read -r repo _; do
   case "$repo" in ''|'#'*) continue ;; esac
   mkdir -p "$clones/$repo/.git"
 done < "$ROOT/forgejo/crates.tsv"
+export RENDER_REF=HEAD  # CI's checkout is shallow and carries no v1 tag
 if "$ROOT/forgejo/sync.sh" "$clones" >/dev/null; then ok; else no "sync.sh write"; fi
 if "$ROOT/forgejo/sync.sh" --check "$clones" >/dev/null; then ok; else no "--check after write"; fi
 crons=$(grep -h -A1 'schedule:' "$clones"/*/.forgejo/workflows/ci.yml | grep cron | sort)

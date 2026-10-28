@@ -13,8 +13,11 @@ input it cannot substitute) fails the render instead of being copied across sile
 
 Usage:
   render.py <crate_name> <coverage_floor> <is_cli_tool> <cron>   # print the workflow
+  RENDER_REF=<ref> overrides the ref rust-crate.yml is read at (default v1).
 """
+import os
 import re
+import subprocess
 import sys
 
 import yaml
@@ -40,7 +43,20 @@ TRANSFORMS = (
     ("drop-permissions-concurrency", "GitHub token scopes; the in-flight cap of 1 serialises"),
 )
 
-SIDECARS = {"Start test Postgres", "Start test NATS", "Stop test Postgres", "Stop test NATS"}
+FORK_GUARD = PRIVATE_ONLY + " && github.event.pull_request.head.repo.fork"
+# Conditions matched whole, never by substring: a new condition that merely mentions one of
+# these must reach the "unknown condition" refusal, not be dropped. A sidecar step names the
+# input that switches it on, so asking for a sidecar fails the render instead of dropping it.
+DROPPED = {FORK_GUARD: None, PUBLIC_ONLY: None}
+SIDECARS = {
+    "inputs.needs_postgres": "needs_postgres",
+    "inputs.needs_nats": "needs_nats",
+    "always() && inputs.needs_postgres": "needs_postgres",
+    "always() && inputs.needs_nats": "needs_nats",
+}
+# A sidecar's URL env is `${{ inputs.needs_X && format(...) || '' }}`: '' when X is off, as on GitHub.
+SIDECAR_ENV = re.compile(r"\$\{\{ inputs\.(needs_[a-z]+) && .* \|\| '' \}\}")
+TOP_LEVEL = {"name", True, "permissions", "concurrency", "jobs"}  # PyYAML reads bare `on:` as True
 
 # The token travels in git's env-config, never in argv (runner hosts expose /proc cmdline).
 CHECKOUT = {
@@ -55,6 +71,7 @@ CHECKOUT = {
     },
     "run": (
         "set -eu\n"
+        '[ -z "$(ls -A)" ] || { echo "::error::workspace not empty"; exit 1; }\n'
         "git init -q .\n"
         'git fetch -q --depth=50 "$REPO_URL" "+$REF:refs/remotes/origin/ref"\n'
         'git checkout -q --detach "$SHA"\n'
@@ -67,20 +84,15 @@ class RenderError(Exception):
     pass
 
 
-def fork_guard(step):
-    return "pull_request.head.repo.fork" in str(step.get("if", ""))
-
-
 def carry_step(step, inputs):
     """One source step, transformed, or None when the step is dropped."""
     name = step.get("name", "")
     cond = step.get("if")
-    if fork_guard(step):
+    cond = cond.strip() if isinstance(cond, str) else cond
+    if cond in DROPPED:
         return None
-    if cond is not None and PUBLIC_ONLY in cond:
-        return None
-    if name in SIDECARS:
-        if inputs["needs_postgres"] or inputs["needs_nats"]:
+    if cond in SIDECARS:
+        if inputs[SIDECARS[cond]]:
             raise RenderError(f"{name}: sidecars are not carried over")
         return None
     if step.get("uses", "").startswith("actions/checkout@"):
@@ -90,15 +102,22 @@ def carry_step(step, inputs):
     if "uses" in step:
         raise RenderError(f"{step['uses']}: a node action cannot run in host mode")
     out = {k: v for k, v in step.items() if k != "if"}
-    if cond is not None and cond.strip() != PRIVATE_ONLY:
+    if cond is not None and cond != PRIVATE_ONLY:
         raise RenderError(f"{name}: unknown condition {cond!r}")
     if "env" in out:
-        out["env"] = {
-            k: ("private" if v == VISIBILITY_EXPR else v)
-            for k, v in out["env"].items()
-            if "inputs.needs_" not in str(v)
-        }
+        out["env"] = {k: carry_env(v, inputs) for k, v in out["env"].items()}
     return substitute(out, inputs)
+
+
+def carry_env(value, inputs):
+    if value == VISIBILITY_EXPR:
+        return "private"
+    m = SIDECAR_ENV.fullmatch(str(value))
+    if m:
+        if inputs.get(m.group(1)) is not False:
+            raise RenderError(f"{m.group(1)}: sidecars are not carried over")
+        return ""
+    return value
 
 
 def substitute(node, inputs):
@@ -121,6 +140,9 @@ def substitute(node, inputs):
 
 def render(source, inputs, cron):
     wf = yaml.safe_load(source)
+    unknown = set(wf) - TOP_LEVEL
+    if unknown:
+        raise RenderError(f"workflow keys this render does not carry: {sorted(map(str, unknown))}")
     jobs = {}
     for job_id in KEPT_JOBS:
         src = wf["jobs"][job_id]
@@ -188,9 +210,17 @@ def main(argv):
         "needs_postgres": False,
         "needs_nats": False,
     }
-    here = __file__.rsplit("/", 1)[0]
-    with open(f"{here}/../.github/workflows/{SOURCE}", encoding="utf-8") as f:
-        source = f.read()
+    # Callers resolve @v1, so the shadow renders what v1 points at, not the working tree.
+    ref = os.environ.get("RENDER_REF", "v1")
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        source = subprocess.run(
+            ["git", "-C", here, "show", f"{ref}:.github/workflows/{SOURCE}"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+    except subprocess.CalledProcessError as e:
+        print(f"render.py: cannot read {SOURCE} at {ref}: {e.stderr.strip()}", file=sys.stderr)
+        return 1
     try:
         sys.stdout.write(render(source, inputs, cron))
     except RenderError as e:
