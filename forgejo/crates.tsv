@@ -1,0 +1,13 @@
+# The private crates Forgejo shadows (HL-508): repo, crate_name, coverage_floor, is_cli_tool.
+# Values are each caller's .github/workflows/ci.yml inputs; forgejo/sync.sh renders each row.
+cargo-boundary	cargo-boundary	0	true
+cargo-deadvariant	cargo-deadvariant	40	true
+cargo-extcalls	cargo-extcalls	0	true
+cargo-http-routes	cargo-http-routes	0	true
+cargo-module-index	cargo-module-index	50	true
+cargo-pg-notify	cargo-pg-notify	40	true
+cargo-schema-compat	cargo-schema-compat	0	true
+cargo-spawntree	cargo-spawntree	0	true
+cargo-statemachines	cargo-statemachines	0	true
+cargo-view-deps	cargo-view-deps	0	true
+migration-graph	cargo-migration-graph	0	true

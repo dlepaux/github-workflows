@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# HL-508: forgejo/render.py turns rust-crate.yml's verify jobs into each crate's Forgejo shadow
+# workflow. These cases hold the three promises the spec makes of it: the shadow runs what GitHub
+# runs, it never publishes, and anything it cannot carry over fails the render instead of being
+# copied silently. sync.sh's write and --check modes run against fake clones.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+python3 - "$ROOT" <<'PY'
+import copy, re, sys
+import yaml
+root = sys.argv[1]
+sys.path.insert(0, f"{root}/forgejo")
+import render as r
+
+src_text = open(f"{root}/.github/workflows/rust-crate.yml", encoding="utf-8").read()
+src = yaml.safe_load(src_text)
+passed = failed = 0
+
+def check(name, cond):
+    global passed, failed
+    if cond:
+        passed += 1
+    else:
+        failed += 1
+        print(f"FAIL: {name}")
+
+def inputs(**kw):
+    base = dict(crate_name="demo", coverage_floor=40, is_cli_tool=False,
+                needs_postgres=False, needs_nats=False)
+    base.update(kw)
+    return base
+
+def refuses(name, mutate, ins=None):
+    wf = copy.deepcopy(src)
+    mutate(wf)
+    try:
+        r.render(yaml.safe_dump(wf, sort_keys=False), ins or inputs(), "0 1 * * *")
+    except r.RenderError:
+        check(name, True)
+        return
+    check(name, False)
+
+out_text = r.render(src_text, inputs(), "30 0 * * *")
+out = yaml.safe_load(out_text)
+
+# Verify only: the two verify jobs and nothing that can publish.
+check("only the verify jobs", list(out["jobs"]) == ["build-and-gate", "test-coverage"])
+body = "".join(l for l in out_text.splitlines(True) if not l.startswith("#"))
+for word in ("semantic-release", "cargo publish", "trivy", "packages: write", "contents: write"):
+    check(f"no {word!r} in the workflow body", word not in body)
+check("no permissions block", "permissions" not in out)
+
+# Triggers: push to main, the schedule, a manual dispatch; never a pull request.
+on = out["on"]
+check("triggers", set(on) == {"push", "schedule", "workflow_dispatch"})
+check("push names main only", on["push"] == {"branches": ["main"]})
+check("schedule carried", on["schedule"] == [{"cron": "30 0 * * *"}])
+
+steps = [s for j in out["jobs"].values() for s in j["steps"]]
+check("labels on every job", all(j["runs-on"] == ["self-hosted", "arm64", "ci-heavy"] for j in out["jobs"].values()))
+check("no node action", all("uses" not in s for s in steps))
+check("no conditions left", all("if" not in s for s in steps))
+check("needs kept", out["jobs"]["test-coverage"].get("needs") == "build-and-gate")
+
+# The job token reaches git through env-config only, never a script's text (argv on the host).
+check("no expression in any run", all("${{" not in s.get("run", "") for s in steps))
+check("token in env only", out_text.count("${{ github.token }}") == 2
+      and all("github.token" not in s.get("run", "") for s in steps))
+
+# Same checks as GitHub: every carried step's script is the source's, inputs inlined.
+def literal(text, ins):
+    return re.sub(r"\$\{\{\s*inputs\.([a-z_]+)\s*\}\}",
+                  lambda m: str(ins[m.group(1)]).lower() if isinstance(ins[m.group(1)], bool) else str(ins[m.group(1)]),
+                  text)
+for job in r.KEPT_JOBS:
+    want = {s["name"]: literal(s["run"], inputs()) for s in src["jobs"][job]["steps"]
+            if "run" in s and "name" in s}
+    for s in out["jobs"][job]["steps"]:
+        if s["name"] in want:
+            check(f"{job}/{s['name']} script unchanged", s["run"] == want[s["name"]])
+gate = next(s for s in out["jobs"]["build-and-gate"]["steps"] if s["name"] == "Grep-based lints")
+check("is_cli_tool inlined", '[ "false" = "true" ]' in gate["run"])
+cov = next(s for s in out["jobs"]["test-coverage"]["steps"] if s["name"].startswith("Coverage"))
+check("coverage floor inlined", "COV_FLOOR=40\n" in cov["run"])
+check("visibility pinned private", cov["env"] == {"REPO_VISIBILITY": "private"})
+check("every source script step carried", sum("run" in s for s in steps) ==
+      sum(1 for j in r.KEPT_JOBS for s in src["jobs"][j]["steps"]
+          if "run" in s and not r.fork_guard(s) and r.PUBLIC_ONLY not in str(s.get("if", ""))
+          and s.get("name") not in r.SIDECARS) + 2)
+
+# Fail closed on what the render does not know.
+refuses("a new node action", lambda wf: wf["jobs"]["build-and-gate"]["steps"].append(
+    {"name": "x", "uses": "actions/cache@v4"}))
+refuses("an unknown condition", lambda wf: wf["jobs"]["build-and-gate"]["steps"].append(
+    {"name": "x", "if": "github.event_name == 'push'", "run": "true"}))
+refuses("checkout options", lambda wf: wf["jobs"]["test-coverage"]["steps"].__setitem__(
+    2, {"uses": "actions/checkout@v7", "with": {"fetch-depth": 0}}))
+refuses("an unknown job key", lambda wf: wf["jobs"]["build-and-gate"].__setitem__("timeout-minutes", 30))
+refuses("an input with no value", lambda wf: wf["jobs"]["build-and-gate"]["steps"].append(
+    {"name": "x", "run": "echo ${{ inputs.brand_new }}"}))
+refuses("sidecars asked for", lambda wf: None, inputs(needs_postgres=True))
+
+print(f"render: {passed} passed, {failed} failed")
+sys.exit(1 if failed else 0)
+PY
+
+pass=0 fail=0
+ok() { pass=$((pass + 1)); }
+no() { fail=$((fail + 1)); echo "FAIL: $1"; }
+
+# Arguments are validated before anything is read.
+for bad in "Bad_Name 40 true x" "demo forty true x" "demo 40 yes x"; do
+  # shellcheck disable=SC2086
+  if python3 "$ROOT/forgejo/render.py" $bad >/dev/null 2>&1; then no "accepted: $bad"; else ok; fi
+done
+
+# sync.sh against fake clones: write, then --check clean, then --check catches a hand edit.
+clones="$WORK/clones"
+while IFS=$'\t' read -r repo _; do
+  case "$repo" in ''|'#'*) continue ;; esac
+  mkdir -p "$clones/$repo/.git"
+done < "$ROOT/forgejo/crates.tsv"
+if "$ROOT/forgejo/sync.sh" "$clones" >/dev/null; then ok; else no "sync.sh write"; fi
+if "$ROOT/forgejo/sync.sh" --check "$clones" >/dev/null; then ok; else no "--check after write"; fi
+crons=$(grep -h -A1 'schedule:' "$clones"/*/.forgejo/workflows/ci.yml | grep cron | sort)
+if [ "$(printf '%s\n' "$crons" | wc -l)" -eq "$(printf '%s\n' "$crons" | uniq | wc -l)" ]; then ok; else no "crons not distinct"; fi
+first=$(ls "$clones" | head -1)
+echo '# hand edit' >> "$clones/$first/.forgejo/workflows/ci.yml"
+if out=$("$ROOT/forgejo/sync.sh" --check "$clones"); then no "--check missed a hand edit"; else
+  case "$out" in *"stale: $clones/$first/"*) ok ;; *) no "--check named the wrong file: $out" ;; esac
+fi
+mkdir -p "$WORK/empty"
+if "$ROOT/forgejo/sync.sh" "$WORK/empty" >/dev/null 2>&1; then no "sync.sh wrote into a non-clone"; else ok; fi
+
+echo "sync: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

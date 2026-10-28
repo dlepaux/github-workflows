@@ -1,0 +1,24 @@
+name: test-forgejo-crate-verify
+
+# Repo housekeeping, not a reusable job: forgejo/render.py derives the crates' Forgejo shadow
+# workflow from rust-crate.yml (HL-508), so a change to either must keep the render passing its
+# cases (tests/forgejo-crate-verify/run.sh). A failure here means a rust-crate.yml change the
+# render cannot carry: teach render.py, then re-run forgejo/sync.sh over the crates.
+
+on:
+  push:
+    paths: ['.github/workflows/rust-crate.yml', 'forgejo/**', 'tests/forgejo-crate-verify/**', '.github/workflows/test-forgejo-crate-verify.yml']
+  pull_request:
+    paths: ['.github/workflows/rust-crate.yml', 'forgejo/**', 'tests/forgejo-crate-verify/**', '.github/workflows/test-forgejo-crate-verify.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  forgejo-crate-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m pip install --quiet pyyaml
+      - run: bash tests/forgejo-crate-verify/run.sh
