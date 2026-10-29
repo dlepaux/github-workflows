@@ -1,0 +1,24 @@
+name: test-native-version-tags
+
+# Repo housekeeping, not a reusable job: runs each native multi-arch workflow's own "Minor version
+# tag" script and checks its version label and tags (tests/native-version-tags/run.sh) whenever
+# one changes. GitHub-hosted, like test-qemu-decision.yml: its test must not depend on the
+# homelab.
+
+on:
+  push:
+    paths: ['.github/workflows/docker-build-push-native.yml', '.github/workflows/docker-build-push-github-native.yml', 'tests/native-version-tags/**', '.github/workflows/test-native-version-tags.yml']
+  pull_request:
+    paths: ['.github/workflows/docker-build-push-native.yml', '.github/workflows/docker-build-push-github-native.yml', 'tests/native-version-tags/**', '.github/workflows/test-native-version-tags.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  native-version-tags:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m pip install --quiet pyyaml
+      - run: bash tests/native-version-tags/run.sh
