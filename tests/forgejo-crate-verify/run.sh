@@ -257,11 +257,13 @@ if release_checkout "$WORK/rel-ref" refs/heads/other "$sha2"; then no "release c
 if release_checkout "$WORK/rel-dirty" refs/heads/main "$sha2"; then no "release checkout over a non-empty workspace"; else ok; fi
 
 # The header's key, as rendered, reaches the forge with or without server_url's trailing slash,
-# and no other host.
+# and no other host. Only the key under test is read: actions/checkout leaves its own github.com
+# extraheader in the checkout's config, which the github.com probe would otherwise find.
 key=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/forgejo'); import render; print(render.CHECKOUT['env']['GIT_CONFIG_KEY_0'])")
 for server in https://forge.example https://forge.example/; do
   k=${key//'${{ github.server_url }}'/$server}
-  match() { GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="$k" GIT_CONFIG_VALUE_0=v git config --get-urlmatch http.extraHeader "$1"; }
+  match() { GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="$k" GIT_CONFIG_VALUE_0=v \
+              git -C "$WORK" config --get-urlmatch http.extraHeader "$1"; }
   if [ "$(match "${server}/o/r.git")" = v ] && [ "$(match https://forge.example/o/r.git)" = v ] \
      && [ -z "$(match https://github.com/o/r.git)" ] && [ -z "$(match https://forge.example.evil/o/r.git)" ]; then ok
   else no "header scope with server_url $server"; fi
