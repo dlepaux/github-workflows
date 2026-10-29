@@ -70,6 +70,14 @@ on:
           applies to library crates and services, not user-facing binaries.
         type: boolean
         default: false
+      release:
+        description: >
+          Run the release job on a push to main. A crate whose family has
+          flipped to the forge (HL-657) sets false: the forge releases it, and
+          GitHub only verifies what the push mirror brings back, so nothing on
+          GitHub can publish a competing release.
+        type: boolean
+        default: true
     secrets:
       # kellnr token (read to fetch deps; publish for `cargo publish --registry
       # gordon`). Optional during the runner-env→repo-secret migration: when a
@@ -534,6 +542,7 @@ jobs:
   release:
     needs: [build-and-gate, test-coverage, trivy]
     if: |
+      inputs.release &&
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push'
     runs-on: [self-hosted, rootless, arch-any, ci-heavy]

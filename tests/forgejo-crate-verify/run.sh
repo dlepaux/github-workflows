@@ -182,6 +182,14 @@ refuses_primary("release: a changed semantic-release step", lambda wf: wf["jobs"
 refuses_primary("release: a changed token source", lambda wf: wf["jobs"]["release"]["steps"][4].__setitem__(
     "env", {"KELLNR_TOKEN_SECRET": "${{ secrets.OTHER }}"}))
 refuses_primary("release: a widened condition", lambda wf: wf["jobs"]["release"].__setitem__("if", "always()"))
+# GitHub's verify-only switch (HL-657): a flipped crate's caller sets release: false.
+check("source: release is behind the verify-only switch, on by default",
+      src["jobs"]["release"]["if"].startswith("inputs.release &&")
+      and src[True]["workflow_call"]["inputs"]["release"] == {
+          "description": src[True]["workflow_call"]["inputs"]["release"]["description"],
+          "type": "boolean", "default": True})
+refuses_primary("release: a condition without the verify-only switch", lambda wf: wf["jobs"]["release"].__setitem__(
+    "if", "github.ref == 'refs/heads/main' &&\ngithub.event_name == 'push'\n"))
 refuses_primary("release: an unknown key", lambda wf: wf["jobs"]["release"].__setitem__("timeout-minutes", 30))
 refuses_primary("release: shallow checkout", lambda wf: wf["jobs"]["release"]["steps"][1]["with"].__setitem__("fetch-depth", 1))
 refuses_primary("release: a changed semantic-release version", lambda wf: wf["jobs"]["release"]["steps"][5]["with"].__setitem__(

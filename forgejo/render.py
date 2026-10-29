@@ -70,7 +70,10 @@ FORK_GUARD = PRIVATE_ONLY + " && github.event.pull_request.head.repo.fork"
 # these must reach the "unknown condition" refusal, not be dropped. A sidecar step names the
 # input that switches it on, so asking for a sidecar fails the render instead of dropping it.
 DROPPED = {FORK_GUARD: None, PUBLIC_ONLY: None}
-RELEASE_IF = "github.ref == 'refs/heads/main' &&\ngithub.event_name == 'push'"
+RELEASE_IF = "inputs.release &&\ngithub.ref == 'refs/heads/main' &&\ngithub.event_name == 'push'"
+# inputs.release is GitHub's verify-only switch for a flipped crate. On the forge, a crate releases
+# because crates.tsv says primary, so the rendered job keeps the rest of the condition only.
+FORGE_RELEASE_IF = "github.ref == 'refs/heads/main' && github.event_name == 'push'"
 SIDECARS = {
     "inputs.needs_postgres": "needs_postgres",
     "inputs.needs_nats": "needs_nats",
@@ -221,7 +224,7 @@ def carry_release(src, inputs):
             out.append(carry_step(step, inputs))
         elif action is not None:
             out.append(dict(action))
-    job = {"needs": src["needs"], "if": RELEASE_IF.replace("\n", " "), "runs-on": LABELS}
+    job = {"needs": src["needs"], "if": FORGE_RELEASE_IF, "runs-on": LABELS}
     if "env" in src:
         job["env"] = src["env"]
     job["steps"] = out
