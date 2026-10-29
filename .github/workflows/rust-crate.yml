@@ -569,8 +569,11 @@ jobs:
       - name: Ensure cargo-edit
         run: command -v cargo-set-version >/dev/null 2>&1 || cargo install cargo-edit --locked
 
-      # Kellnr token for `cargo publish --registry gordon --token "$KELLNR_TOKEN"`
-      # (semantic-release publishCmd). Repo secret → env, else runner ambient.
+      # Kellnr token for `cargo publish --registry gordon` (semantic-release
+      # publishCmd), read by cargo's `cargo:token` provider from
+      # CARGO_REGISTRIES_GORDON_TOKEN: never `--token`, which would put it in
+      # argv, world-readable on the runner host (HL-626). Repo secret → env,
+      # else runner ambient.
       # Only written when non-empty so an unforwarded secret keeps the ambient
       # publish token (empty would override it and 401 the publish).
       - name: Source kellnr token from repo secret
@@ -604,6 +607,6 @@ jobs:
 
   # Publication is handled by `@semantic-release/exec` inside the
   # release job — its `publishCmd` runs `cargo publish --registry gordon
-  # --token "$KELLNR_TOKEN" --allow-dirty` as part of the same release
+  # --allow-dirty` as part of the same release
   # transaction (no separate job needed). A duplicate publish job here
   # fails with `crate already exists` on the second pass.
