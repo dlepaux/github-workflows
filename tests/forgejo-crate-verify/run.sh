@@ -181,6 +181,18 @@ refuses_primary("release: a changed token source", lambda wf: wf["jobs"]["releas
 refuses_primary("release: a widened condition", lambda wf: wf["jobs"]["release"].__setitem__("if", "always()"))
 refuses_primary("release: an unknown key", lambda wf: wf["jobs"]["release"].__setitem__("timeout-minutes", 30))
 refuses_primary("release: shallow checkout", lambda wf: wf["jobs"]["release"]["steps"][1]["with"].__setitem__("fetch-depth", 1))
+refuses_primary("release: a changed semantic-release version", lambda wf: wf["jobs"]["release"]["steps"][5]["with"].__setitem__(
+    "semantic_version", 25))
+refuses_primary("release: a changed setup-node", lambda wf: wf["jobs"]["release"]["steps"][2].__setitem__(
+    "with", {"node-version": "22"}))
+refuses_primary("release: a changed fork guard", lambda wf: wf["jobs"]["release"]["steps"][0].__setitem__("run", "true"))
+wf = copy.deepcopy(src)
+wf["jobs"]["release"]["steps"][5]["uses"] = "cycjimmy/semantic-release-action@v6"
+check("release: an action's version alone is not a change",
+      "release" in yaml.safe_load(r.render(yaml.safe_dump(wf, sort_keys=False), inputs(), "0 1 * * *", primary=True))["jobs"])
+check("the job token's header is scoped to the forge",
+      all(s["env"].get("GIT_CONFIG_KEY_0") == r.CHECKOUT["env"]["GIT_CONFIG_KEY_0"]
+          for j in prim["jobs"].values() for s in j["steps"] if "GIT_CONFIG_VALUE_0" in s.get("env", {})))
 refuses_primary("release: a changed cargo-edit step", lambda wf: wf["jobs"]["release"]["steps"][3].__setitem__(
     "run", "curl -s x | sh"))
 
@@ -232,6 +244,17 @@ if release_checkout "$WORK/rel-ok" refs/heads/main "$sha2" \
    && [ "$(git -C "$WORK/rel-ok" rev-list --count HEAD)" = 2 ]; then ok; else no "release checkout: main, sha, tags, history"; fi
 if release_checkout "$WORK/rel-ref" refs/heads/other "$sha2"; then no "release checkout off main"; else ok; fi
 if release_checkout "$WORK/rel-dirty" refs/heads/main "$sha2"; then no "release checkout over a non-empty workspace"; else ok; fi
+
+# The header's key, as rendered, reaches the forge with or without server_url's trailing slash,
+# and no other host.
+key=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/forgejo'); import render; print(render.CHECKOUT['env']['GIT_CONFIG_KEY_0'])")
+for server in https://forge.example https://forge.example/; do
+  k=${key//'${{ github.server_url }}'/$server}
+  match() { GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="$k" GIT_CONFIG_VALUE_0=v git config --get-urlmatch http.extraHeader "$1"; }
+  if [ "$(match "${server}/o/r.git")" = v ] && [ "$(match https://forge.example/o/r.git)" = v ] \
+     && [ -z "$(match https://github.com/o/r.git)" ] && [ -z "$(match https://forge.example.evil/o/r.git)" ]; then ok
+  else no "header scope with server_url $server"; fi
+done
 
 # sync.sh against fake clones: write, then --check clean, then --check catches a hand edit.
 clones="$WORK/clones"

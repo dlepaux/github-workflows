@@ -65,8 +65,6 @@ FORK_GUARD = PRIVATE_ONLY + " && github.event.pull_request.head.repo.fork"
 # these must reach the "unknown condition" refusal, not be dropped. A sidecar step names the
 # input that switches it on, so asking for a sidecar fails the render instead of dropping it.
 DROPPED = {FORK_GUARD: None, PUBLIC_ONLY: None}
-# The release job's own guard, unreachable while its `if:` admits only pushes.
-RELEASE_FORK_GUARD = "github.event.pull_request.head.repo.fork"
 RELEASE_IF = "github.ref == 'refs/heads/main' &&\ngithub.event_name == 'push'"
 SIDECARS = {
     "inputs.needs_postgres": "needs_postgres",
@@ -78,12 +76,15 @@ SIDECARS = {
 SIDECAR_ENV = re.compile(r"\$\{\{ inputs\.(needs_[a-z]+) && .* \|\| '' \}\}")
 TOP_LEVEL = {"name", True, "permissions", "concurrency", "jobs"}  # PyYAML reads bare `on:` as True
 
-# The token travels in git's env-config, never in argv (runner hosts expose /proc cmdline).
+# The token travels in git's env-config, never in argv (runner hosts expose /proc cmdline), and
+# only to the forge: an unscoped http.extraHeader goes to any host a step's git talks to. Forgejo's
+# server_url is its AppURL, slash included; git reads the URL up to the key's last dot, so the
+# key holds with or without the slash, where "<url>/.extraHeader" would not.
 CHECKOUT = {
     "name": "Check out (plain git)",
     "env": {
         "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_KEY_0": "http.${{ github.server_url }}.extraHeader",
         "GIT_CONFIG_VALUE_0": "Authorization: token ${{ github.token }}",
         "REPO_URL": "${{ github.server_url }}/${{ github.repository }}.git",
         "REF": "${{ github.ref }}",
@@ -139,21 +140,63 @@ class RenderError(Exception):
     pass
 
 
-CARGO_EDIT = "command -v cargo-set-version >/dev/null 2>&1 || cargo install cargo-edit --locked"
+# rust-crate.yml's release steps as this render knows them, compared whole (an action's version
+# aside): a changed `with:` or `env:` on a dropped or replaced step fails the render, since
+# the forge would otherwise silently not do what GitHub does.
+RELEASE_SOURCE = yaml.safe_load(r"""
+- name: Refuse fork pull requests on self-hosted runners
+  if: github.event.pull_request.head.repo.fork
+  run: |
+    echo "::error::Fork pull request on a self-hosted runner — refused (HL-390)."
+    exit 1
+- uses: actions/checkout@
+  with:
+    fetch-depth: 0
+    persist-credentials: true
+- uses: actions/setup-node@
+  with:
+    node-version: "24"
+- name: Ensure cargo-edit
+  run: command -v cargo-set-version >/dev/null 2>&1 || cargo install cargo-edit --locked
+- name: Source kellnr token from repo secret
+  env:
+    KELLNR_TOKEN_SECRET: ${{ secrets.KELLNR_TOKEN }}
+  run: |
+    set -eu
+    if [ -n "${KELLNR_TOKEN_SECRET:-}" ]; then
+      echo "::add-mask::$KELLNR_TOKEN_SECRET"
+      {
+        echo "CARGO_REGISTRIES_GORDON_TOKEN=$KELLNR_TOKEN_SECRET"
+        echo "KELLNR_TOKEN=$KELLNR_TOKEN_SECRET"
+      } >> "$GITHUB_ENV"
+      echo "kellnr token: sourced from repo secret"
+    else
+      echo "kellnr token: repo secret not forwarded — using runner ambient env"
+    fi
+- name: Run semantic-release
+  id: semrel
+  uses: cycjimmy/semantic-release-action@
+  with:
+    semantic_version: 24
+    extra_plugins: |
+      @semantic-release/changelog@6
+      @semantic-release/exec@6
+      @semantic-release/git@10
+      conventional-changelog-conventionalcommits@8
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+""")
 
 
-# rust-crate.yml's release steps, in order, each with what the forge does with it: None drops it,
-# "carry" keeps it as carry_step would, a dict replaces it. Any other step list fails the render.
-RELEASE_STEPS = (
-    (lambda s: s.get("if", "").strip() == RELEASE_FORK_GUARD, None),
-    (lambda s: s.get("uses", "").startswith("actions/checkout@")
-     and s.get("with") == {"fetch-depth": 0, "persist-credentials": True}, RELEASE_CHECKOUT),
-    (lambda s: s.get("uses", "").startswith("actions/setup-node@"), None),
-    (lambda s: s == {"name": "Ensure cargo-edit", "run": CARGO_EDIT}, "carry"),
-    (lambda s: s.get("name") == "Source kellnr token from repo secret"
-     and s.get("env") == {"KELLNR_TOKEN_SECRET": "${{ secrets.KELLNR_TOKEN }}"}, None),
-    (lambda s: s.get("uses", "").startswith("cycjimmy/semantic-release-action@") and s.get("id") == "semrel", RELEASE_STEP),
-)
+# What the forge does with each of RELEASE_SOURCE's steps: None drops it, "carry" keeps it as
+# carry_step would, a dict replaces it.
+RELEASE_ACTIONS = (None, RELEASE_CHECKOUT, None, "carry", None, RELEASE_STEP)
+
+
+def _unversioned(step):
+    if "uses" not in step:
+        return step
+    return {**step, "uses": re.sub(r"@[^@]+$", "@", step["uses"])}
 
 
 def carry_release(src, inputs):
@@ -163,11 +206,11 @@ def carry_release(src, inputs):
     if str(src.get("if", "")).strip() != RELEASE_IF:
         raise RenderError(f"release: condition {src.get('if')!r} is not the one this render knows")
     steps = src["steps"]
-    if len(steps) != len(RELEASE_STEPS):
-        raise RenderError(f"release: {len(steps)} steps, this render knows {len(RELEASE_STEPS)}")
+    if len(steps) != len(RELEASE_SOURCE):
+        raise RenderError(f"release: {len(steps)} steps, this render knows {len(RELEASE_SOURCE)}")
     out = []
-    for i, (step, (matches, action)) in enumerate(zip(steps, RELEASE_STEPS)):
-        if not matches(step):
+    for i, (step, known, action) in enumerate(zip(steps, RELEASE_SOURCE, RELEASE_ACTIONS)):
+        if _unversioned(step) != known:
             raise RenderError(f"release: step {i} ({step.get('name') or step.get('uses')}) is not the one this render knows")
         if action == "carry":
             out.append(carry_step(step, inputs))
