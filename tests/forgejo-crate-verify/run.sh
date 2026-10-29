@@ -128,6 +128,62 @@ again = yaml.safe_load(r.render(yaml.safe_dump(wf, sort_keys=False), inputs(), "
 check("a sidecar's name alone drops nothing",
       any(s.get("run") == "echo kept" for s in again["jobs"]["test-coverage"]["steps"]))
 
+# Primary (HL-657): the same verify jobs, plus trivy and a release job rewritten for host mode.
+prim_text = r.render(src_text, inputs(), "30 0 * * *", primary=True)
+prim = yaml.safe_load(prim_text)
+check("primary: verify, trivy and release", list(prim["jobs"]) == ["build-and-gate", "test-coverage", "trivy", "release"])
+check("primary: verify jobs as the shadow's", all(prim["jobs"][j] == out["jobs"][j] for j in r.KEPT_JOBS))
+check("primary: named as the CI of record", prim["name"] == "CI (Forgejo)" and "primary on the forge" in prim_text.split("\nname:")[0])
+check("primary: header names the release edits, not drop-jobs",
+      "release-driver" in prim_text.split("\nname:")[0] and "drop-jobs" not in prim_text.split("\nname:")[0])
+check("shadow: still no release", "release" not in out["jobs"] and "forge-release" not in out_text)
+trivy = prim["jobs"]["trivy"]
+check("primary trivy: plain-git checkout, no action, no condition",
+      trivy["steps"][0] == r.CHECKOUT and all("uses" not in s and "if" not in s for s in trivy["steps"]))
+rel = prim["jobs"]["release"]
+check("release: needs every gate", rel["needs"] == ["build-and-gate", "test-coverage", "trivy"])
+check("release: main pushes only", rel["if"] == "github.ref == 'refs/heads/main' && github.event_name == 'push'")
+check("release: no permissions or outputs", "permissions" not in rel and "outputs" not in rel)
+check("release: host labels", rel["runs-on"] == ["self-hosted", "arm64", "ci-heavy"])
+check("release: steps are checkout, cargo-edit, driver",
+      [s["name"] for s in rel["steps"]] == [r.RELEASE_CHECKOUT["name"], "Ensure cargo-edit", r.RELEASE_STEP["name"]])
+check("release: no action, no condition, no GITHUB_ENV", all("uses" not in s and "if" not in s for s in rel["steps"])
+      and "GITHUB_ENV" not in yaml.safe_dump(rel))
+check("release: no expression in any run", all("${{" not in s.get("run", "") for s in rel["steps"]))
+drive = rel["steps"][2]
+check("release: the driver runs from the toolchain", "node /usr/local/lib/ci-toolchain/semantic-release/forge-release.mjs" in drive["run"])
+check("release: Kellnr token is the publish secret, in the driver's env only",
+      drive["env"]["CARGO_REGISTRIES_GORDON_TOKEN"] == "${{ secrets.KELLNR_PUBLISH_TOKEN }}"
+      and prim_text.count("secrets.KELLNR_PUBLISH_TOKEN") == 1 and "secrets." not in yaml.safe_dump(rel["steps"][:2]))
+check("release: an empty Kellnr token fails before the driver",
+      drive["run"].index("CARGO_REGISTRIES_GORDON_TOKEN") < drive["run"].index("node "))
+check("release: no token variable semantic-release would put in a URL",
+      not {"GITHUB_TOKEN", "GH_TOKEN", "GIT_CREDENTIALS"} & {k for s in rel["steps"] for k in s.get("env", {})})
+# Six: the three verify checkouts, the release checkout, and the driver's header and FORGEJO_TOKEN.
+check("primary: job token in env only", prim_text.count("${{ github.token }}") == 6
+      and all("github.token" not in s.get("run", "") for j in prim["jobs"].values() for s in j["steps"]))
+
+def refuses_primary(name, mutate):
+    wf = copy.deepcopy(src)
+    mutate(wf)
+    try:
+        r.render(yaml.safe_dump(wf, sort_keys=False), inputs(), "0 1 * * *", primary=True)
+    except r.RenderError:
+        check(name, True)
+        return
+    check(name, False)
+
+refuses_primary("release: a new step", lambda wf: wf["jobs"]["release"]["steps"].insert(3, {"name": "x", "run": "true"}))
+refuses_primary("release: a changed semantic-release step", lambda wf: wf["jobs"]["release"]["steps"][-1].__setitem__(
+    "uses", "some/other-action@v1"))
+refuses_primary("release: a changed token source", lambda wf: wf["jobs"]["release"]["steps"][4].__setitem__(
+    "env", {"KELLNR_TOKEN_SECRET": "${{ secrets.OTHER }}"}))
+refuses_primary("release: a widened condition", lambda wf: wf["jobs"]["release"].__setitem__("if", "always()"))
+refuses_primary("release: an unknown key", lambda wf: wf["jobs"]["release"].__setitem__("timeout-minutes", 30))
+refuses_primary("release: shallow checkout", lambda wf: wf["jobs"]["release"]["steps"][1]["with"].__setitem__("fetch-depth", 1))
+refuses_primary("release: a changed cargo-edit step", lambda wf: wf["jobs"]["release"]["steps"][3].__setitem__(
+    "run", "curl -s x | sh"))
+
 print(f"render: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
 PY
@@ -137,7 +193,7 @@ ok() { pass=$((pass + 1)); }
 no() { fail=$((fail + 1)); echo "FAIL: $1"; }
 
 # Arguments are validated before anything is read.
-for bad in "Bad_Name 40 true x" "demo forty true x" "demo 40 yes x"; do
+for bad in "Bad_Name 40 true x shadow" "demo forty true x shadow" "demo 40 yes x shadow" "demo 40 true x publish" "demo 40 true x"; do
   # shellcheck disable=SC2086
   if python3 "$ROOT/forgejo/render.py" $bad >/dev/null 2>&1; then no "accepted: $bad"; else ok; fi
 done
@@ -148,6 +204,7 @@ import sys
 sys.path.insert(0, f"{sys.argv[1]}/forgejo")
 import render
 open(sys.argv[2], "w").write(render.CHECKOUT["run"])
+open(sys.argv[2].replace("checkout", "release-checkout"), "w").write(render.RELEASE_CHECKOUT["run"])
 PY
 src_repo="$WORK/src"
 git init -q -b main "$src_repo"
@@ -159,6 +216,22 @@ checkout() {  # <dir> -> runs the step there, as the runner would
 mkdir -p "$WORK/ws-empty" "$WORK/ws-dirty"; : > "$WORK/ws-dirty/leftover"
 if checkout "$WORK/ws-empty" && [ "$(git -C "$WORK/ws-empty" rev-parse HEAD)" = "$sha" ]; then ok; else no "checkout into an empty workspace"; fi
 if checkout "$WORK/ws-dirty"; then no "checkout over a non-empty workspace"; else ok; fi
+
+# The release checkout: on a local main at the pushed sha, with every tag, as semantic-release needs.
+git -C "$src_repo" tag v1.0.0 "$sha"
+git -C "$src_repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m two
+sha2=$(git -C "$src_repo" rev-parse HEAD)
+release_checkout() {  # <dir> <ref> <sha>
+  (cd "$1" && REPO_URL="$src_repo" REF=$2 SHA=$3 GIT_CONFIG_COUNT=0 bash "$WORK/release-checkout.sh") >/dev/null 2>&1
+}
+mkdir -p "$WORK/rel-ok" "$WORK/rel-ref" "$WORK/rel-dirty"; : > "$WORK/rel-dirty/leftover"
+if release_checkout "$WORK/rel-ok" refs/heads/main "$sha2" \
+   && [ "$(git -C "$WORK/rel-ok" rev-parse HEAD)" = "$sha2" ] \
+   && [ "$(git -C "$WORK/rel-ok" symbolic-ref --short HEAD)" = main ] \
+   && [ "$(git -C "$WORK/rel-ok" tag)" = v1.0.0 ] \
+   && [ "$(git -C "$WORK/rel-ok" rev-list --count HEAD)" = 2 ]; then ok; else no "release checkout: main, sha, tags, history"; fi
+if release_checkout "$WORK/rel-ref" refs/heads/other "$sha2"; then no "release checkout off main"; else ok; fi
+if release_checkout "$WORK/rel-dirty" refs/heads/main "$sha2"; then no "release checkout over a non-empty workspace"; else ok; fi
 
 # sync.sh against fake clones: write, then --check clean, then --check catches a hand edit.
 clones="$WORK/clones"

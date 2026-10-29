@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a crate's Forgejo shadow workflow from rust-crate.yml (HL-508).
+"""Render a crate's Forgejo workflow from rust-crate.yml (HL-508), shadow or primary.
 
 The forge cannot call this repo's reusable workflow: Forgejo resolves cross-repo `uses:` only
 from a public repo, and the forge keeps every repo private. So each crate carries its own copy,
@@ -7,12 +7,15 @@ and the copy is derived here from rust-crate.yml's two verify jobs rather than w
 so the shadow runs exactly what GitHub runs. Every difference is one entry of TRANSFORMS below:
 that list is the edit count phase 3 costs per family (spec §1, Acceptance "Edits").
 
-Verify only: trivy and release are dropped, so the forge never publishes (spec §1). Anything in
+A shadow is verify only: trivy and release are dropped, so the forge never publishes (spec §1).
+A primary crate (its family has flipped, HL-657) is the forge's to release, so it also carries
+trivy and the release job, the release rewritten for host mode: PRIMARY_TRANSFORMS. Anything in
 rust-crate.yml this script does not know how to carry over (a new `uses:` step, a new `if:`, an
-input it cannot substitute) fails the render instead of being copied across silently.
+input it cannot substitute, a changed release step) fails the render instead of being copied
+across silently.
 
 Usage:
-  render.py <crate_name> <coverage_floor> <is_cli_tool> <cron>   # print the workflow
+  render.py <crate_name> <coverage_floor> <is_cli_tool> <cron> <shadow|primary>   # print it
   RENDER_REF=<ref> overrides the ref rust-crate.yml is read at (default v1).
 """
 import os
@@ -24,6 +27,7 @@ import yaml
 
 SOURCE = "rust-crate.yml"
 KEPT_JOBS = ("build-and-gate", "test-coverage")
+PRIMARY_JOBS = KEPT_JOBS + ("trivy", "release")
 LABELS = ["self-hosted", "arm64", "ci-heavy"]
 PUBLIC_ONLY = "github.event.repository.visibility == 'public'"
 PRIVATE_ONLY = "github.event.repository.visibility != 'public'"
@@ -43,6 +47,14 @@ TRANSFORMS = (
     ("drop-permissions-concurrency", "GitHub token scopes; the in-flight cap of 1 serialises"),
     ("shell-default", "GitHub runs a step with no shell as `bash -e {0}`; forgejo-runner adds pipefail"),
 )
+# A primary keeps trivy and release, so drop-jobs gives way to these.
+PRIMARY_TRANSFORMS = (
+    ("release-checkout", "full history and tags with plain git, on a local main, as semantic-release needs"),
+    ("release-host-node", "node and semantic-release are homelab roles/ci-toolchain's, not setup-node and the action"),
+    ("release-driver", "forge-release.mjs drops @semantic-release/github and makes the release page on the forge"),
+    ("release-token", "the Kellnr publish token is the repo secret KELLNR_PUBLISH_TOKEN, in the release step's env only"),
+    ("release-keys", "permissions and outputs go: Forgejo's job token is scoped to its repo, and nothing reads the outputs"),
+)
 # GitHub's default for a `run:` step with no `shell:`. forgejo-runner maps "" to
 # `bash --noprofile --norc -e -o pipefail {0}` (act/runner/step_run.go, v13.2.0) and passes any
 # other string through, so pinning this one gives the shadow GitHub's semantics.
@@ -53,6 +65,9 @@ FORK_GUARD = PRIVATE_ONLY + " && github.event.pull_request.head.repo.fork"
 # these must reach the "unknown condition" refusal, not be dropped. A sidecar step names the
 # input that switches it on, so asking for a sidecar fails the render instead of dropping it.
 DROPPED = {FORK_GUARD: None, PUBLIC_ONLY: None}
+# The release job's own guard, unreachable while its `if:` admits only pushes.
+RELEASE_FORK_GUARD = "github.event.pull_request.head.repo.fork"
+RELEASE_IF = "github.ref == 'refs/heads/main' &&\ngithub.event_name == 'push'"
 SIDECARS = {
     "inputs.needs_postgres": "needs_postgres",
     "inputs.needs_nats": "needs_nats",
@@ -85,8 +100,84 @@ CHECKOUT = {
 }
 
 
+# The token travels as CHECKOUT's does. semantic-release reads its config from the checkout, wants
+# the branch it releases checked out and every tag fetched, and pushes the release commit and tag
+# through the same header (forge-release.mjs). git would follow main's tags without --tags; it is
+# there so a remote.tagOpt or a tag off main cannot leave the version computed from too few tags.
+GIT_AUTH = {k: CHECKOUT["env"][k] for k in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")}
+RELEASE_CHECKOUT = {
+    "name": "Check out with history and tags (plain git)",
+    "env": {**GIT_AUTH, "REPO_URL": CHECKOUT["env"]["REPO_URL"], "REF": "${{ github.ref }}", "SHA": "${{ github.sha }}"},
+    "run": (
+        "set -eu\n"
+        'test "$REF" = refs/heads/main\n'
+        '[ -z "$(ls -A)" ] || { echo "::error::workspace not empty"; exit 1; }\n'
+        "git init -q .\n"
+        'git remote add origin "$REPO_URL"\n'
+        'git fetch -q --tags origin "+refs/heads/main:refs/remotes/origin/main"\n'
+        'git checkout -q -B main "$SHA"\n'
+        'test "$(git rev-parse HEAD)" = "$SHA"\n'
+    ),
+}
+RELEASE_STEP = {
+    "name": "Run semantic-release (forge)",
+    "env": {
+        **GIT_AUTH,
+        "FORGEJO_TOKEN": "${{ github.token }}",
+        "CARGO_REGISTRIES_GORDON_TOKEN": "${{ secrets.KELLNR_PUBLISH_TOKEN }}",
+    },
+    "run": (
+        "set -eu\n"
+        '[ -n "${CARGO_REGISTRIES_GORDON_TOKEN:-}" ] || {\n'
+        '  echo "::error::KELLNR_PUBLISH_TOKEN is not set on this repo (homelab forgejo_actions_repo_secrets)"; exit 1; }\n'
+        "node /usr/local/lib/ci-toolchain/semantic-release/forge-release.mjs\n"
+    ),
+}
+
+
 class RenderError(Exception):
     pass
+
+
+CARGO_EDIT = "command -v cargo-set-version >/dev/null 2>&1 || cargo install cargo-edit --locked"
+
+
+# rust-crate.yml's release steps, in order, each with what the forge does with it: None drops it,
+# "carry" keeps it as carry_step would, a dict replaces it. Any other step list fails the render.
+RELEASE_STEPS = (
+    (lambda s: s.get("if", "").strip() == RELEASE_FORK_GUARD, None),
+    (lambda s: s.get("uses", "").startswith("actions/checkout@")
+     and s.get("with") == {"fetch-depth": 0, "persist-credentials": True}, RELEASE_CHECKOUT),
+    (lambda s: s.get("uses", "").startswith("actions/setup-node@"), None),
+    (lambda s: s == {"name": "Ensure cargo-edit", "run": CARGO_EDIT}, "carry"),
+    (lambda s: s.get("name") == "Source kellnr token from repo secret"
+     and s.get("env") == {"KELLNR_TOKEN_SECRET": "${{ secrets.KELLNR_TOKEN }}"}, None),
+    (lambda s: s.get("uses", "").startswith("cycjimmy/semantic-release-action@") and s.get("id") == "semrel", RELEASE_STEP),
+)
+
+
+def carry_release(src, inputs):
+    unknown = set(src) - {"needs", "if", "runs-on", "env", "permissions", "outputs", "steps"}
+    if unknown:
+        raise RenderError(f"release: keys this render does not carry: {sorted(unknown)}")
+    if str(src.get("if", "")).strip() != RELEASE_IF:
+        raise RenderError(f"release: condition {src.get('if')!r} is not the one this render knows")
+    steps = src["steps"]
+    if len(steps) != len(RELEASE_STEPS):
+        raise RenderError(f"release: {len(steps)} steps, this render knows {len(RELEASE_STEPS)}")
+    out = []
+    for i, (step, (matches, action)) in enumerate(zip(steps, RELEASE_STEPS)):
+        if not matches(step):
+            raise RenderError(f"release: step {i} ({step.get('name') or step.get('uses')}) is not the one this render knows")
+        if action == "carry":
+            out.append(carry_step(step, inputs))
+        elif action is not None:
+            out.append(dict(action))
+    job = {"needs": src["needs"], "if": RELEASE_IF.replace("\n", " "), "runs-on": LABELS}
+    if "env" in src:
+        job["env"] = src["env"]
+    job["steps"] = out
+    return job
 
 
 def carry_step(step, inputs):
@@ -143,14 +234,17 @@ def substitute(node, inputs):
     return re.sub(r"\$\{\{\s*inputs\.([a-z_]+)\s*\}\}", literal, node)
 
 
-def render(source, inputs, cron):
+def render(source, inputs, cron, primary=False):
     wf = yaml.safe_load(source)
     unknown = set(wf) - TOP_LEVEL
     if unknown:
         raise RenderError(f"workflow keys this render does not carry: {sorted(map(str, unknown))}")
     jobs = {}
-    for job_id in KEPT_JOBS:
+    for job_id in PRIMARY_JOBS if primary else KEPT_JOBS:
         src = wf["jobs"][job_id]
+        if job_id == "release":
+            jobs[job_id] = carry_release(src, inputs)
+            continue
         job = {}
         if "needs" in src:
             job["needs"] = src["needs"]
@@ -162,7 +256,7 @@ def render(source, inputs, cron):
             raise RenderError(f"{job_id}: keys this render does not carry: {sorted(unknown)}")
         jobs[job_id] = job
     out = {
-        "name": "CI (Forgejo shadow)",
+        "name": "CI (Forgejo)" if primary else "CI (Forgejo shadow)",
         "on": {
             "push": {"branches": ["main"]},
             "schedule": [{"cron": cron}],
@@ -174,13 +268,22 @@ def render(source, inputs, cron):
     text = yaml.dump(out, Dumper=BlockDumper, sort_keys=False, width=1000, allow_unicode=True)
     if "inputs." in text or "visibility" in text:
         raise RenderError("an input or a visibility branch survived the render")
-    return HEADER.format(transforms="\n".join(f"#   {t}: {w}" for t, w in TRANSFORMS)) + text
+    transforms = (tuple(t for t in TRANSFORMS if t[0] != "drop-jobs") + PRIMARY_TRANSFORMS) if primary else TRANSFORMS
+    header = PRIMARY_HEADER if primary else HEADER
+    return header.format(transforms="\n".join(f"#   {t}: {w}" for t, w in transforms)) + text
 
 
 HEADER = """\
 # Generated by dlepaux/github-workflows forgejo/render.py from rust-crate.yml (HL-508).
 # Do not edit: re-render with forgejo/sync.sh. Forgejo shadow CI, verify only: it never
 # publishes, and GitHub's .github/workflows stays the CI of record until this crate's flip.
+# Edits against rust-crate.yml:
+{transforms}
+"""
+PRIMARY_HEADER = """\
+# Generated by dlepaux/github-workflows forgejo/render.py from rust-crate.yml (HL-508, HL-657).
+# Do not edit: re-render with forgejo/sync.sh. This crate is primary on the forge: this is its CI
+# of record, and its release job publishes to Kellnr. GitHub only receives the push mirror.
 # Edits against rust-crate.yml:
 {transforms}
 """
@@ -202,11 +305,12 @@ BlockDumper.add_representer(str, _str)
 
 
 def main(argv):
-    if len(argv) != 5:
+    if len(argv) != 6:
         print(__doc__, file=sys.stderr)
         return 2
-    crate, floor, cli, cron = argv[1:]
-    if not re.fullmatch(r"[a-z0-9-]+", crate) or not floor.isdigit() or cli not in ("true", "false"):
+    crate, floor, cli, cron, mode = argv[1:]
+    if (not re.fullmatch(r"[a-z0-9-]+", crate) or not floor.isdigit() or cli not in ("true", "false")
+            or mode not in ("shadow", "primary")):
         print("render.py: bad arguments", file=sys.stderr)
         return 2
     inputs = {
@@ -228,7 +332,7 @@ def main(argv):
         print(f"render.py: cannot read {SOURCE} at {ref}: {e.stderr.strip()}", file=sys.stderr)
         return 1
     try:
-        sys.stdout.write(render(source, inputs, cron))
+        sys.stdout.write(render(source, inputs, cron, primary=mode == "primary"))
     except RenderError as e:
         print(f"render.py: {e}", file=sys.stderr)
         return 1
