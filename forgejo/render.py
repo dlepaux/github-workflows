@@ -29,6 +29,10 @@ SOURCE = "rust-crate.yml"
 KEPT_JOBS = ("build-and-gate", "test-coverage")
 PRIMARY_JOBS = KEPT_JOBS + ("trivy", "release")
 LABELS = ["self-hosted", "arm64", "ci-heavy"]
+# trivy is medium on GitHub (arch-any, ci-medium). The forge's medium class is arm64 only, as its
+# runners must reach the LAN-only /api/actions/ (homelab group_vars nomad_forgejo_jobs, HL-657).
+MEDIUM_LABELS = ["self-hosted", "arm64", "ci-medium"]
+JOB_LABELS = {"trivy": MEDIUM_LABELS}
 PUBLIC_ONLY = "github.event.repository.visibility == 'public'"
 PRIVATE_ONLY = "github.event.repository.visibility != 'public'"
 VISIBILITY_EXPR = "${{ github.event.repository.visibility }}"
@@ -49,6 +53,7 @@ TRANSFORMS = (
 )
 # A primary keeps trivy and release, so drop-jobs gives way to these.
 PRIMARY_TRANSFORMS = (
+    ("trivy-medium", "trivy runs on the forge's medium class, [self-hosted, arm64, ci-medium]"),
     ("release-checkout", "full history and tags with plain git, on a local main, as semantic-release needs"),
     ("release-host-node", "node and semantic-release are homelab roles/ci-toolchain's, not setup-node and the action"),
     ("release-driver", "forge-release.mjs drops @semantic-release/github and makes the release page on the forge"),
@@ -291,7 +296,7 @@ def render(source, inputs, cron, primary=False):
         job = {}
         if "needs" in src:
             job["needs"] = src["needs"]
-        job["runs-on"] = LABELS
+        job["runs-on"] = JOB_LABELS.get(job_id, LABELS)
         steps = [carry_step(s, inputs) for s in src["steps"]]
         job["steps"] = [s for s in steps if s is not None]
         unknown = set(src) - {"needs", "runs-on", "steps"}

@@ -138,6 +138,9 @@ check("primary: header names the release edits, not drop-jobs",
       "release-driver" in prim_text.split("\nname:")[0] and "drop-jobs" not in prim_text.split("\nname:")[0])
 check("shadow: still no release", "release" not in out["jobs"] and "forge-release" not in out_text)
 trivy = prim["jobs"]["trivy"]
+check("primary trivy: the medium class's labels, the others the heavy's",
+      trivy["runs-on"] == ["self-hosted", "arm64", "ci-medium"]
+      and all(prim["jobs"][j]["runs-on"] == r.LABELS for j in ("build-and-gate", "test-coverage", "release")))
 check("primary trivy: plain-git checkout, no action, no condition",
       trivy["steps"][0] == r.CHECKOUT and all("uses" not in s and "if" not in s for s in trivy["steps"]))
 rel = prim["jobs"]["release"]
