@@ -1,14 +1,14 @@
 # The private crates on the forge (HL-508): repo, crate_name, coverage_floor, is_cli_tool, mode.
 # Values are each caller's .github/workflows/ci.yml inputs; forgejo/sync.sh renders each row.
 # mode: shadow (verify only, GitHub stays the CI of record) or primary (the forge releases, HL-657).
-cargo-boundary	cargo-boundary	0	true	shadow
-cargo-deadvariant	cargo-deadvariant	40	true	shadow
-cargo-extcalls	cargo-extcalls	0	true	shadow
-cargo-http-routes	cargo-http-routes	0	true	shadow
-cargo-module-index	cargo-module-index	50	true	shadow
-cargo-pg-notify	cargo-pg-notify	40	true	shadow
-cargo-schema-compat	cargo-schema-compat	0	true	shadow
-cargo-spawntree	cargo-spawntree	0	true	shadow
-cargo-statemachines	cargo-statemachines	0	true	shadow
-cargo-view-deps	cargo-view-deps	0	true	shadow
-migration-graph	cargo-migration-graph	0	true	shadow
+cargo-boundary	cargo-boundary	0	true	primary
+cargo-deadvariant	cargo-deadvariant	40	true	primary
+cargo-extcalls	cargo-extcalls	0	true	primary
+cargo-http-routes	cargo-http-routes	0	true	primary
+cargo-module-index	cargo-module-index	50	true	primary
+cargo-pg-notify	cargo-pg-notify	40	true	primary
+cargo-schema-compat	cargo-schema-compat	0	true	primary
+cargo-spawntree	cargo-spawntree	0	true	primary
+cargo-statemachines	cargo-statemachines	0	true	primary
+cargo-view-deps	cargo-view-deps	0	true	primary
+migration-graph	cargo-migration-graph	0	true	primary
