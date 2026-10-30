@@ -59,6 +59,7 @@ PRIMARY_TRANSFORMS = (
     ("release-driver", "forge-release.mjs drops @semantic-release/github and makes the release page on the forge"),
     ("release-token", "the Kellnr publish token is the repo secret KELLNR_PUBLISH_TOKEN, in the release step's env only"),
     ("release-keys", "permissions and outputs go: Forgejo's job token is scoped to its repo, and nothing reads the outputs"),
+    ("mail", "enable-email-notifications: the forge mails a failed run, and the first green after one (HL-651)"),
 )
 # GitHub's default for a `run:` step with no `shell:`. forgejo-runner maps "" to
 # `bash --noprofile --norc -e -o pipefail {0}` (act/runner/step_run.go, v13.2.0) and passes any
@@ -316,6 +317,10 @@ def render(source, inputs, cron, primary=False):
         "defaults": {"run": {"shell": GITHUB_DEFAULT_SHELL}},
         "jobs": jobs,
     }
+    if primary:
+        # Forgejo 15 mails a run only when its workflow opts in. The shadow never does, so GitHub
+        # stays the only mail while it is the CI of record; a primary crate has no GitHub run left.
+        out = {"enable-email-notifications": True, **out}
     text = yaml.dump(out, Dumper=BlockDumper, sort_keys=False, width=1000, allow_unicode=True)
     if "inputs." in text or "visibility" in text:
         raise RenderError("an input or a visibility branch survived the render")

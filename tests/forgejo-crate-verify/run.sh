@@ -137,6 +137,8 @@ check("primary: named as the CI of record", prim["name"] == "CI (Forgejo)" and "
 check("primary: header names the release edits, not drop-jobs",
       "release-driver" in prim_text.split("\nname:")[0] and "drop-jobs" not in prim_text.split("\nname:")[0])
 check("shadow: still no release", "release" not in out["jobs"] and "forge-release" not in out_text)
+check("primary: mails a failed run (HL-651)", prim.get("enable-email-notifications") is True)
+check("shadow: never mails, GitHub stays the mail of record", "enable-email-notifications" not in out)
 trivy = prim["jobs"]["trivy"]
 check("primary trivy: the medium class's labels, the others the heavy's",
       trivy["runs-on"] == ["self-hosted", "arm64", "ci-medium"]
