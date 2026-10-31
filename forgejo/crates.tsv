@@ -3,12 +3,10 @@
 # mode: shadow (verify only, GitHub stays the CI of record) or primary (the forge releases, HL-657).
 cargo-boundary	cargo-boundary	0	true	primary
 cargo-deadvariant	cargo-deadvariant	40	true	primary
-cargo-extcalls	cargo-extcalls	0	true	primary
 cargo-http-routes	cargo-http-routes	0	true	primary
 cargo-module-index	cargo-module-index	50	true	primary
 cargo-pg-notify	cargo-pg-notify	40	true	primary
 cargo-schema-compat	cargo-schema-compat	0	true	primary
 cargo-spawntree	cargo-spawntree	0	true	primary
-cargo-statemachines	cargo-statemachines	0	true	primary
 cargo-view-deps	cargo-view-deps	0	true	primary
 migration-graph	cargo-migration-graph	0	true	primary

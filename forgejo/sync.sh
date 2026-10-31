@@ -6,7 +6,7 @@
 # A row's mode picks the render; a row with no mode passes an empty one, which render.py refuses.
 # Every crate runs nightly at 00:30 UTC, on one line: ci-dispatch's in-flight cap of one already
 # takes them one at a time, so a stagger adds nothing (spec §1 Triggers). The night is when
-# GitHub's heavy queue is emptiest, and eleven crates finish well inside the forge's 6 h bound.
+# GitHub's heavy queue is emptiest, and nine crates finish well inside the forge's 6 h bound.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
