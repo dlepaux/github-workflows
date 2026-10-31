@@ -571,7 +571,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "26"
 
       # cargo-edit pre-installed by Ansible ci-toolchain role; this is a
       # belt-and-braces install for first-run hosts.
