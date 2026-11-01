@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 python3 - "$ROOT" <<'PY'
-import copy, os, re, subprocess, sys
+import copy, os, re, subprocess, sys, tempfile, textwrap
 import yaml
 root = sys.argv[1]
 sys.path.insert(0, f"{root}/forgejo")
@@ -76,10 +76,11 @@ for repo, wf in rendered.items():
     check(f"{repo}: release waits for every gate", sorted(needs) == sorted(gates))
     check(f"{repo}: release runs on a push only", jobs["release"]["if"] == "github.event_name == 'push'")
     if "docker" in jobs and table[repo].get("multi_arch"):
-        for job_id, first in (("docker", "release"), ("rebuild", "quality")):
+        for job_id, first in (("docker", ["release"]), ("rebuild", gates)):
             legs = [f"{job_id}-arm64", f"{job_id}-x64"]
-            check(f"{repo}: {job_id} merges only after both legs", jobs[job_id]["needs"] == [first] + legs)
-            check(f"{repo}: {job_id}'s legs follow {first}", all(jobs[l]["needs"] == first for l in legs))
+            check(f"{repo}: {job_id} merges only after both legs", jobs[job_id]["needs"] == first + legs)
+            leg_needs = first[0] if len(first) == 1 else first
+            check(f"{repo}: {job_id}'s legs follow {first}", all(jobs[l]["needs"] == leg_needs for l in legs))
             check(f"{repo}: {job_id} merges under the same guard",
                   all(jobs[l]["if"] == jobs[job_id]["if"] for l in legs))
             check(f"{repo}: each leg builds on its own hardware",
@@ -98,8 +99,9 @@ for repo, wf in rendered.items():
               and jobs["docker"]["if"] == "needs.release.outputs.version != ''")
         check(f"{repo}: a rebuild runs only on the schedule or by hand",
               jobs["rebuild"]["if"] == "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'")
-        check(f"{repo}: a rebuild waits for quality where there is one",
-              ("quality" in gates) == (jobs["rebuild"].get("needs") == "quality"))
+        rebuild_needs = jobs["rebuild"].get("needs", [])
+        rebuild_needs = [rebuild_needs] if isinstance(rebuild_needs, str) else rebuild_needs
+        check(f"{repo}: a rebuild waits for every gate", sorted(rebuild_needs) == sorted(gates))
 
 # A pull request gets gates and nothing that publishes; a host repo gets no check at all, which is
 # what holds its updates to a human's merge (HL-130). The guards are pinned whole, since `always()`
@@ -212,6 +214,29 @@ for arch, labels in (("arm64", "arm64"), ("x64", "x64")):
     check(f"smoke-{arch} follows the manifest", job["needs"] == ["release", "docker"])
     check(f"the smoke script parses ({arch})",
           subprocess.run(["bash", "-n"], input=job["steps"][0]["run"], text=True).returncode == 0)
+# epubarr's real smoke against a stub docker: a typo in it would only show after the version is out.
+with tempfile.TemporaryDirectory() as stub_dir:
+    stub = os.path.join(stub_dir, "docker")
+    with open(stub, "w") as f:
+        f.write(textwrap.dedent("""\
+            #!/bin/bash
+            case "$1 $2" in
+              "run --rm") echo "epubarr ${STUB_PRINTS:-1.2.3}" ;;
+              "image inspect") echo "${STUB_LABEL:-1.2.3}" ;;
+              "buildx imagetools") case "$4" in *:1.2) echo "${STUB_MINOR:-same}" ;; *) echo same ;; esac ;;
+              *) echo "unexpected docker $*" >&2; exit 9 ;;
+            esac
+            """))
+    os.chmod(stub, 0o755)
+    def smoke(**env):
+        return subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + table["epubarr"]["image_smoke"]],
+            env={"PATH": f"{stub_dir}:{os.environ['PATH']}", "IMAGE": "img", "VERSION": "1.2.3",
+                 "PLATFORM": "linux/arm64", **env}, capture_output=True, text=True).returncode
+    check("epubarr's smoke passes a right image", smoke() == 0)
+    check("epubarr's smoke fails a wrong --version", smoke(STUB_PRINTS="1.2.2") == 1)
+    check("epubarr's smoke fails a wrong label", smoke(STUB_LABEL="1.2.2") == 1)
+    check("epubarr's smoke fails a minor tag on another digest", smoke(STUB_MINOR="other") == 1)
 refuses("a smoke with no manifest to check", arch_repo, {**table[arch_repo], "image_smoke": "true\n"}, "needs multi_arch")
 refuses("multi_arch with image_env", arch_repo, {**table[arch_repo], "multi_arch": True, "image_env": {"X": "1"}}, "image_env")
 check("a missing digest stops the merge before any login", refused.returncode == 1 and "left no digest" in refused.stdout)

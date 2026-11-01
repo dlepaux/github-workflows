@@ -293,7 +293,7 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
     whatever follows `docker` follows the manifest. A failed leg leaves no manifest at all."""
     if "image_env" in entry:
         raise RenderError(f"{repo}: multi_arch carries no image_env, as a leg's build takes only its own args")
-    needs = guard.get("needs")
+    needs = guard.get("needs", [])
     env = {"IMAGE": f"ghcr.io/dlepaux/{repo}", "GHCR_WRITE_TOKEN": "${{ secrets.GHCR_WRITE_TOKEN }}"}
     if version:
         env["VERSION"] = "${{ needs.release.outputs.version }}"
@@ -314,7 +314,7 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
     }
     merge_env = {**env, **{f"DIGEST_{a.upper()}": f"${{{{ needs.{job_id}-{a}.outputs.digest }}}}" for a in IMAGE_PLATFORMS}}
     merge = {
-        "needs": ([needs] if needs else []) + list(legs),
+        "needs": ([needs] if isinstance(needs, str) else needs) + list(legs),
         "if": guard["if"],
         "runs-on": runs_on("medium"),
         "timeout-minutes": 10,
@@ -325,7 +325,7 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
 
 def smoke_jobs(entry, docker_guard):
     """A check of the published image, on each architecture's own hardware: no emulation stands in
-    for the binary a host will run. It holds a token only to pull, and logs in with its own config."""
+    for the binary a host will run. It uses the token to pull, the repo's only one, under its own config."""
     return {
         f"smoke-{arch}": {
             "needs": ["release", "docker"],
@@ -359,7 +359,8 @@ def service_workflow(repo, entry, deploy_step_run):
     jobs = dict(gates)
     jobs["release"] = release_job(gates, version_output=True)
     docker_guard = {"needs": "release", "if": "needs.release.outputs.version != ''"}
-    rebuild_guard = {"needs": "quality"} if "quality" in gates else {}
+    # Every gate, as for a release: a rebuild moves :latest too, so it may not publish past a red one.
+    rebuild_guard = {"needs": needing(list(gates))} if gates else {}
     # Named, not `!= 'push'`: a pull request must never publish :latest.
     rebuild_guard["if"] = "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
     if "image_smoke" in entry and not entry.get("multi_arch", False):
