@@ -1,0 +1,173 @@
+# What each flipped repo's forge workflow does not share with its family (HL-711):
+# forgejo/render_repo.py reads this, forgejo/sync-repos.sh writes each render into the repo.
+# `checkout` in a gate's steps stands for the pinned checkout. Rendered repos: do not edit their copy.
+homelab-hub:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 20
+      steps:
+      - checkout
+      - name: Install
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm ci --no-audit --no-fund
+      - name: Type check
+        run: npm run typecheck
+      - name: Format
+        run: npm run format:check
+      - name: Lint
+        run: npm run lint
+      - name: Build site
+        run: npx vitepress build docs
+  image_timeout: 30
+  image_env:
+    NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  deploy_url: https://apps.webhook.lepaux.com/deploy
+homelab-maps:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 20
+      steps:
+      - checkout
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      # No --with-deps: the job has no root, and roles/ci-runner's playwright-deps.yml installs the libs.
+      - name: Install the browser
+        run: npx playwright install chromium
+      - name: Test
+        env:
+          CI: 'true'
+        run: npm test
+  image_timeout: 30
+  deploy_url: https://apps.webhook.lepaux.com/deploy
+pihole-exporter:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all-targets
+    advisories:
+      class: medium
+      timeout: 15
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Security audit
+        run: cargo deny check advisories
+  image_timeout: 45
+protomaps-docker:
+  family: service
+  image_timeout: 30
+homelab-grafana-generator:
+  family: package
+  gates:
+    quality:
+      class: heavy
+      timeout: 20
+      steps:
+      - checkout
+      - name: Install
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm ci --no-audit --no-fund
+      - name: Type check
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Format
+        run: npm run format:check
+      - name: Test
+        run: npm run test:coverage
+homelab-nginx-generator:
+  family: package
+  gates:
+    quality:
+      class: heavy
+      timeout: 20
+      steps:
+      - checkout
+      - name: Install
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm ci --no-audit --no-fund
+      - name: Type check
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test -- --run
+      - name: Build
+        run: npm run build
+homelab-schema:
+  family: package
+  gates:
+    quality:
+      class: heavy
+      timeout: 20
+      steps:
+      - checkout
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Type check
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      # Vitest runs the TypeScript source through its own module interop, so an import the
+      # built package cannot satisfy (js-yaml 5 dropped its default export) passes every
+      # test above. Load dist/ the way consumers do, and parse a file through it.
+      - name: Smoke-test the built package
+        run: |
+          smoke=$(mktemp --suffix=.yaml)
+          trap 'rm -f "$smoke"' EXIT
+          printf 'services: {}\n' > "$smoke"
+          node --input-type=module -e "
+            import { validateFile } from './dist/index.js';
+            const r = validateFile(process.argv[1]);
+            const msgs = (r.errors ?? []).map((e) => e.message).join('; ');
+            if (r.success || msgs.includes('YAML parse error')) { console.error(msgs); process.exit(1); }
+            console.log('dist loads and parses YAML');
+          " "$smoke"
+  release_install: true
+  release_env:
+    NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+srv-apps:
+  family: lint
+srv-core:
+  family: lint
+srv-media:
+  family: lint
+srv-runner-1:
+  family: lint
+srv-runner-2:
+  family: lint
+srv-runner-3:
+  family: lint
+srv-swiss:
+  family: lint

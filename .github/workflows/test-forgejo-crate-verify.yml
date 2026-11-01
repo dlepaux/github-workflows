@@ -7,9 +7,9 @@ name: test-forgejo-crate-verify
 
 on:
   push:
-    paths: ['.github/workflows/rust-crate.yml', 'forgejo/**', 'tests/forgejo-crate-verify/**', '.github/workflows/test-forgejo-crate-verify.yml']
+    paths: ['.github/workflows/rust-crate.yml', 'forgejo/**', 'tests/forgejo-repo-render/**', 'tests/forgejo-crate-verify/**', '.github/workflows/test-forgejo-crate-verify.yml']
   pull_request:
-    paths: ['.github/workflows/rust-crate.yml', 'forgejo/**', 'tests/forgejo-crate-verify/**', '.github/workflows/test-forgejo-crate-verify.yml']
+    paths: ['.github/workflows/rust-crate.yml', 'forgejo/**', 'tests/forgejo-repo-render/**', 'tests/forgejo-crate-verify/**', '.github/workflows/test-forgejo-crate-verify.yml']
 
 permissions:
   contents: read
@@ -22,3 +22,4 @@ jobs:
       - uses: actions/checkout@v7
       - run: python3 -m pip install --quiet pyyaml
       - run: bash tests/forgejo-crate-verify/run.sh
+      - run: bash tests/forgejo-repo-render/run.sh
