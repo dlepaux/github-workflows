@@ -73,9 +73,26 @@ for repo, wf in rendered.items():
     if "docker" in jobs:
         check(f"{repo}: the image waits for a release", jobs["docker"]["needs"] == "release"
               and jobs["docker"]["if"] == "needs.release.outputs.version != ''")
-        check(f"{repo}: a rebuild never runs on a push", jobs["rebuild"]["if"] == "github.event_name != 'push'")
+        check(f"{repo}: a rebuild runs only on the schedule or by hand",
+              jobs["rebuild"]["if"] == "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'")
         check(f"{repo}: a rebuild waits for quality where there is one",
               ("quality" in gates) == (jobs["rebuild"].get("needs") == "quality"))
+
+# A pull request gets gates and nothing that publishes; a host repo gets no check at all, which is
+# what holds its updates to a human's merge (HL-130).
+for repo, wf in rendered.items():
+    on_pr = "pull_request" in wf["on"]
+    check(f"{repo}: pull requests match the family", on_pr == (table[repo]["family"] != "lint"))
+    if on_pr:
+        check(f"{repo}: pull requests into main only", wf["on"]["pull_request"]["branches"] == ["main"])
+        for job_id in ("release", "docker", "rebuild", "deploy"):
+            job = wf["jobs"].get(job_id)
+            if job is None:
+                continue
+            guard = job.get("if", "")
+            needs_guarded = job.get("needs") in ("release", "docker")
+            check(f"{repo}/{job_id} cannot run on a pull request",
+                  needs_guarded or ("event_name ==" in guard and "pull_request" not in guard))
 
 # Deploy comes from the docker job only, and carries deploy.yml's step whole.
 for repo, wf in rendered.items():
