@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
 python3 - "$ROOT" <<'PY'
-import copy, re, sys
+import copy, os, re, subprocess, sys
 import yaml
 root = sys.argv[1]
 sys.path.insert(0, f"{root}/forgejo")
@@ -37,6 +37,11 @@ def refuses(name, repo, entry, word):
         check(f"{name}: refused", False)
 
 
+def plain(job_id):
+    """A leg answers to the rules of the job it builds for."""
+    return re.sub(r"-(arm64|x64)$", "", job_id)
+
+
 def checkouts(job):
     return [s for s in job["steps"] if "git init" in (s.get("run") or "")]
 
@@ -47,7 +52,7 @@ for repo, wf in rendered.items():
     for job_id, job in wf["jobs"].items():
         for step in checkouts(job):
             where = f"{repo}/{job_id}"
-            if job_id == "docker":
+            if plain(job_id) == "docker":
                 # The release commit sits past github.sha, so the image takes the tag it was given.
                 check(f"{where} builds the release tag", step["env"]["REF"].startswith("refs/tags/v${{"))
                 continue
@@ -65,12 +70,30 @@ for repo, wf in rendered.items():
     jobs = wf["jobs"]
     if "release" not in jobs:
         continue
-    gates = [j for j in jobs if j not in ("release", "docker", "rebuild", "deploy", "image")]
+    gates = [j for j in jobs if plain(j) not in ("release", "docker", "rebuild", "deploy", "image")]
     needs = jobs["release"].get("needs", [])
     needs = [needs] if isinstance(needs, str) else needs
     check(f"{repo}: release waits for every gate", sorted(needs) == sorted(gates))
     check(f"{repo}: release runs on a push only", jobs["release"]["if"] == "github.event_name == 'push'")
-    if "docker" in jobs:
+    if "docker" in jobs and table[repo].get("multi_arch"):
+        for job_id, first in (("docker", "release"), ("rebuild", "quality")):
+            legs = [f"{job_id}-arm64", f"{job_id}-x64"]
+            check(f"{repo}: {job_id} merges only after both legs", jobs[job_id]["needs"] == [first] + legs)
+            check(f"{repo}: {job_id}'s legs follow {first}", all(jobs[l]["needs"] == first for l in legs))
+            check(f"{repo}: {job_id} merges under the same guard",
+                  all(jobs[l]["if"] == jobs[job_id]["if"] for l in legs))
+            check(f"{repo}: each leg builds on its own hardware",
+                  jobs[legs[0]]["runs-on"] == ["self-hosted", "arm64", "ci-heavy"]
+                  and jobs[legs[1]]["runs-on"] == ["self-hosted", "x64", "ci-heavy"])
+            platforms = [jobs[l]["steps"][-1]["env"]["PLATFORM"] for l in legs]
+            check(f"{repo}: each leg asks for its own platform", platforms == ["linux/arm64", "linux/amd64"])
+            merge_env = jobs[job_id]["steps"][-1]["env"]
+            check(f"{repo}: {job_id} merges each leg's digest",
+                  all(merge_env[f"DIGEST_{a}"] == f"${{{{ needs.{job_id}-{a.lower()}.outputs.digest }}}}"
+                      for a in ("ARM64", "X64")))
+        check(f"{repo}: a rebuild claims no version", all("VERSION" not in jobs[j]["steps"][-1]["env"]
+              for j in ("rebuild", "rebuild-arm64", "rebuild-x64")))
+    elif "docker" in jobs:
         check(f"{repo}: the image waits for a release", jobs["docker"]["needs"] == "release"
               and jobs["docker"]["if"] == "needs.release.outputs.version != ''")
         check(f"{repo}: a rebuild runs only on the schedule or by hand",
@@ -102,8 +125,8 @@ for repo, wf in rendered.items():
         continue
     check(f"{repo}: pull requests into main only", wf["on"]["pull_request"] == {"branches": ["main"]})
     for job_id, job in wf["jobs"].items():
-        if job_id in PUBLISHERS:
-            check(f"{repo}/{job_id}: guard pinned", job.get("if") == PUBLISHERS[job_id])
+        if plain(job_id) in PUBLISHERS:
+            check(f"{repo}/{job_id}: guard pinned", job.get("if") == PUBLISHERS[plain(job_id)])
         elif table[repo]["family"] == "image" and job_id == "image":
             continue  # Its own cases are below: this job publishes, behind its gates.
         elif table[repo]["family"] != "pages":
@@ -162,6 +185,26 @@ for repo, wf in rendered.items():
           ("if" in job) != table[repo].get("image_on_pull_request", False))
 
 check("deploy.yml's step is found at HEAD", "curl" in rr.deploy_step_source("HEAD"))
+
+# The multi-arch route: the shared scripts parse, and a leg that left no digest makes no manifest.
+arch_repo = next(r for r, e in table.items()
+                 if e["family"] == "service" and "quality" in e.get("gates", {}) and "image_env" not in e)
+arch_wf = yaml.safe_load(rr.render_repo(arch_repo, {**table[arch_repo], "multi_arch": True}, DEPLOY))
+check("multi_arch adds both legs of both publishers",
+      {"docker", "docker-arm64", "docker-x64", "rebuild", "rebuild-arm64", "rebuild-x64"} <= set(arch_wf["jobs"]))
+check("a release's leg builds the tag", arch_wf["jobs"]["docker-x64"]["steps"][0]["env"]["REF"].startswith("refs/tags/v${{"))
+check("a rebuild's leg builds the pushed commit", arch_wf["jobs"]["rebuild-x64"]["steps"][0]["env"]["SHA"] == "${{ github.sha }}")
+check("deploy still follows the manifest", arch_wf["jobs"].get("deploy", {"needs": "docker"})["needs"] == "docker")
+for name, script in (("leg", rr.BUILD_LEG), ("merge", rr.MERGE_LEGS)):
+    check(f"the {name} script parses", subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0)
+refused = subprocess.run(["bash", "-c", rr.MERGE_LEGS], text=True, capture_output=True, env={
+    "PATH": os.environ["PATH"], "GHCR_WRITE_TOKEN": "x", "IMAGE": "ghcr.io/x/y", "GITHUB_SHA": "a" * 40,
+    "DOCKER_HOST": "unix:///nonexistent", "DIGEST_ARM64": "", "DIGEST_X64": "sha256:" + "0" * 64,
+})
+check("the manifest is checked before any tag moves",
+      rr.MERGE_LEGS.index("--dry-run") < rr.MERGE_LEGS.index('create "${tags[@]}"'))
+refuses("multi_arch with image_env", arch_repo, {**table[arch_repo], "multi_arch": True, "image_env": {"X": "1"}}, "image_env")
+check("a missing digest stops the merge before any login", refused.returncode == 1 and "left no digest" in refused.stdout)
 
 # Refusals.
 service = next(r for r, e in table.items() if e["family"] == "service" and "gates" in e)

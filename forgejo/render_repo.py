@@ -9,7 +9,8 @@ and its deploy target. A key this script does not know fails the render instead 
 
 Families:
   service  gates, then semantic-release, the image on a release, a weekly image rebuild, and
-           optionally the deploy webhook
+           optionally the deploy webhook. With multi_arch, each image is built natively per
+           architecture and merged into one manifest
   package  gates, then semantic-release, which publishes the package
   image    gates, then the repo's own build script, publishing from main: no release and no rebuild
   lint     the fleet repos' loopback-binding check
@@ -36,7 +37,7 @@ CLASSES = ("heavy", "medium")
 GATE_REQUIRED = {"class", "timeout", "steps"}
 GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {
-    "service": {"family", "gates", "image_timeout", "image_env", "deploy_url"},
+    "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch"},
     "package": {"family", "gates", "release_install", "release_env"},
     "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request"},
     "lint": {"family"},
@@ -112,15 +113,67 @@ SERVICE_NOTE = """\
 # patched base, since a stable service never releases and its base would otherwise never change.
 # The rebuild does not deploy: image-update-exporter reports the digest, and the pull stays a decision.
 """
+# Each architecture builds on its own hardware, since a rootless runner cannot register QEMU (HL-722).
+# A leg's Docker config and builder are its own: the runner keeps one daemon across jobs, and
+# docker-container is the driver that can push by digest with attestations.
+IMAGE_PLATFORMS = {"arm64": "linux/arm64", "x64": "linux/amd64"}
+GHCR_LOGIN = (
+    ': "${GHCR_WRITE_TOKEN:?GHCR_WRITE_TOKEN is not set on this repo (homelab forgejo_actions_repo_secrets)}"\n'
+    'DOCKER_CONFIG=$(mktemp -d)\n'
+    'export DOCKER_CONFIG\n'
+)
+BUILD_LEG = (
+    "set -euo pipefail\n"
+    + GHCR_LOGIN +
+    'builder="forge-${GITHUB_RUN_ID}-${GITHUB_JOB}"\n'
+    """trap 'docker buildx rm --force "$builder" >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT\n"""
+    """printf '%s' "$GHCR_WRITE_TOKEN" | docker login ghcr.io -u dlepaux --password-stdin\n"""
+    'sha=$(git rev-parse HEAD)\n'
+    'args=(--build-arg "GIT_SHA=$sha" --build-arg "VERSION=${VERSION:-sha-${sha:0:7}}"\n'
+    '  --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)")\n'
+    "# A released image names its version whether or not its Dockerfile labels one.\n"
+    'if [ -n "${VERSION:-}" ]; then args+=(--label "org.opencontainers.image.version=$VERSION"); fi\n'
+    'docker buildx create --name "$builder" --driver docker-container --bootstrap >/dev/null\n'
+    "# --pull: a rebuild exists to take a patched base, so a cached one must not stand in for it.\n"
+    'docker buildx build --builder "$builder" --pull --platform "$PLATFORM" \\\n'
+    '  --sbom=true --provenance=mode=max "${args[@]}" --metadata-file "$DOCKER_CONFIG/meta.json" \\\n'
+    '  --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" .\n'
+    """digest=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "$DOCKER_CONFIG/meta.json")\n"""
+    '[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest: $digest"; exit 1; }\n'
+    'echo "digest=$digest" >> "$GITHUB_OUTPUT"\n'
+)
+# X.Y follows the newest release of its minor line, so a host can pin a minor and take its patches.
+# The dry run shows the manifest before any tag moves, so one missing an architecture fails here and
+# :latest stays where it was. An attestation's entry has platform unknown/unknown, which the check ignores.
+MERGE_LEGS = (
+    "set -euo pipefail\n"
+    'for digest in "$DIGEST_ARM64" "$DIGEST_X64"; do\n'
+    '  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::a leg left no digest: \'$digest\'"; exit 1; }\n'
+    'done\n'
+    + GHCR_LOGIN +
+    """trap 'rm -rf "$DOCKER_CONFIG"' EXIT\n"""
+    """printf '%s' "$GHCR_WRITE_TOKEN" | docker login ghcr.io -u dlepaux --password-stdin\n"""
+    'tags=("--tag=$IMAGE:latest" "--tag=$IMAGE:sha-${GITHUB_SHA:0:7}")\n'
+    'if [ -n "${VERSION:-}" ]; then tags+=("--tag=$IMAGE:$VERSION"); fi\n'
+    'if [[ "${VERSION:-}" =~ ^([0-9]+)\\.([0-9]+)\\.[0-9]+$ ]]; then\n'
+    '  tags+=("--tag=$IMAGE:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}")\n'
+    'fi\n'
+    'docker buildx imagetools create --dry-run "$IMAGE@$DIGEST_ARM64" "$IMAGE@$DIGEST_X64" | python3 -I -c \'\n'
+    'import json, sys\n'
+    'seen = {m.get("platform", {}).get("architecture") for m in json.load(sys.stdin)["manifests"]}\n'
+    'sys.exit(0 if {"amd64", "arm64"} <= seen else f"manifest has only {sorted(map(str, seen))}")\n'
+    "'\n"
+    'docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST_ARM64" "$IMAGE@$DIGEST_X64"\n'
+)
 LINT_NOTE = """\
 # Layer 1 of the three-layer auth model: every compose service is loopback-bound or allowlisted.
 """
 
 
-def runs_on(job_class):
+def runs_on(job_class, arch="arm64"):
     if job_class not in CLASSES:
         raise RenderError(f"unknown job class {job_class}")
-    return ["self-hosted", "arm64", f"ci-{job_class}"]
+    return ["self-hosted", arch, f"ci-{job_class}"]
 
 
 def checked_keys(name, entry, allowed, required):
@@ -234,27 +287,66 @@ def deploy_job(deploy_step_run, url):
     }
 
 
+def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
+    """One leg per architecture, then a job under the plain name that merges their digests, so
+    whatever follows `docker` follows the manifest. A failed leg leaves no manifest at all."""
+    if "image_env" in entry:
+        raise RenderError(f"{repo}: multi_arch carries no image_env, as a leg's build takes only its own args")
+    needs = guard.get("needs")
+    env = {"IMAGE": f"ghcr.io/dlepaux/{repo}", "GHCR_WRITE_TOKEN": "${{ secrets.GHCR_WRITE_TOKEN }}"}
+    if version:
+        env["VERSION"] = "${{ needs.release.outputs.version }}"
+    legs = {
+        f"{job_id}-{arch}": {
+            **guard,
+            "runs-on": runs_on("heavy", arch),
+            "timeout-minutes": entry["image_timeout"],
+            "outputs": {"digest": "${{ steps.leg.outputs.digest }}"},
+            "steps": [checkout, {
+                "name": f"Build and push {platform} by digest",
+                "id": "leg",
+                "env": {**env, "PLATFORM": platform},
+                "run": BUILD_LEG,
+            }],
+        }
+        for arch, platform in IMAGE_PLATFORMS.items()
+    }
+    merge_env = {**env, **{f"DIGEST_{a.upper()}": f"${{{{ needs.{job_id}-{a}.outputs.digest }}}}" for a in IMAGE_PLATFORMS}}
+    merge = {
+        "needs": ([needs] if needs else []) + list(legs),
+        "if": guard["if"],
+        "runs-on": runs_on("medium"),
+        "timeout-minutes": 10,
+        "steps": [{"name": "Merge into one manifest", "env": merge_env, "run": MERGE_LEGS}],
+    }
+    return {**legs, job_id: merge}
+
+
 def service_workflow(repo, entry, deploy_step_run):
     gates = gate_jobs(repo, entry)
     timeout = entry["image_timeout"]
     jobs = dict(gates)
     jobs["release"] = release_job(gates, version_output=True)
-    jobs["docker"] = {
-        "needs": "release",
-        "if": "needs.release.outputs.version != ''",
-        "runs-on": runs_on("heavy"),
-        "timeout-minutes": timeout,
-        "steps": [tag_checkout(), build_step(entry, version=True)],
-    }
-    rebuild = {"needs": "quality"} if "quality" in gates else {}
-    rebuild.update({
-        # Named, not `!= 'push'`: a pull request must never publish :latest.
-        "if": "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
-        "runs-on": runs_on("heavy"),
-        "timeout-minutes": timeout,
-        "steps": [CHECKOUT, build_step(entry, version=False)],
-    })
-    jobs["rebuild"] = rebuild
+    docker_guard = {"needs": "release", "if": "needs.release.outputs.version != ''"}
+    rebuild_guard = {"needs": "quality"} if "quality" in gates else {}
+    # Named, not `!= 'push'`: a pull request must never publish :latest.
+    rebuild_guard["if"] = "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+    if entry.get("multi_arch", False):
+        jobs.update(multi_arch_jobs("docker", repo, entry, docker_guard, tag_checkout(), version=True))
+        jobs.update(multi_arch_jobs("rebuild", repo, entry, rebuild_guard, CHECKOUT, version=False))
+    else:
+        jobs["docker"] = {
+            **docker_guard,
+            "runs-on": runs_on("heavy"),
+            "timeout-minutes": timeout,
+            "steps": [tag_checkout(), build_step(entry, version=True)],
+        }
+        jobs["rebuild"] = {
+            **rebuild_guard,
+            "runs-on": runs_on("heavy"),
+            "timeout-minutes": timeout,
+            "steps": [CHECKOUT, build_step(entry, version=False)],
+        }
     if "deploy_url" in entry:
         jobs["deploy"] = deploy_job(deploy_step_run, entry["deploy_url"])
     triggers = {**GATED_TRIGGERS, "schedule": [{"cron": "0 4 * * 1"}]}

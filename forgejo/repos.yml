@@ -78,6 +78,49 @@ pihole-exporter:
       - name: Security audit
         run: cargo deny check advisories
   image_timeout: 45
+image-update-exporter:
+  family: service
+  multi_arch: true
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      # Renovate once moved rust-toolchain.toml alone, and releases then tagged without an image for
+      # eleven days (2026-10-03 to 10-14), as quality passed on one Rust and the build failed on the other.
+      - name: Dockerfile builder matches rust-toolchain.toml
+        run: |
+          pin=$(sed -nE 's/^channel *= *"([0-9.]+)"/\1/p' rust-toolchain.toml)
+          grep -qE "^FROM rust:${pin}-bookworm AS builder" Dockerfile \
+            || { echo "::error file=Dockerfile::builder is not rust:${pin}-bookworm (rust-toolchain.toml)"; exit 1; }
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      # --all-targets: the registry contract and the HTTP surface are integration tests.
+      - name: Test
+        run: cargo test --all-targets
+    advisories:
+      class: medium
+      timeout: 15
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Security audit
+        run: cargo deny check advisories
+  image_timeout: 45
 protomaps-docker:
   family: service
   image_timeout: 30
