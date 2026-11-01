@@ -237,6 +237,10 @@ with tempfile.TemporaryDirectory() as stub_dir:
     check("epubarr's smoke fails a wrong --version", smoke(STUB_PRINTS="1.2.2") == 1)
     check("epubarr's smoke fails a wrong label", smoke(STUB_LABEL="1.2.2") == 1)
     check("epubarr's smoke fails a minor tag on another digest", smoke(STUB_MINOR="other") == 1)
+for repo, entry in table.items():
+    if "image_smoke" in entry:
+        check(f"{repo}: its smoke script parses",
+              subprocess.run(["bash", "-n"], input=entry["image_smoke"], text=True).returncode == 0)
 refuses("a smoke with no manifest to check", arch_repo, {**table[arch_repo], "image_smoke": "true\n"}, "needs multi_arch")
 refuses("multi_arch with image_env", arch_repo, {**table[arch_repo], "multi_arch": True, "image_env": {"X": "1"}}, "image_env")
 check("a missing digest stops the merge before any login", refused.returncode == 1 and "left no digest" in refused.stdout)

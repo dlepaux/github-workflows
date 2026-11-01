@@ -215,6 +215,82 @@ epubarr:
     minor=$(docker buildx imagetools inspect "$IMAGE:${VERSION%.*}" --format '{{ json .Manifest.Digest }}')
     patch=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{ json .Manifest.Digest }}')
     [ "$minor" = "$patch" ] || { echo "::error::${VERSION%.*} is not $VERSION"; exit 1; }
+homelab-webhook:
+  family: service
+  multi_arch: true
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Dockerfile builder matches rust-toolchain.toml
+        run: |
+          pin=$(sed -nE 's/^channel *= *"([0-9.]+)"/\1/p' rust-toolchain.toml)
+          grep -qE "^FROM --platform=\\\$BUILDPLATFORM rust:${pin}-bookworm AS builder" Dockerfile \
+            || { echo "::error file=Dockerfile::builder is not rust:${pin}-bookworm (rust-toolchain.toml)"; exit 1; }
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Lifecycle contract shape gate
+        run: ./scripts/check-lifecycle-contract.sh
+      - name: Test
+        run: cargo test --locked
+    advisories:
+      class: medium
+      timeout: 15
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Security audit
+        run: cargo deny check advisories
+    # The real deployer against mock lifecycle containers, the class fix for the 2026-06-01
+    # blue/green incident. It runs on the host for its docker, and builds its own test runner image.
+    # 20 minutes to run, plus up to 25 waiting for another run's daemon lock (see the script).
+    rolling-e2e:
+      class: heavy
+      timeout: 45
+      steps:
+      - checkout
+      - name: Rolling-deploy e2e
+        run: ./scripts/rolling-e2e.sh
+    # The real guard on a scratch compose project fed by a local registry (HL-127).
+    guard-e2e:
+      class: heavy
+      timeout: 45
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Guarded-deploy e2e
+        run: ./scripts/guard-e2e.sh
+  # It compiles the docker CLI and compose from source on top of the crate.
+  image_timeout: 60
+  # Every repo's deploy goes through this image and hosts pull :latest at the roll, so a red smoke
+  # gives a look before 05:30. The docker CLI matters as much as the binary: it does the deploying.
+  image_smoke: |
+    printed=$(docker run --rm --pull always --platform "$PLATFORM" "$IMAGE:$VERSION" --version)
+    label=$(docker image inspect "$IMAGE:$VERSION" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+    echo "$PLATFORM: $printed, label $label"
+    [ "$printed" = "homelab-webhook $VERSION" ] || { echo "::error::$PLATFORM prints '$printed'"; exit 1; }
+    [ "$label" = "$VERSION" ] || { echo "::error::$PLATFORM is labelled '$label'"; exit 1; }
+    docker run --rm --platform "$PLATFORM" --entrypoint docker "$IMAGE:$VERSION" compose version
 protomaps-docker:
   family: service
   image_timeout: 30
