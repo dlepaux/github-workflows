@@ -38,8 +38,8 @@ def refuses(name, repo, entry, word):
 
 
 def plain(job_id):
-    """A leg answers to the rules of the job it builds for."""
-    return re.sub(r"-(arm64|x64)$", "", job_id)
+    """A leg, or one of several images, answers to the rules of the job it builds for."""
+    return "docker" if job_id.endswith("-image") else re.sub(r"-(arm64|x64)$", "", job_id)
 
 
 def checkouts(job):
@@ -52,7 +52,8 @@ for repo, wf in rendered.items():
     for job_id, job in wf["jobs"].items():
         for step in checkouts(job):
             where = f"{repo}/{job_id}"
-            if plain(job_id) == "docker":
+            # A hand dispatch has no release to build, so it takes the commit, as a gate does.
+            if plain(job_id) == "docker" and step.get("if") != "needs.release.outputs.version == ''":
                 # The release commit sits past github.sha, so the image takes the tag it was given.
                 check(f"{where} builds the release tag", step["env"]["REF"].startswith("refs/tags/v${{"))
                 continue
@@ -145,6 +146,8 @@ for repo, wf in rendered.items():
                 # The image job's PUBLISH condition: a pull request's or a branch's build is never published.
                 **({"deploy": "github.ref == 'refs/heads/main' && github.event_name != 'pull_request'"}
                    if table[repo]["family"] == "image" else {}),
+                # Its own cases are below: one image's guard, and a deploy past all of them.
+                **({"docker": job.get("if"), "deploy": job.get("if")} if table[repo]["family"] == "images" else {}),
             }
             check(f"{repo}/{job_id}: guard pinned", job.get("if") == pinned.get(plain(job_id), PUBLISHERS[plain(job_id)]))
         elif table[repo]["family"] == "image" and job_id == "image":
@@ -229,6 +232,7 @@ for repo, wf in rendered.items():
     if deploy:
         expected = ["docker", "rebuild"] if table[repo].get("deploy_rebuild") else "docker"
         expected = "image" if table[repo]["family"] == "image" else expected
+        expected = [f"{n}-image" for n in table[repo]["images"]] if table[repo]["family"] == "images" else expected
         check(f"{repo}: deploy follows the image", deploy["needs"] == expected)
         check(f"{repo}: deploy runs deploy.yml's step", deploy["steps"][0]["run"] == DEPLOY)
 
@@ -245,6 +249,32 @@ for repo, wf in rendered.items():
     check(f"{repo}: only main publishes", "refs/heads/main" in env["PUBLISH"] and "pull_request" in env["PUBLISH"])
     check(f"{repo}: image builds on a pull request only if asked",
           ("if" in job) != table[repo].get("image_on_pull_request", False))
+
+# The images family: nothing builds on a pull request or a push without a release, and the deploy
+# waits for every image, since the app's start requeues failures onto the worker's image (dinle).
+for repo, wf in rendered.items():
+    if table[repo]["family"] != "images":
+        continue
+    jobs = wf["jobs"]
+    built = [f"{n}-image" for n in table[repo]["images"]]
+    for job_id in built:
+        job = jobs[job_id]
+        check(f"{repo}/{job_id}: follows the release", "release" in job["needs"])
+        for gate in table[repo]["gates"]:
+            check(f"{repo}/{job_id}: {gate} must be green", f"needs.{gate}.result == 'success'" in job["if"])
+        check(f"{repo}/{job_id}: main only", "refs/heads/main" in job["if"])
+        check(f"{repo}/{job_id}: a push needs a release", "needs.release.outputs.version != ''" in job["if"])
+        check(f"{repo}/{job_id}: pull_request is not among the events", "pull_request" not in job["if"])
+        check(f"{repo}/{job_id}: a release builds its tag",
+              job["steps"][1]["env"]["REF"].startswith("refs/tags/v${{") and "!= ''" in job["steps"][1]["if"])
+        check(f"{repo}/{job_id}: a dispatch builds its commit",
+              job["steps"][0]["env"]["SHA"] == rr.CHECKOUT["env"]["SHA"] and "== ''" in job["steps"][0]["if"])
+        check(f"{repo}/{job_id}: the script is told which image",
+              job["steps"][2]["run"] == f"{rr.BUILD_IMAGE} {job_id.removesuffix('-image')}")
+    for job_id in built:
+        check(f"{repo}: deploy needs {job_id} green", f"needs.{job_id}.result == 'success'" in jobs["deploy"]["if"])
+    check(f"{repo}: a checkout holds no token",
+          all("GHCR_WRITE_TOKEN" not in jobs[j]["steps"][i].get("env", {}) for j in built for i in (0, 1)))
 
 check("deploy.yml's step is found at HEAD", "curl" in rr.deploy_step_source("HEAD"))
 

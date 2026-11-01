@@ -42,6 +42,7 @@ FAMILY_KEYS = {
                 "image_arch", "image_on_every_push", "deploy_rebuild"},
     "package": {"family", "gates", "release_install", "release_env"},
     "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request", "deploy_url"},
+    "images": {"family", "gates", "note", "images", "deploy_url"},
     "lint": {"family"},
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
@@ -50,6 +51,7 @@ ALWAYS_PRESENT = {
     "service": {"family", "image_timeout"},
     "package": {"family", "gates"},
     "image": {"family", "gates", "note", "image_timeout"},
+    "images": {"family", "gates", "note", "images", "deploy_url"},
     "lint": {"family"},
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
@@ -58,6 +60,7 @@ WORKFLOW_FILE = {
     "service": "ci.yml",
     "package": "ci.yml",
     "image": "ci.yml",
+    "images": "ci.yml",
     "lint": "loopback-bindings-lint.yml",
     "verify": "ci.yml",
     "pages": "pages.yml",
@@ -490,6 +493,44 @@ def image_workflow(repo, entry, deploy_step_run):
     return workflow, note_comment(entry["note"])
 
 
+def images_workflow(repo, entry, deploy_step_run):
+    """A release ships several images, each on its own architecture's hardware, and deploys after all of
+    them. `always()` lets a hand dispatch past the release it skips; only a release or a dispatch builds,
+    since a build moves a `latest` that something else may be pulling."""
+    gates = gate_jobs(repo, entry)
+    release = release_job(gates, version_output=True)
+    green = " && ".join(f"needs.{g}.result == 'success'" for g in gates)
+    version = "needs.release.outputs.version"
+    guard = {
+        "needs": list(gates) + ["release"],
+        "if": (
+            f"always() && {ON_MAIN} && {green} && (github.event_name == 'workflow_dispatch'"
+            f" || (github.event_name == 'push' && needs.release.result == 'success' && {version} != ''))"
+        ),
+    }
+    images = {}
+    for name, image in entry["images"].items():
+        checked_keys(f"{repo}/{name}", image, {"arch", "timeout"}, {"arch", "timeout"})
+        images[f"{name}-image"] = {
+            **guard,
+            "runs-on": runs_on("heavy", image["arch"]),
+            "timeout-minutes": image["timeout"],
+            "steps": [
+                {**CHECKOUT, "if": f"{version} == ''"},
+                {**tag_checkout(), "if": f"{version} != ''"},
+                {**build_step(entry, True), "run": f"{BUILD_IMAGE} {name}"},
+            ],
+        }
+    deploy = {
+        **deploy_job(deploy_step_run, entry["deploy_url"]),
+        "needs": list(images),
+        "if": "always() && " + " && ".join(f"needs.{j}.result == 'success'" for j in images),
+    }
+    jobs = {**gates, "release": release, **images, "deploy": deploy}
+    workflow = {"name": "CI", "on": GATED_TRIGGERS, "defaults": RUN_DEFAULTS, "jobs": jobs}
+    return workflow, note_comment(entry["note"])
+
+
 def publish_step(site_dir):
     return {
         "name": "Publish",
@@ -583,6 +624,8 @@ def render_repo(repo, entry, deploy_step_run):
         workflow, note = package_workflow(repo, entry)
     elif family == "image":
         workflow, note = image_workflow(repo, entry, deploy_step_run)
+    elif family == "images":
+        workflow, note = images_workflow(repo, entry, deploy_step_run)
     elif family == "verify":
         workflow, note = verify_workflow(repo, entry)
     elif family == "pages":

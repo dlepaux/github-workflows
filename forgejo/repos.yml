@@ -704,6 +704,36 @@ curatarr:
   image_timeout: 30
   image_on_pull_request: true
   deploy_url: https://apps.webhook.lepaux.com/deploy
+dinle:
+  family: images
+  note: |-
+    app and worker each test against the app's dev stack. A release builds both images, each on its
+    own hardware, and deploys after both: the app's start requeues failures, and the old worker must
+    not spend the attempts on what the release fixed. A push with no release builds nothing, since
+    srv-compute restarts on a new worker `latest` (a hand dispatch on main is that too).
+  gates:
+    app:
+      class: heavy
+      timeout: 60
+      steps:
+      - checkout
+      - name: Lint and test the app and the release config, against the dev stack
+        run: .forgejo/gate.sh app
+    worker:
+      class: heavy
+      timeout: 60
+      steps:
+      - checkout
+      - name: Format, lint and test the worker, against the dev stack
+        run: .forgejo/gate.sh worker
+  images:
+    app:
+      arch: arm64
+      timeout: 60
+    worker:
+      arch: x64
+      timeout: 60
+  deploy_url: https://apps.webhook.lepaux.com/deploy
 hermes-image:
   family: image
   note: |-
