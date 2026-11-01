@@ -318,6 +318,10 @@ def render(source, inputs, cron, primary=False):
         "jobs": jobs,
     }
     if primary:
+        # A pull request runs the verify jobs: release names `push`, trivy publishes nothing. It is
+        # the green check Renovate's automerge waits for (HL-715); a shadow stays off, as GitHub
+        # still gates that crate.
+        out["on"] = {**out["on"], "pull_request": {"branches": ["main"]}}
         # Forgejo 15 mails a run only when its workflow opts in. The shadow never does, so GitHub
         # stays the only mail while it is the CI of record; a primary crate has no GitHub run left.
         out = {"enable-email-notifications": True, **out}

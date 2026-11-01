@@ -60,7 +60,7 @@ check("no permissions block", "permissions" not in out)
 check("shell pinned to GitHub's default", out.get("defaults") == {"run": {"shell": "bash -e {0}"}})
 check("shell pin documented", "shell-default" in out_text.split("\nname:")[0])
 
-# Triggers: push to main, the schedule, a manual dispatch; never a pull request.
+# A shadow's triggers: push to main, the schedule, a manual dispatch; never a pull request.
 on = out["on"]
 check("triggers", set(on) == {"push", "schedule", "workflow_dispatch"})
 check("push names main only", on["push"] == {"branches": ["main"]})
@@ -138,6 +138,8 @@ check("primary: header names the release edits, not drop-jobs",
       "release-driver" in prim_text.split("\nname:")[0] and "drop-jobs" not in prim_text.split("\nname:")[0])
 check("shadow: still no release", "release" not in out["jobs"] and "forge-release" not in out_text)
 check("primary: mails a failed run (HL-651)", prim.get("enable-email-notifications") is True)
+check("primary: pull requests into main run the checks", prim["on"]["pull_request"] == {"branches": ["main"]})
+check("primary: a pull request cannot release", prim["jobs"]["release"]["if"] == r.FORGE_RELEASE_IF and "'push'" in r.FORGE_RELEASE_IF)
 check("shadow: never mails, GitHub stays the mail of record", "enable-email-notifications" not in out)
 trivy = prim["jobs"]["trivy"]
 check("primary trivy: the medium class's labels, the others the heavy's",
