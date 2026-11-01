@@ -174,7 +174,7 @@ srv-swiss:
 naja-miner:
   family: verify
   note: |
-    Verify the case on every push to main (homelab HL-673). The repo is private and has no site, so
+    Verify the case on every pull request and push to main (homelab HL-673). The repo is private and has no site, so
     this publishes nothing; GitHub's deploy workflow, which it replaces, skipped its Pages steps too.
 
     The forge's runners are arm64 and OpenSCAD ships no aarch64 snapshot, so the render uses the same
@@ -214,12 +214,13 @@ naja-miner:
 pedigree-tree:
   family: verify
   note: |
-    Verify main on every push (homelab HL-673): the checks release.yml ran before it released.
+    Verify every pull request and push to main (homelab HL-673): the checks release.yml ran before it released.
 
     Verify only for now: releasing and publishing the versioned docs from the forge are homelab HL-698.
     The docs build here is the current checkout's alone; the versioned one rebuilds every tag.
   gates:
     verify:
+      # One test encodes a 92-megapixel PNG in memory: ci-heavy has no per-job 2G memory limit.
       class: heavy
       timeout: 30
       steps:

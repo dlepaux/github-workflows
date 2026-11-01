@@ -120,9 +120,14 @@ for repo, wf in rendered.items():
     check(f"{repo}: both run on main only", all(s["if"] == "github.ref == 'refs/heads/main'" for s in guarded))
     built = job["steps"][:-2]
     check(f"{repo}: the build runs on a pull request", all("if" not in s for s in built) and "if" not in job)
-    check(f"{repo}: only the guarded steps hold a secret", "secrets." not in yaml.safe_dump(built).replace("token ${{ github.token }}", ""))
+    check(f"{repo}: only the guarded steps hold a secret", "secrets." not in yaml.safe_dump({**job, "steps": built}))
     check(f"{repo}: uploads what it built", f"tar -cz -C {table[repo]['site_dir']} ." in guarded[0]["run"])
     check(f"{repo}: the key is never in argv", "printf '%s\\n' \"$DEPLOY_KEY\"" in guarded[0]["run"])
+
+# These scripts were written against GitHub's shell, without pipefail.
+for repo, wf in rendered.items():
+    if table[repo]["family"] in ("verify", "pages"):
+        check(f"{repo}: shell pinned", wf["defaults"] == {"run": {"shell": "bash -e {0}"}})
 
 # OpenSCAD comes from one pin, and its step is what each job's env feeds.
 for repo, wf in rendered.items():

@@ -67,7 +67,8 @@ GATED_TRIGGERS = {
 # GitHub's default for a `run:` step with no `shell:`, which these families' scripts were written
 # against: forgejo-runner would add pipefail (render.py's shell-default).
 RUN_DEFAULTS = {"run": {"shell": "bash -e {0}"}}
-# A pull request's ref is refs/pull/N/head, so this alone keeps a site's key off one.
+# A pull request's ref is refs/pull/N/head, so a build there cannot publish by mistake. It is no
+# boundary: a run takes the workflow from the pull request's head, and only the owner and Renovate push.
 ON_MAIN = "github.ref == 'refs/heads/main'"
 EDGE = "static-sites@82.112.240.209"
 OPENSCAD_VERSION = "2026.04.26"
