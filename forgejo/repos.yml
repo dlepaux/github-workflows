@@ -734,6 +734,32 @@ dinle:
       arch: x64
       timeout: 60
   deploy_url: https://apps.webhook.lepaux.com/deploy
+kaneo-mcp:
+  family: tag-release
+  note: |-
+    A push checks the crate. A tag vX.Y.Z also cross-compiles the binary for both Macs and publishes
+    it as this forge's release, since no fleet host is a Mac and none is to run CI (homelab HL-739).
+    What only macOS shows reaches a Mac first: the install's version probe is what refuses a bad build.
+  gates:
+    checks:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+  release_script: .forgejo/release-darwin.sh
+  release_timeout: 60
 hermes-image:
   family: image
   note: |-

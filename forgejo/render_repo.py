@@ -43,6 +43,7 @@ FAMILY_KEYS = {
     "package": {"family", "gates", "release_install", "release_env"},
     "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request", "deploy_url"},
     "images": {"family", "gates", "note", "images", "deploy_url"},
+    "tag-release": {"family", "gates", "note", "release_script", "release_timeout"},
     "lint": {"family"},
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
@@ -52,6 +53,7 @@ ALWAYS_PRESENT = {
     "package": {"family", "gates"},
     "image": {"family", "gates", "note", "image_timeout"},
     "images": {"family", "gates", "note", "images", "deploy_url"},
+    "tag-release": {"family", "gates", "note", "release_script", "release_timeout"},
     "lint": {"family"},
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
@@ -61,6 +63,7 @@ WORKFLOW_FILE = {
     "package": "ci.yml",
     "image": "ci.yml",
     "images": "ci.yml",
+    "tag-release": "ci.yml",
     "lint": "loopback-bindings-lint.yml",
     "verify": "ci.yml",
     "pages": "pages.yml",
@@ -80,6 +83,7 @@ RUN_DEFAULTS = {"run": {"shell": "bash -e {0}"}}
 # A pull request's ref is refs/pull/N/head, so a build there cannot publish by mistake. It is no
 # boundary: a run takes the workflow from the pull request's head, and only the owner and Renovate push.
 ON_MAIN = "github.ref == 'refs/heads/main'"
+TAG_PUSH = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
 EDGE = "static-sites@82.112.240.209"
 # The pinned checkout is 50 commits deep. VitePress dates a page, and its sitemap entry, from the
 # commit that last touched it, so past that depth the boundary commit's date moves with every push.
@@ -531,6 +535,25 @@ def images_workflow(repo, entry, deploy_step_run):
     return workflow, note_comment(entry["note"])
 
 
+def tag_release_workflow(repo, entry):
+    """A person tags the version, and the repo's own script publishes it, past green gates."""
+    gates = gate_jobs(repo, entry)
+    release = {
+        "needs": needing(list(gates)),
+        "if": TAG_PUSH,
+        "runs-on": runs_on("heavy"),
+        "timeout-minutes": entry["release_timeout"],
+        "steps": [CHECKOUT, {
+            "name": "Build and publish",
+            "env": {"FORGEJO_TOKEN": "${{ github.token }}"},
+            "run": entry["release_script"],
+        }],
+    }
+    on = {**GATED_TRIGGERS, "push": {"branches": ["main"], "tags": ["v*"]}}
+    workflow = {"name": "CI", "on": on, "defaults": RUN_DEFAULTS, "jobs": {**gates, "release": release}}
+    return workflow, note_comment(entry["note"])
+
+
 def publish_step(site_dir):
     return {
         "name": "Publish",
@@ -626,6 +649,8 @@ def render_repo(repo, entry, deploy_step_run):
         workflow, note = image_workflow(repo, entry, deploy_step_run)
     elif family == "images":
         workflow, note = images_workflow(repo, entry, deploy_step_run)
+    elif family == "tag-release":
+        workflow, note = tag_release_workflow(repo, entry)
     elif family == "verify":
         workflow, note = verify_workflow(repo, entry)
     elif family == "pages":

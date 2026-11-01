@@ -75,7 +75,8 @@ for repo, wf in rendered.items():
     needs = jobs["release"].get("needs", [])
     needs = [needs] if isinstance(needs, str) else needs
     check(f"{repo}: release waits for every gate", sorted(needs) == sorted(gates))
-    check(f"{repo}: release runs on a push only", jobs["release"]["if"] == "github.event_name == 'push'")
+    on_push = rr.TAG_PUSH if table[repo]["family"] == "tag-release" else "github.event_name == 'push'"
+    check(f"{repo}: release runs on a push only", jobs["release"]["if"] == on_push)
     if "docker" in jobs and table[repo].get("multi_arch"):
         for job_id, first in (("docker", ["release"]), ("rebuild", gates)):
             legs = [f"{job_id}-arm64", f"{job_id}-x64"]
@@ -148,6 +149,7 @@ for repo, wf in rendered.items():
                    if table[repo]["family"] == "image" else {}),
                 # Its own cases are below: one image's guard, and a deploy past all of them.
                 **({"docker": job.get("if"), "deploy": job.get("if")} if table[repo]["family"] == "images" else {}),
+                **({"release": rr.TAG_PUSH} if table[repo]["family"] == "tag-release" else {}),
             }
             check(f"{repo}/{job_id}: guard pinned", job.get("if") == pinned.get(plain(job_id), PUBLISHERS[plain(job_id)]))
         elif table[repo]["family"] == "image" and job_id == "image":
@@ -275,6 +277,18 @@ for repo, wf in rendered.items():
         check(f"{repo}: deploy needs {job_id} green", f"needs.{job_id}.result == 'success'" in jobs["deploy"]["if"])
     check(f"{repo}: a checkout holds no token",
           all("GHCR_WRITE_TOKEN" not in jobs[j]["steps"][i].get("env", {}) for j in built for i in (0, 1)))
+
+# The tag-release family: only a pushed tag publishes, past every gate, and a tag runs the gates.
+for repo, wf in rendered.items():
+    if table[repo]["family"] != "tag-release":
+        continue
+    job = wf["jobs"]["release"]
+    needs = [job["needs"]] if isinstance(job["needs"], str) else job["needs"]
+    check(f"{repo}: release needs every gate", set(needs) == set(table[repo]["gates"]))
+    check(f"{repo}: a tag starts the run", wf["on"]["push"]["tags"] == ["v*"])
+    check(f"{repo}: main still starts the run", wf["on"]["push"]["branches"] == ["main"])
+    check(f"{repo}: only a tag's push publishes", job["if"] == "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')")
+    check(f"{repo}: the token is the publish step's alone", list(job["steps"][-1]["env"]) == ["FORGEJO_TOKEN"])
 
 check("deploy.yml's step is found at HEAD", "curl" in rr.deploy_step_source("HEAD"))
 
