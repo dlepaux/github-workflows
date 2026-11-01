@@ -171,3 +171,206 @@ srv-runner-3:
   family: lint
 srv-swiss:
   family: lint
+naja-miner:
+  family: verify
+  note: |
+    Verify the case on every push to main (homelab HL-673). The repo is private and has no site, so
+    this publishes nothing; GitHub's deploy workflow, which it replaces, skipped its Pages steps too.
+
+    The forge's runners are arm64 and OpenSCAD ships no aarch64 snapshot, so the render uses the same
+    pinned snapshot's WebAssembly build on node. All four test suites, the render and the manifest
+    contract passed on that build on 2026-10-31.
+  gates:
+    verify:
+      class: medium
+      timeout: 30
+      steps:
+      - checkout
+      - openscad
+      # Before the STLs, not after. Every one of these checks fails on geometry that renders and
+      # exports perfectly cleanly, so a green STL build proves nothing about whether the parts fit.
+      - name: Test CAD geometry
+        run: |
+          export OPENSCAD="$PWD/.openscad/bin/openscad"
+          ./scripts/test.sh
+      - name: Generate STL files
+        run: |
+          export OPENSCAD="$PWD/.openscad/bin/openscad"
+          ./scripts/generate-stl.sh --ci
+      # The manifest is written by a shell heredoc and consumed by typed TypeScript, so nothing else
+      # connects the two.
+      - name: Test manifest contract
+        run: ./scripts/test-manifest.sh public/manifest.json
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: |
+          npm run build
+          test -f dist/index.html
+      env:
+        PATH: /usr/local/bin:/usr/bin:/bin
+pedigree-tree:
+  family: verify
+  note: |
+    Verify main on every push (homelab HL-673): the checks release.yml ran before it released.
+
+    Verify only for now: releasing and publishing the versioned docs from the forge are homelab HL-698.
+    The docs build here is the current checkout's alone; the versioned one rebuilds every tag.
+  gates:
+    verify:
+      class: heavy
+      timeout: 30
+      steps:
+      - checkout
+      # canvas' arm64 prebuilt bundles a libcairo aligned for 4K pages, which a Pi 5's 16K kernel
+      # refuses to load, so it is compiled against the host's (homelab roles/ci-toolchain).
+      - name: Install
+        run: |
+          npm ci --no-audit --no-fund
+          npm rebuild canvas --build-from-source
+          node -e "require('canvas')"
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Test
+        run: npm run test:run
+      - name: Build
+        run: npm run build
+      - name: Build docs
+        working-directory: docs
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      env:
+        PATH: /usr/local/bin:/usr/bin:/bin
+invariant-coverage:
+  family: verify
+  note: |
+    The forge is this repo's primary (homelab HL-674); GitHub only receives the push mirror.
+    Runners are host mode, with no container: jq, git and awk (mawk 1.3.4, which tests/run.sh accepts)
+    come from the host, and shellcheck, which the hosts do not carry, is pinned here by checksum.
+  gates:
+    check:
+      class: medium
+      timeout: 30
+      steps:
+      - checkout
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          dir="$PWD/.shellcheck"; mkdir -p "$dir"
+          curl -fsSL --retry 5 --retry-delay 10 -o "$dir/sc.tar.xz" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.aarch64.tar.xz"
+          echo "$SHELLCHECK_SHA256  $dir/sc.tar.xz" | sha256sum -c -
+          tar -xJf "$dir/sc.tar.xz" -C "$dir" --strip-components=1
+      - name: Shellcheck
+        run: .shellcheck/shellcheck check-invariant-coverage.sh tests/run.sh
+      - name: Syntax
+        run: |
+          bash -n check-invariant-coverage.sh
+          bash -n tests/run.sh
+      - name: Test
+        run: bash tests/run.sh
+      env:
+        PATH: /usr/local/bin:/usr/bin:/bin
+        SHELLCHECK_VERSION: v0.11.0
+        SHELLCHECK_SHA256: 12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588
+lab-router:
+  family: pages
+  note: |
+    Publish the site to lab-router.pages.lepaux.com (homelab HL-673), the forge's GitHub Pages
+    replacement (HL-675).
+
+    The forge's runners are arm64 and OpenSCAD ships no aarch64 snapshot, so the render uses the same
+    pinned snapshot's WebAssembly build on node. Checked against GitHub's AppImage build of 5477c66
+    on 2026-10-30: every part has the same facets, bounding box and volume.
+
+    The upload is a tar of dist/ over SSH to vps-edge. The deploy key may run only the edge's
+    receiver for this site, which puts the upload live only if it extracts cleanly and has an
+    index.html, so a bad build leaves the previous release serving. The key and the edge's host
+    key are repo secrets the homelab forgejo role writes; nobody types them.
+  gates:
+    publish:
+      class: medium
+      timeout: 30
+      steps:
+      - checkout
+      # Public on GitHub; the forge token's extraHeader is scoped to the forge, so it never goes there.
+      - name: Check out SBC_Model_Framework
+        run: |
+          git submodule update --init --depth 1 cad/SBC_Model_Framework
+          test -n "$(ls -A cad/SBC_Model_Framework)"
+      - openscad
+      - name: Generate STL files
+        run: |
+          export OPENSCAD="$PWD/.openscad/bin/openscad"
+          ./scripts/generate-stl.sh --ci
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Build
+        run: |
+          npm run build
+          test -f dist/index.html
+          test -f dist/manifest.json
+      env:
+        PATH: /usr/local/bin:/usr/bin:/bin
+  site_dir: dist
+  # A 200 alone could be the previous release, so each site proves the commit it serves.
+  served:
+    name: Served
+    env:
+      SHA: ${{ github.sha }}
+    run: |
+      set -euo pipefail
+      curl -fsS --retry 3 -o /dev/null -w '%{http_code} %{url_effective}\n' https://lab-router.pages.lepaux.com/
+      served="$(curl -fsS --retry 3 https://lab-router.pages.lepaux.com/manifest.json | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["commit"])')"
+      # The same call scripts/generate-stl.sh writes the manifest's commit with.
+      [ "$served" = "$(git rev-parse --short HEAD)" ] || {
+        echo "::error::lab-router.pages.lepaux.com serves commit $served, not this run's $SHA"; exit 1; }
+      echo "serving $served"
+naja-fan-filter:
+  family: pages
+  note: |
+    Publish the site to naja-fan-filter.pages.lepaux.com (homelab HL-673), the forge's GitHub Pages
+    replacement (HL-675).
+
+    The forge's runners are arm64 and OpenSCAD ships no aarch64 snapshot, so the render uses the same
+    pinned snapshot's WebAssembly build on node. Checked against GitHub's AppImage build on 2026-10-31:
+    the STL's sha256 is the one GitHub Pages serves.
+
+    The upload is a tar of _site over SSH to vps-edge. The deploy key may run only the edge's receiver
+    for this site, which puts the upload live only if it extracts cleanly and has an index.html, so a
+    bad build leaves the previous release serving. The key and the edge's host key are repo secrets
+    the homelab forgejo role writes; nobody types them.
+  gates:
+    publish:
+      class: medium
+      timeout: 30
+      steps:
+      - checkout
+      - openscad
+      - name: Test
+        run: |
+          export OPENSCAD="$PWD/.openscad/bin/openscad"
+          ./scripts/test.sh
+      - name: Build
+        run: |
+          export OPENSCAD="$PWD/.openscad/bin/openscad"
+          CI=1 ./scripts/build-site.sh _site
+          test -f _site/index.html
+          test -f _site/naja-fan-filter.stl
+      env:
+        PATH: /usr/local/bin:/usr/bin:/bin
+  site_dir: _site
+  # A 200 alone could be the previous release, so each site proves the commit it serves.
+  served:
+    name: Served
+    run: |
+      set -euo pipefail
+      site=https://naja-fan-filter.pages.lepaux.com
+      curl -fsS --retry 3 -o /dev/null -w '%{http_code} %{url_effective}\n' "$site/naja-fan-filter.stl"
+      commit="$(git rev-parse --short HEAD)"
+      curl -fsS --retry 3 "$site/" | grep -qF "<code>$commit</code>" || {
+        echo "::error::$site does not serve commit $commit"; exit 1; }
+      echo "serving $commit"

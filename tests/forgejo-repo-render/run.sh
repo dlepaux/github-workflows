@@ -104,10 +104,33 @@ for repo, wf in rendered.items():
     for job_id, job in wf["jobs"].items():
         if job_id in PUBLISHERS:
             check(f"{repo}/{job_id}: guard pinned", job.get("if") == PUBLISHERS[job_id])
-        else:
+        elif table[repo]["family"] != "pages":
             # A gate runs on the pull request, so only the read-only install token may reach it.
             names = set(re.findall(r"secrets\.([A-Z_]+)", yaml.safe_dump(job)))
             check(f"{repo}/{job_id}: a gate holds no write secret", "if" not in job and names <= {"NPM_TOKEN"})
+
+# A site builds on a pull request and publishes on main only: the key sits on the guarded step, and
+# what it uploads is what the gates in the same job just built.
+for repo, wf in rendered.items():
+    if table[repo]["family"] != "pages":
+        continue
+    job = wf["jobs"]["publish"]
+    guarded = job["steps"][-2:]
+    check(f"{repo}: publish and served close the job", [s["name"] for s in guarded] == ["Publish", "Served"])
+    check(f"{repo}: both run on main only", all(s["if"] == "github.ref == 'refs/heads/main'" for s in guarded))
+    built = job["steps"][:-2]
+    check(f"{repo}: the build runs on a pull request", all("if" not in s for s in built) and "if" not in job)
+    check(f"{repo}: only the guarded steps hold a secret", "secrets." not in yaml.safe_dump(built).replace("token ${{ github.token }}", ""))
+    check(f"{repo}: uploads what it built", f"tar -cz -C {table[repo]['site_dir']} ." in guarded[0]["run"])
+    check(f"{repo}: the key is never in argv", "printf '%s\\n' \"$DEPLOY_KEY\"" in guarded[0]["run"])
+
+# OpenSCAD comes from one pin, and its step is what each job's env feeds.
+for repo, wf in rendered.items():
+    for job in wf["jobs"].values():
+        uses = any(s.get("name") == rr.OPENSCAD_STEP["name"] for s in job["steps"])
+        if uses:
+            check(f"{repo}: OpenSCAD is the one pin", job["env"]["OPENSCAD_SHA256"] == rr.OPENSCAD_SHA256)
+            check(f"{repo}: its version is checked", "OpenSCAD version $OPENSCAD_VERSION" in rr.OPENSCAD_STEP["run"])
 
 # Deploy comes from the docker job only, and carries deploy.yml's step whole.
 for repo, wf in rendered.items():
@@ -127,6 +150,9 @@ lint = next(r for r, e in table.items() if e["family"] == "lint")
 refuses("unknown family", service, {**table[service], "family": "nope"}, "unknown family")
 refuses("unknown repo key", service, {**table[service], "automerge": True}, "does not carry")
 refuses("a package key on a service", service, {**table[service], "release_install": True}, "does not carry")
+pages = next(r for r, e in table.items() if e["family"] == "pages")
+refuses("a site with no served proof", pages, {k: v for k, v in table[pages].items() if k != "served"}, "missing")
+refuses("a site split over two jobs", pages, {**table[pages], "gates": {**table[pages]["gates"], "extra": table[pages]["gates"]["publish"]}}, "one job")
 refuses("a lint repo with gates", lint, {"family": "lint", "gates": {}}, "does not carry")
 refuses("a service with no image timeout", service,
         {k: v for k, v in table[service].items() if k != "image_timeout"}, "missing")

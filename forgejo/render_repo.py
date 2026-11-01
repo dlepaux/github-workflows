@@ -12,6 +12,8 @@ Families:
            optionally the deploy webhook
   package  gates, then semantic-release, which publishes the package
   lint     the fleet repos' loopback-binding check
+  verify   gates and nothing after them
+  pages    one job that builds a static site, and on main uploads it to the edge and proves it serves
 
 Usage:
   render_repo.py --list        # print each "<repo> <workflow file>"
@@ -30,14 +32,29 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SEMANTIC_RELEASE = "node /usr/local/lib/ci-toolchain/semantic-release/forge-release.mjs"
 BUILD_IMAGE = ".forgejo/build-image.sh"
 CLASSES = ("heavy", "medium")
-GATE_KEYS = {"class", "timeout", "steps"}
+GATE_REQUIRED = {"class", "timeout", "steps"}
+GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {
     "service": {"family", "gates", "image_timeout", "image_env", "deploy_url"},
     "package": {"family", "gates", "release_install", "release_env"},
     "lint": {"family"},
+    "verify": {"family", "gates", "note"},
+    "pages": {"family", "gates", "note", "site_dir", "served"},
 }
-ALWAYS_PRESENT = {"service": {"family", "image_timeout"}, "package": {"family", "gates"}, "lint": {"family"}}
-WORKFLOW_FILE = {"service": "ci.yml", "package": "ci.yml", "lint": "loopback-bindings-lint.yml"}
+ALWAYS_PRESENT = {
+    "service": {"family", "image_timeout"},
+    "package": {"family", "gates"},
+    "lint": {"family"},
+    "verify": {"family", "gates", "note"},
+    "pages": {"family", "gates", "note", "site_dir", "served"},
+}
+WORKFLOW_FILE = {
+    "service": "ci.yml",
+    "package": "ci.yml",
+    "lint": "loopback-bindings-lint.yml",
+    "verify": "ci.yml",
+    "pages": "pages.yml",
+}
 
 # A pull request's run is the green check Renovate's automerge waits for (HL-130). The lint family
 # stays off it on purpose: the srv-* host repos are held to a human's merge by having no check.
@@ -45,6 +62,38 @@ GATED_TRIGGERS = {
     "push": {"branches": ["main"]},
     "pull_request": {"branches": ["main"]},
     "workflow_dispatch": {},
+}
+
+# GitHub's default for a `run:` step with no `shell:`, which these families' scripts were written
+# against: forgejo-runner would add pipefail (render.py's shell-default).
+RUN_DEFAULTS = {"run": {"shell": "bash -e {0}"}}
+# A pull request's ref is refs/pull/N/head, so this alone keeps a site's key off one.
+ON_MAIN = "github.ref == 'refs/heads/main'"
+EDGE = "static-sites@82.112.240.209"
+OPENSCAD_VERSION = "2026.04.26"
+# sha256 of OpenSCAD-2026.04.26-WebAssembly-node.zip, read 2026-10-30; bump both together.
+OPENSCAD_SHA256 = "cffe65689337f0ed16b3577545c53372ac556fe6e0ab582d481670602e39bfe8"
+OPENSCAD_ENV = {"OPENSCAD_VERSION": OPENSCAD_VERSION, "OPENSCAD_SHA256": OPENSCAD_SHA256}
+# The forge's runners are arm64 and OpenSCAD ships no aarch64 snapshot, hence the WebAssembly build,
+# into the job's own workspace, which the runner discards.
+OPENSCAD_STEP = {
+    "name": "Install OpenSCAD (WebAssembly)",
+    "run": (
+        "set -euo pipefail\n"
+        'dir="$PWD/.openscad"; mkdir -p "$dir/bin"\n'
+        'curl -fsSL --retry 5 --retry-delay 10 -o "$dir/openscad.zip" \\\n'
+        '  "https://files.openscad.org/snapshots/OpenSCAD-${OPENSCAD_VERSION}-WebAssembly-node.zip"\n'
+        'echo "$OPENSCAD_SHA256  $dir/openscad.zip" | sha256sum -c -\n'
+        'python3 -I -m zipfile -e "$dir/openscad.zip" "$dir/x"\n'
+        "# openscad.js is CommonJS; without this, node takes the repo's \"type\": \"module\" and fails.\n"
+        """printf '{"type":"commonjs"}\\n' > "$dir/x/package.json"\n"""
+        """printf '#!/usr/bin/env bash\\nexec node %q "$@"\\n' "$dir/x/openscad.js" > "$dir/bin/openscad"\n"""
+        'chmod +x "$dir/bin/openscad"\n'
+        "# This build exits 7 after printing --version (a render exits 0, a failed one 1), so the check\n"
+        "# is on what it prints, not on its status.\n"
+        'v="$("$dir/bin/openscad" --version 2>&1 || true)"; echo "$v"\n'
+        '[ "$v" = "OpenSCAD version $OPENSCAD_VERSION" ] || { echo "::error::expected OpenSCAD $OPENSCAD_VERSION"; exit 1; }\n'
+    ),
 }
 
 HEADER = """\
@@ -80,11 +129,17 @@ def checked_keys(name, entry, allowed, required):
 
 def gate_job(repo, gate_id, gate):
     """A gate's steps are the repo's own, with `checkout` standing for the one pinned checkout."""
-    checked_keys(f"{repo}/{gate_id}", gate, GATE_KEYS, GATE_KEYS)
+    checked_keys(f"{repo}/{gate_id}", gate, GATE_KEYS, GATE_REQUIRED)
     if gate["steps"].count("checkout") != 1:
         raise RenderError(f"{repo}/{gate_id}: a gate takes exactly one checkout")
-    steps = [CHECKOUT if s == "checkout" else s for s in gate["steps"]]
-    return {"runs-on": runs_on(gate["class"]), "timeout-minutes": gate["timeout"], "steps": steps}
+    named = {"checkout": CHECKOUT, "openscad": OPENSCAD_STEP}
+    steps = [named[s] if isinstance(s, str) else s for s in gate["steps"]]
+    job = {"runs-on": runs_on(gate["class"]), "timeout-minutes": gate["timeout"]}
+    env = {**gate.get("env", {}), **(OPENSCAD_ENV if "openscad" in gate["steps"] else {})}
+    if env:
+        job["env"] = env
+    job["steps"] = steps
+    return job
 
 
 def gate_jobs(repo, entry):
@@ -209,6 +264,49 @@ def package_workflow(repo, entry):
     return {"name": "CI/CD", "on": GATED_TRIGGERS, "jobs": jobs}, ""
 
 
+def publish_step(site_dir):
+    return {
+        "name": "Publish",
+        "if": ON_MAIN,
+        "env": {
+            "DEPLOY_KEY": "${{ secrets.STATIC_SITE_DEPLOY_KEY }}",
+            "KNOWN_HOSTS": "${{ secrets.STATIC_SITE_KNOWN_HOSTS }}",
+        },
+        "run": (
+            "set -euo pipefail\n"
+            '[ -n "${DEPLOY_KEY:-}" ] && [ -n "${KNOWN_HOSTS:-}" ] || {\n'
+            '  echo "::error::STATIC_SITE_DEPLOY_KEY or STATIC_SITE_KNOWN_HOSTS is not set (homelab static_sites, converge srv-apps)"; exit 1; }\n'
+            'dir="$(mktemp -d)"; trap \'rm -rf "$dir"\' EXIT\n'
+            "# printf is a builtin: the key never appears in a process's argv.\n"
+            """printf '%s\\n' "$DEPLOY_KEY" > "$dir/key"; chmod 600 "$dir/key"\n"""
+            """printf '%s\\n' "$KNOWN_HOSTS" > "$dir/known_hosts"\n"""
+            "# The receiver picks the site from the key, so the remote command is ignored; none is sent.\n"
+            f'tar -cz -C {site_dir} . | ssh -T -i "$dir/key" -o IdentitiesOnly=yes -o BatchMode=yes \\\n'
+            '  -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$dir/known_hosts" \\\n'
+            f"  {EDGE}\n"
+        ),
+    }
+
+
+def note_comment(note):
+    return "".join(f"# {line}\n" if line else "#\n" for line in note.splitlines())
+
+
+def verify_workflow(repo, entry):
+    workflow = {"name": "CI", "on": GATED_TRIGGERS, "defaults": RUN_DEFAULTS, "jobs": gate_jobs(repo, entry)}
+    return workflow, note_comment(entry["note"])
+
+
+def pages_workflow(repo, entry):
+    jobs = gate_jobs(repo, entry)
+    if list(jobs) != ["publish"]:
+        raise RenderError(f"{repo}: a site has the one job, publish, as its build and upload share a workspace")
+    jobs["publish"]["steps"] = jobs["publish"]["steps"] + [
+        publish_step(entry["site_dir"]), {**entry["served"], "if": ON_MAIN}]
+    workflow = {"name": "Pages", "on": GATED_TRIGGERS, "defaults": RUN_DEFAULTS, "jobs": jobs}
+    return workflow, note_comment(entry["note"])
+
+
 def lint_workflow():
     workflow = {
         "name": "loopback-bindings-lint",
@@ -249,6 +347,10 @@ def render_repo(repo, entry, deploy_step_run):
         workflow, note = service_workflow(repo, entry, deploy_step_run)
     elif family == "package":
         workflow, note = package_workflow(repo, entry)
+    elif family == "verify":
+        workflow, note = verify_workflow(repo, entry)
+    elif family == "pages":
+        workflow, note = pages_workflow(repo, entry)
     else:
         workflow, note = lint_workflow()
     # Forgejo 15 mails a run only when its workflow opts in, and the forge is these repos' only CI.
