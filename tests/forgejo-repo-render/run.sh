@@ -79,20 +79,35 @@ for repo, wf in rendered.items():
               ("quality" in gates) == (jobs["rebuild"].get("needs") == "quality"))
 
 # A pull request gets gates and nothing that publishes; a host repo gets no check at all, which is
-# what holds its updates to a human's merge (HL-130).
+# what holds its updates to a human's merge (HL-130). The guards are pinned whole, since `always()`
+# on a job would otherwise pass here and fire its write secret from a pull request.
+PUBLISHERS = {
+    "release": "github.event_name == 'push'",
+    "docker": "needs.release.outputs.version != ''",
+    "rebuild": "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+    "deploy": None,
+}
+LINT_ON = {
+    "push": {"branches": ["main"], "paths": [
+        "docker-compose*.yml",
+        "loopback-bind.allowlist",
+        "scripts/check-loopback-bindings.sh",
+        ".forgejo/workflows/loopback-bindings-lint.yml",
+    ]},
+    "workflow_dispatch": {},
+}
 for repo, wf in rendered.items():
-    on_pr = "pull_request" in wf["on"]
-    check(f"{repo}: pull requests match the family", on_pr == (table[repo]["family"] != "lint"))
-    if on_pr:
-        check(f"{repo}: pull requests into main only", wf["on"]["pull_request"]["branches"] == ["main"])
-        for job_id in ("release", "docker", "rebuild", "deploy"):
-            job = wf["jobs"].get(job_id)
-            if job is None:
-                continue
-            guard = job.get("if", "")
-            needs_guarded = job.get("needs") in ("release", "docker")
-            check(f"{repo}/{job_id} cannot run on a pull request",
-                  needs_guarded or ("event_name ==" in guard and "pull_request" not in guard))
+    if table[repo]["family"] == "lint":
+        check(f"{repo}: a host repo's triggers put no status on a Renovate branch", wf["on"] == LINT_ON)
+        continue
+    check(f"{repo}: pull requests into main only", wf["on"]["pull_request"] == {"branches": ["main"]})
+    for job_id, job in wf["jobs"].items():
+        if job_id in PUBLISHERS:
+            check(f"{repo}/{job_id}: guard pinned", job.get("if") == PUBLISHERS[job_id])
+        else:
+            # A gate runs on the pull request, so only the read-only install token may reach it.
+            names = set(re.findall(r"secrets\.([A-Z_]+)", yaml.safe_dump(job)))
+            check(f"{repo}/{job_id}: a gate holds no write secret", "if" not in job and names <= {"NPM_TOKEN"})
 
 # Deploy comes from the docker job only, and carries deploy.yml's step whole.
 for repo, wf in rendered.items():

@@ -41,13 +41,13 @@ VISIBILITY_EXPR = "${{ github.event.repository.visibility }}"
 TRANSFORMS = (
     ("drop-jobs", "trivy and release are not verify jobs; release publishes"),
     ("runs-on", "the runner offers [self-hosted, arm64, ci-heavy]; the job must ask for all of them"),
-    ("drop-fork-guard", "a pull mirror carries no pull requests, and the triggers name none"),
+    ("drop-fork-guard", "no fork can exist: only the owner reads a repo here, as a new login is restricted and holds no grant"),
     ("drop-public-only", "the forge forces every repo private, so hosted-runner installs never run"),
     ("strip-private-only", "always private on the forge: private-only conditions go, visibility env is 'private'"),
     ("checkout-git", "host mode would need node for actions/checkout; plain git needs nothing"),
     ("drop-sidecars", "no shadowed crate sets needs_postgres or needs_nats"),
     ("inputs-literal", "a standalone workflow has no inputs; the caller's values are inlined"),
-    ("triggers", "push to main plus a staggered nightly schedule (spec §1 Triggers)"),
+    ("triggers", "push to main plus a staggered nightly schedule (spec §1 Triggers); a primary crate adds pull requests (HL-715)"),
     ("drop-permissions-concurrency", "GitHub token scopes; the in-flight cap of 1 serialises"),
     ("shell-default", "GitHub runs a step with no shell as `bash -e {0}`; forgejo-runner adds pipefail"),
 )
