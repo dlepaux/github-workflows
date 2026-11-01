@@ -97,10 +97,13 @@ for repo, wf in rendered.items():
     elif "docker" in jobs:
         check(f"{repo}: the image waits for a release", jobs["docker"]["needs"] == "release"
               and jobs["docker"]["if"] == "needs.release.outputs.version != ''")
-        check(f"{repo}: a rebuild runs only on the schedule or by hand",
-              jobs["rebuild"]["if"] == "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'")
         rebuild_needs = jobs["rebuild"].get("needs", [])
         rebuild_needs = [rebuild_needs] if isinstance(rebuild_needs, str) else rebuild_needs
+        if table[repo].get("image_on_every_push"):
+            check(f"{repo}: a rebuild waits for every gate and the release", sorted(rebuild_needs) == sorted([*gates, "release"]))
+            continue
+        check(f"{repo}: a rebuild runs only on the schedule or by hand",
+              jobs["rebuild"]["if"] == "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'")
         check(f"{repo}: a rebuild waits for every gate", sorted(rebuild_needs) == sorted(gates))
 
 # A pull request gets gates and nothing that publishes; a host repo gets no check at all, which is
@@ -114,6 +117,12 @@ PUBLISHERS = {
     "deploy": None,
     "publish-site": "github.ref == 'refs/heads/main'",
 }
+EVERY_PUSH_REBUILD = (
+    "always() && needs.quality.result == 'success' && (github.event_name == 'schedule' || "
+    "github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && "
+    "needs.release.result == 'success' && needs.release.outputs.version == ''))"
+)
+DEPLOY_REBUILD = "always() && (needs.docker.result == 'success' || needs.rebuild.result == 'success')"
 LINT_ON = {
     "push": {"branches": ["main"], "paths": [
         "docker-compose*.yml",
@@ -130,7 +139,11 @@ for repo, wf in rendered.items():
     check(f"{repo}: pull requests into main only", wf["on"]["pull_request"] == {"branches": ["main"]})
     for job_id, job in wf["jobs"].items():
         if plain(job_id) in PUBLISHERS:
-            check(f"{repo}/{job_id}: guard pinned", job.get("if") == PUBLISHERS[plain(job_id)])
+            pinned = {
+                **({"rebuild": EVERY_PUSH_REBUILD} if table[repo].get("image_on_every_push") else {}),
+                **({"deploy": DEPLOY_REBUILD} if table[repo].get("deploy_rebuild") else {}),
+            }
+            check(f"{repo}/{job_id}: guard pinned", job.get("if") == pinned.get(plain(job_id), PUBLISHERS[plain(job_id)]))
         elif table[repo]["family"] == "image" and job_id == "image":
             continue  # Its own cases are below: this job publishes, behind its gates.
         elif table[repo]["family"] != "pages":
@@ -211,7 +224,8 @@ for repo, wf in rendered.items():
     deploy = wf["jobs"].get("deploy")
     check(f"{repo}: deploy matches the table", (deploy is not None) == ("deploy_url" in table[repo]))
     if deploy:
-        check(f"{repo}: deploy follows the image", deploy["needs"] == "docker")
+        expected = ["docker", "rebuild"] if table[repo].get("deploy_rebuild") else "docker"
+        check(f"{repo}: deploy follows the image", deploy["needs"] == expected)
         check(f"{repo}: deploy runs deploy.yml's step", deploy["steps"][0]["run"] == DEPLOY)
 
 # The real deploy.yml still has the step the render takes.
@@ -282,6 +296,74 @@ for repo, entry in table.items():
     if "image_smoke" in entry:
         check(f"{repo}: its smoke script parses",
               subprocess.run(["bash", "-n"], input=entry["image_smoke"], text=True).returncode == 0)
+refuses("image_arch with multi_arch", arch_repo, {**table[arch_repo], "multi_arch": True, "image_arch": "x64"}, "image_arch")
+refuses("every push with multi_arch", arch_repo, {**table[arch_repo], "multi_arch": True, "image_on_every_push": True}, "image_on_every_push")
+
+# One image for the other arch: both its publishers build there, and nothing else moves.
+single = next(r for r, e in table.items() if e["family"] == "service" and not e.get("multi_arch") and "image_arch" not in e)
+refuses("an arch the render does not know", single, {**table[single], "image_arch": "riscv"}, "image_arch")
+x64_wf = yaml.safe_load(rr.render_repo(single, {**table[single], "image_arch": "x64"}, DEPLOY))
+arm_wf = yaml.safe_load(rr.render_repo(single, table[single], DEPLOY))
+check("image_arch moves docker", x64_wf["jobs"]["docker"]["runs-on"] == ["self-hosted", "x64", "ci-heavy"])
+check("image_arch moves rebuild", x64_wf["jobs"]["rebuild"]["runs-on"] == ["self-hosted", "x64", "ci-heavy"])
+check("image_arch moves nothing else", {
+    j: v for j, v in x64_wf["jobs"].items() if j not in ("docker", "rebuild")
+} == {j: v for j, v in arm_wf["jobs"].items() if j not in ("docker", "rebuild")})
+check("the default arch stays arm64", arm_wf["jobs"]["docker"]["runs-on"] == ["self-hosted", "arm64", "ci-heavy"])
+
+# Every push: a commit with no release builds, past green gates only, and a pull request never does.
+every_entry = {**table[single], "image_on_every_push": True, "deploy_rebuild": True, "deploy_url": "https://example.test/deploy"}
+refuses("every push that never ships", single, {k: v for k, v in every_entry.items() if k != "deploy_rebuild"}, "deploy_rebuild")
+refuses("a rebuild's deploy with nowhere to go", single,
+        {**{k: v for k, v in table[single].items() if k != "deploy_url"}, "deploy_rebuild": True}, "deploy_url")
+every_wf = yaml.safe_load(rr.render_repo(single, every_entry, DEPLOY))
+guard = every_wf["jobs"]["rebuild"]["if"]
+every_gates = [j for j in every_wf["jobs"] if j not in ("release", "docker", "rebuild", "deploy")]
+check("every push: rebuild waits for the release that decides it", "release" in every_wf["jobs"]["rebuild"]["needs"])
+check("every push: always() is what lets a skipped release through", guard.startswith("always() && "))
+for g in every_gates:
+    check(f"every push: {g} must be green", f"needs.{g}.result == 'success'" in guard)
+check("every push: a release's own commit stays the docker job's", "needs.release.outputs.version == ''" in guard)
+check("every push: a failed release builds nothing", "needs.release.result == 'success'" in guard)
+check("every push: pull_request is not among the events", "pull_request" not in guard and "!= 'push'" not in guard)
+check("every push: the release job still builds its tag",
+      every_wf["jobs"]["docker"]["steps"][0]["env"]["REF"].startswith("refs/tags/v${{"))
+check("every push: deploy follows either build", every_wf["jobs"]["deploy"]["needs"] == ["docker", "rebuild"]
+      and "needs.docker.result == 'success' || needs.rebuild.result == 'success'" in every_wf["jobs"]["deploy"]["if"])
+
+
+def guard_is(expr, event, quality, release, version):
+    """The guard's truth for one run: the expression is only these names, `&&`, `||` and parentheses."""
+    for word, value in (
+        ("github.event_name", repr(event)), ("needs.quality.result", repr(quality)),
+        ("needs.release.result", repr(release)), ("needs.release.outputs.version", repr(version)),
+        ("always()", "True"), ("&&", " and "), ("||", " or "),
+    ):
+        expr = expr.replace(word, value)
+    return eval(expr, {"__builtins__": {}})
+
+
+for event, quality, release, version, builds in (
+    ("push", "success", "success", "", True),
+    ("push", "success", "success", "1.2.3", False),
+    ("push", "success", "failure", "", False),
+    ("push", "failure", "skipped", "", False),
+    ("push", "cancelled", "skipped", "", False),
+    ("schedule", "success", "skipped", "", True),
+    ("schedule", "failure", "skipped", "", False),
+    ("workflow_dispatch", "success", "skipped", "", True),
+    ("pull_request", "success", "skipped", "", False),
+    ("pull_request", "success", "success", "", False),
+):
+    check(f"every push guard: {event} quality={quality} release={release} version={version!r} -> {builds}",
+          guard_is(guard, event, quality, release, version) is builds)
+# A queue strands its first job until ci-dispatch can retry one (HL-738).
+for repo, wf in rendered.items():
+    check(f"{repo}: no queue yet", "concurrency" not in wf)
+check("the note says a rebuild deploys", "The rebuild deploys too" in rr.render_repo("nilufer", table["nilufer"], DEPLOY))
+check("the note says a rebuild does not", "The rebuild does not deploy" in rr.render_repo(single, table[single], DEPLOY))
+check("without it, deploy follows docker alone", arm_wf["jobs"].get("deploy", {"needs": "docker"})["needs"] == "docker")
+
 refuses("a smoke with no manifest to check", arch_repo, {**table[arch_repo], "image_smoke": "true\n"}, "needs multi_arch")
 refuses("multi_arch with image_env", arch_repo, {**table[arch_repo], "multi_arch": True, "image_env": {"X": "1"}}, "image_env")
 check("a missing digest stops the merge before any login", refused.returncode == 1 and "left no digest" in refused.stdout)

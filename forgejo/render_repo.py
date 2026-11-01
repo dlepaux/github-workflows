@@ -38,7 +38,8 @@ CLASSES = ("heavy", "medium")
 GATE_REQUIRED = {"class", "timeout", "steps"}
 GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {
-    "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke", "site"},
+    "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke", "site",
+                "image_arch", "image_on_every_push", "deploy_rebuild"},
     "package": {"family", "gates", "release_install", "release_env"},
     "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request"},
     "lint": {"family"},
@@ -120,7 +121,12 @@ HEADER = """\
 SERVICE_NOTE = """\
 # A release's image comes from its tag, and the weekly schedule's rebuild republishes :latest on a
 # patched base, since a stable service never releases and its base would otherwise never change.
+"""
+NO_REBUILD_DEPLOY_NOTE = """\
 # The rebuild does not deploy: image-update-exporter reports the digest, and the pull stays a decision.
+"""
+REBUILD_DEPLOY_NOTE = """\
+# The rebuild deploys too: the image roller leaves this service to its pipeline, so nothing else would ship it.
 """
 # Each architecture builds on its own hardware, since a rootless runner cannot register QEMU (HL-722).
 # A leg's Docker config and builder are its own: the runner keeps one daemon across jobs, and
@@ -361,6 +367,24 @@ def smoke_jobs(entry, docker_guard):
     }
 
 
+def every_push_guard(gates):
+    """A site whose content lives in its image ships every push, so a commit no release follows is built too.
+
+    `always()` because release is skipped on a schedule or a dispatch, and a skipped need otherwise skips
+    this job; the gates are then named, so it still cannot publish past a red one. Named events, as a
+    pull request must never publish :latest. A release's own commit is the docker job's.
+    """
+    green = " && ".join(f"needs.{g}.result == 'success'" for g in gates)
+    return {
+        "needs": list(gates) + ["release"],
+        "if": (
+            f"always() && {green} && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+            " || (github.event_name == 'push' && needs.release.result == 'success'"
+            " && needs.release.outputs.version == ''))"
+        ),
+    }
+
+
 def service_workflow(repo, entry, deploy_step_run):
     gates = gate_jobs(repo, entry)
     timeout = entry["image_timeout"]
@@ -373,6 +397,22 @@ def service_workflow(repo, entry, deploy_step_run):
     rebuild_guard["if"] = "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
     if "image_smoke" in entry and not entry.get("multi_arch", False):
         raise RenderError(f"{repo}: image_smoke needs multi_arch, whose legs it checks")
+    if entry.get("multi_arch", False) and "image_arch" in entry:
+        raise RenderError(f"{repo}: multi_arch builds both arches, image_arch picks the one")
+    if entry.get("multi_arch", False) and "image_on_every_push" in entry:
+        raise RenderError(f"{repo}: image_on_every_push is for one image, not two legs and a merge")
+    # The arch the image runs on: vps-edge is x86_64, and the render's default is the arm64 pool.
+    image_arch = entry.get("image_arch", "arm64")
+    if image_arch not in IMAGE_PLATFORMS:
+        raise RenderError(f"{repo}: image_arch must be one of {sorted(IMAGE_PLATFORMS)}")
+    every_push = entry.get("image_on_every_push", False)
+    deploy_rebuild = entry.get("deploy_rebuild", False)
+    if deploy_rebuild and "deploy_url" not in entry:
+        raise RenderError(f"{repo}: deploy_rebuild needs a deploy_url")
+    if every_push and "deploy_url" in entry and not deploy_rebuild:
+        raise RenderError(f"{repo}: image_on_every_push needs deploy_rebuild, or a push builds and never ships")
+    if every_push:
+        rebuild_guard = every_push_guard(gates)
     if entry.get("multi_arch", False):
         jobs.update(multi_arch_jobs("docker", repo, entry, docker_guard, tag_checkout(), version=True))
         if "image_smoke" in entry:
@@ -381,22 +421,35 @@ def service_workflow(repo, entry, deploy_step_run):
     else:
         jobs["docker"] = {
             **docker_guard,
-            "runs-on": runs_on("heavy"),
+            "runs-on": runs_on("heavy", image_arch),
             "timeout-minutes": timeout,
             "steps": [tag_checkout(), build_step(entry, version=True)],
         }
         jobs["rebuild"] = {
             **rebuild_guard,
-            "runs-on": runs_on("heavy"),
+            "runs-on": runs_on("heavy", image_arch),
             "timeout-minutes": timeout,
             "steps": [CHECKOUT, build_step(entry, version=False)],
         }
     if "deploy_url" in entry:
         jobs["deploy"] = deploy_job(deploy_step_run, entry["deploy_url"])
+        if deploy_rebuild:
+            # The image roller leaves a webhook-deployed service to its pipeline, so a rebuild no deploy
+            # follows never reaches the host. Either build published, and the other was skipped, so the
+            # default rule that a skipped need skips the job would never deploy.
+            jobs["deploy"] = {
+                "needs": ["docker", "rebuild"],
+                "if": "always() && (needs.docker.result == 'success' || needs.rebuild.result == 'success')",
+                **{k: v for k, v in jobs["deploy"].items() if k != "needs"},
+            }
     if "site" in entry:
         jobs["publish-site"] = site_job(repo, entry["site"])
     triggers = {**GATED_TRIGGERS, "schedule": [{"cron": "0 4 * * 1"}]}
-    return {"name": "CI/CD", "on": triggers, "jobs": jobs}, SERVICE_NOTE
+    # No `concurrency`, though these repos queued under GitHub: a queued job's runner finds no task and
+    # exits, and ci-dispatch never retries it (HL-738). Forgejo's default cancels the older push instead,
+    # so the newest commit still wins, and a release a push cancelled heals at the next rebuild's deploy.
+    note = REBUILD_DEPLOY_NOTE if deploy_rebuild else NO_REBUILD_DEPLOY_NOTE
+    return {"name": "CI/CD", "on": triggers, "jobs": jobs}, SERVICE_NOTE + note
 
 
 def package_workflow(repo, entry):

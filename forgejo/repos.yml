@@ -757,3 +757,56 @@ katha:
         [ "$served" = "$SHA" ] || {
           echo "::error::katha.pages.lepaux.com serves commit $served, not this run's $SHA"; exit 1; }
         echo "serving $served"
+
+nilufer:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 20
+      steps:
+      - checkout
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Generate the Prisma client
+        run: npm run db:generate
+      - name: Generate the schemas
+        run: npm run generate:schemas
+      - name: Lint
+        run: npm run lint
+      - name: Type check
+        run: npm run lint:types
+      # Fails if a Server Component or Route Handler ships without the auth layer's coverage.
+      - name: DAL coverage
+        run: bash scripts/check-dal-coverage.sh
+      - name: Test
+        run: npm run test
+  image_arch: x64
+  image_timeout: 60
+  deploy_url: https://webhook.lepaux.com/deploy
+  deploy_rebuild: true
+
+dlepaux.github.io:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 20
+      steps:
+      - checkout
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Generate the Prisma client
+        run: npm run db:generate
+      - name: Lint
+        run: npm run lint
+      - name: Type check
+        run: npm run lint:types
+      - name: Test
+        run: npm run test
+  image_arch: x64
+  # Posts are generated into the image, so a commit no release follows still has to ship.
+  image_on_every_push: true
+  image_timeout: 60
+  deploy_url: https://webhook.lepaux.com/deploy
+  deploy_rebuild: true
