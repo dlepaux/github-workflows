@@ -65,7 +65,7 @@ for repo, wf in rendered.items():
     jobs = wf["jobs"]
     if "release" not in jobs:
         continue
-    gates = [j for j in jobs if j not in ("release", "docker", "rebuild", "deploy")]
+    gates = [j for j in jobs if j not in ("release", "docker", "rebuild", "deploy", "image")]
     needs = jobs["release"].get("needs", [])
     needs = [needs] if isinstance(needs, str) else needs
     check(f"{repo}: release waits for every gate", sorted(needs) == sorted(gates))
@@ -104,6 +104,8 @@ for repo, wf in rendered.items():
     for job_id, job in wf["jobs"].items():
         if job_id in PUBLISHERS:
             check(f"{repo}/{job_id}: guard pinned", job.get("if") == PUBLISHERS[job_id])
+        elif table[repo]["family"] == "image" and job_id == "image":
+            continue  # Its own cases are below: this job publishes, behind its gates.
         elif table[repo]["family"] != "pages":
             # A gate runs on the pull request, so only the read-only install token may reach it.
             names = set(re.findall(r"secrets\.([A-Z_]+)", yaml.safe_dump(job)))
@@ -146,6 +148,19 @@ for repo, wf in rendered.items():
         check(f"{repo}: deploy runs deploy.yml's step", deploy["steps"][0]["run"] == DEPLOY)
 
 # The real deploy.yml still has the step the render takes.
+# The image family: its publish sits behind every gate, and a pull request never holds the token.
+for repo, wf in rendered.items():
+    if table[repo]["family"] != "image":
+        continue
+    job = wf["jobs"]["image"]
+    needs = [job["needs"]] if isinstance(job["needs"], str) else job["needs"]
+    check(f"{repo}: image needs every gate", set(needs) == set(table[repo]["gates"]))
+    env = job["steps"][-1]["env"]
+    check(f"{repo}: a pull request holds no token", "github.event_name != 'pull_request' &&" in env["GHCR_WRITE_TOKEN"])
+    check(f"{repo}: only main publishes", "refs/heads/main" in env["PUBLISH"] and "pull_request" in env["PUBLISH"])
+    check(f"{repo}: image builds on a pull request only if asked",
+          ("if" in job) != table[repo].get("image_on_pull_request", False))
+
 check("deploy.yml's step is found at HEAD", "curl" in rr.deploy_step_source("HEAD"))
 
 # Refusals.
@@ -161,6 +176,8 @@ refuses("a site split over two jobs", pages, {**table[pages], "gates": {**table[
 refuses("a lint repo with gates", lint, {"family": "lint", "gates": {}}, "does not carry")
 refuses("a service with no image timeout", service,
         {k: v for k, v in table[service].items() if k != "image_timeout"}, "missing")
+image = next(r for r, e in table.items() if e["family"] == "image")
+refuses("an image repo with no timeout", image, {k: v for k, v in table[image].items() if k != "image_timeout"}, "missing")
 refuses("a package with no gates", package, {"family": "package"}, "missing")
 for name, mutate, word in [
     ("a gate with no checkout", lambda g: g["steps"].remove("checkout"), "exactly one checkout"),

@@ -375,3 +375,93 @@ naja-fan-filter:
       curl -fsS --retry 3 "$site/" | grep -qF "<code>$commit</code>" || {
         echo "::error::$site does not serve commit $commit"; exit 1; }
       echo "serving $commit"
+household-mcp-evals:
+  family: verify
+  note: |-
+    No secret and no publish: the tests start their own fake MCP server and a scripted model endpoint.
+    Host mode, so rust-toolchain.toml's pin comes through the runner's rustup.
+  gates:
+    test:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+livrarr-mcp:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Security audit
+        run: |
+          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+          cargo audit
+      - name: Release version bump is cargo-free and cargo-correct
+        run: bash scripts/set-version.test.sh
+      - name: Test
+        run: cargo test --locked
+  image_timeout: 45
+shelfwright:
+  family: image
+  note: |-
+    Every push to main publishes :latest and sha-<commit>. No version tags and no deploy hook: srv-media
+    pins the digest in its one-shot job's compose, and moving that pin is its own change.
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+  image_timeout: 45
+hermes-image:
+  family: image
+  note: |-
+    test applies the patches to upstream at the Dockerfile's version and runs their suites, so a patch that
+    no longer applies fails loudly. image builds and checks the image on pull requests too, and on main
+    pushes it as <upstream version>-<sha7>. homelab pins that tag as hermes_image; nothing deploys from here.
+  gates:
+    test:
+      class: medium
+      timeout: 30
+      steps:
+      - checkout
+      - name: Patch upstream and test
+        run: bash .forgejo/test-patches.sh
+  image_timeout: 45
+  image_on_pull_request: true

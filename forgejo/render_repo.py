@@ -11,6 +11,7 @@ Families:
   service  gates, then semantic-release, the image on a release, a weekly image rebuild, and
            optionally the deploy webhook
   package  gates, then semantic-release, which publishes the package
+  image    gates, then the repo's own build script, publishing from main: no release and no rebuild
   lint     the fleet repos' loopback-binding check
   verify   gates and nothing after them
   pages    one job that builds a static site, and on main uploads it to the edge and proves it serves
@@ -37,6 +38,7 @@ GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {
     "service": {"family", "gates", "image_timeout", "image_env", "deploy_url"},
     "package": {"family", "gates", "release_install", "release_env"},
+    "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request"},
     "lint": {"family"},
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
@@ -44,6 +46,7 @@ FAMILY_KEYS = {
 ALWAYS_PRESENT = {
     "service": {"family", "image_timeout"},
     "package": {"family", "gates"},
+    "image": {"family", "gates", "note", "image_timeout"},
     "lint": {"family"},
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
@@ -51,6 +54,7 @@ ALWAYS_PRESENT = {
 WORKFLOW_FILE = {
     "service": "ci.yml",
     "package": "ci.yml",
+    "image": "ci.yml",
     "lint": "loopback-bindings-lint.yml",
     "verify": "ci.yml",
     "pages": "pages.yml",
@@ -265,6 +269,28 @@ def package_workflow(repo, entry):
     return {"name": "CI/CD", "on": GATED_TRIGGERS, "jobs": jobs}, ""
 
 
+def image_workflow(repo, entry):
+    """A pull request may build, so a review covers what will ship, but never holds the push token."""
+    gates = gate_jobs(repo, entry)
+    job = {"needs": needing(list(gates))}
+    if not entry.get("image_on_pull_request", False):
+        job["if"] = "github.event_name != 'pull_request'"
+    job.update({
+        "runs-on": runs_on("heavy"),
+        "timeout-minutes": entry["image_timeout"],
+        "steps": [CHECKOUT, {
+            "name": "Build, and publish from main",
+            "env": {
+                "PUBLISH": f"${{{{ {ON_MAIN} && github.event_name != 'pull_request' }}}}",
+                "GHCR_WRITE_TOKEN": "${{ github.event_name != 'pull_request' && secrets.GHCR_WRITE_TOKEN || '' }}",
+            },
+            "run": BUILD_IMAGE,
+        }],
+    })
+    workflow = {"name": "CI", "on": GATED_TRIGGERS, "defaults": RUN_DEFAULTS, "jobs": {**gates, "image": job}}
+    return workflow, note_comment(entry["note"])
+
+
 def publish_step(site_dir):
     return {
         "name": "Publish",
@@ -348,6 +374,8 @@ def render_repo(repo, entry, deploy_step_run):
         workflow, note = service_workflow(repo, entry, deploy_step_run)
     elif family == "package":
         workflow, note = package_workflow(repo, entry)
+    elif family == "image":
+        workflow, note = image_workflow(repo, entry)
     elif family == "verify":
         workflow, note = verify_workflow(repo, entry)
     elif family == "pages":
