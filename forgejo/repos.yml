@@ -678,3 +678,56 @@ hermes-image:
         run: bash .forgejo/test-patches.sh
   image_timeout: 45
   image_on_pull_request: true
+katha:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      # The image is built only after a release is cut, so an include_str! the Dockerfile does not
+      # COPY would publish a version with no image (KAT-2).
+      - name: Docker builder context compiles
+        run: scripts/check-docker-context.sh
+    advisories:
+      class: medium
+      timeout: 15
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Advisories
+        run: cargo deny check advisories
+    # GitHub Pages stays where it is, frozen at its last deploy, until David picks the docs site's
+    # address (HL-723). Until then a broken docs change still fails here.
+    # Heavy, not medium: katha's medium-class peak reads 10 GB in docs/ci-capacity.md with no job label,
+    # and the docs build is the likeliest source, which a medium job's 2G MemoryMax would not hold.
+    docs:
+      class: heavy
+      timeout: 15
+      steps:
+      - checkout
+      - name: Install
+        run: cd docs && npm ci --no-audit --no-fund
+      - name: Build
+        run: cd docs && npm run build
+  image_timeout: 45
+  # LAN only: srv-media's webhook binds this address, and every arm64 medium client reaches it.
+  deploy_url: http://192.168.1.20:3005/deploy

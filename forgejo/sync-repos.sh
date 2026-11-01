@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render every repo in repos.yml into <clones>/<repo>/.forgejo/workflows/ (HL-711).
 #   sync-repos.sh <clones-dir>          write the files
-#   sync-repos.sh --check <clones-dir>  exit 1 if any file differs from its render
+#   sync-repos.sh --check <clones-dir>  exit 1 if any file differs from its render, or a build script it names is missing
 # Re-run after any change to repos.yml or render_repo.py, and after deploy.yml's webhook step moves v1.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +20,11 @@ while read -r repo workflow; do
   target="$dir/.forgejo/workflows/$workflow"
   if $check; then
     if [ "$(cat "$target" 2>/dev/null)" != "$want" ]; then echo "stale: $target"; stale=1; fi
+    # The render names this script without carrying it. Without it a release tags a version and then
+    # fails to build its image, and nothing short of the first release would show that.
+    if grep -q '\.forgejo/build-image\.sh' <<< "$want" && [ ! -x "$dir/.forgejo/build-image.sh" ]; then
+      echo "no build script: $dir/.forgejo/build-image.sh"; stale=1
+    fi
   else
     mkdir -p "$(dirname "$target")"
     printf '%s\n' "$want" > "$target"

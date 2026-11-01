@@ -283,7 +283,17 @@ export RENDER_REF=HEAD
 repos="$(python3 "$ROOT/forgejo/render_repo.py" --list | cut -d' ' -f1)"
 for repo in $repos; do mkdir -p "$WORK/$repo/.git"; done
 "$ROOT/forgejo/sync-repos.sh" "$WORK" > /dev/null
+needs_script="$(grep -l 'forgejo/build-image\.sh' "$WORK"/*/.forgejo/workflows/* | sed -E 's|/\.forgejo/.*||')"
+[ -n "$needs_script" ] || { echo "FAIL: no repo renders the build script, so the check below proves nothing"; exit 1; }
+for dir in $needs_script; do printf '#!/bin/sh\n' > "$dir/.forgejo/build-image.sh"; chmod +x "$dir/.forgejo/build-image.sh"; done
 "$ROOT/forgejo/sync-repos.sh" --check "$WORK"
+script_victim="$(printf '%s\n' $needs_script | head -1)"
+chmod -x "$script_victim/.forgejo/build-image.sh"
+if "$ROOT/forgejo/sync-repos.sh" --check "$WORK" > "$WORK/out"; then
+  echo "FAIL: --check passed a repo whose build script cannot run"; exit 1
+fi
+grep -q "no build script: $script_victim/" "$WORK/out" || { echo "FAIL: --check did not name the missing build script"; exit 1; }
+chmod +x "$script_victim/.forgejo/build-image.sh"
 victim="$(printf '%s\n' $repos | head -1)"
 echo "# by hand" >> "$WORK/$victim/.forgejo/workflows/ci.yml"
 if "$ROOT/forgejo/sync-repos.sh" --check "$WORK" > "$WORK/out"; then
@@ -294,4 +304,4 @@ rm -rf "$WORK/$victim"
 if "$ROOT/forgejo/sync-repos.sh" --check "$WORK" > /dev/null 2>&1; then
   echo "FAIL: a missing clone passed"; exit 1
 fi
-echo "ok: sync-repos.sh writes the table, and --check names a hand edit and refuses a missing clone"
+echo "ok: sync-repos.sh writes the table, and --check names a hand edit, a missing build script and refuses a missing clone"
