@@ -715,8 +715,8 @@ katha:
       - checkout
       - name: Advisories
         run: cargo deny check advisories
-    # GitHub Pages stays where it is, frozen at its last deploy, until David picks the docs site's
-    # address (HL-723). Until then a broken docs change still fails here.
+    # A broken docs change fails here on a pull request and holds a release back; publish-site below
+    # puts main's docs live.
     # Heavy, not medium: katha's medium-class peak reads 10 GB in docs/ci-capacity.md with no job label,
     # and the docs build is the likeliest source, which a medium job's 2G MemoryMax would not hold.
     docs:
@@ -731,3 +731,29 @@ katha:
   image_timeout: 45
   # LAN only: srv-media's webhook binds this address, and every arm64 medium client reaches it.
   deploy_url: http://192.168.1.20:3005/deploy
+  # katha.pages.lepaux.com, the forge's GitHub Pages replacement (homelab HL-675, HL-736). Heavy as the
+  # docs gate is.
+  site:
+    class: heavy
+    timeout: 15
+    steps:
+    - checkout
+    - full-history
+    - name: Install
+      run: cd docs && npm ci --no-audit --no-fund
+    - name: Build
+      run: |
+        cd docs && npm run build
+        git rev-parse HEAD > .vitepress/dist/revision.txt
+    dir: docs/.vitepress/dist
+    # A 200 alone could be the previous release, so the site proves the commit it serves.
+    served:
+      name: Served
+      env:
+        SHA: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        served="$(curl -fsS --retry 3 https://katha.pages.lepaux.com/revision.txt)"
+        [ "$served" = "$SHA" ] || {
+          echo "::error::katha.pages.lepaux.com serves commit $served, not this run's $SHA"; exit 1; }
+        echo "serving $served"

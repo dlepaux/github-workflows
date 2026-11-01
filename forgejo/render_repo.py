@@ -38,7 +38,7 @@ CLASSES = ("heavy", "medium")
 GATE_REQUIRED = {"class", "timeout", "steps"}
 GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {
-    "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke"},
+    "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke", "site"},
     "package": {"family", "gates", "release_install", "release_env"},
     "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request"},
     "lint": {"family"},
@@ -77,6 +77,14 @@ RUN_DEFAULTS = {"run": {"shell": "bash -e {0}"}}
 # boundary: a run takes the workflow from the pull request's head, and only the owner and Renovate push.
 ON_MAIN = "github.ref == 'refs/heads/main'"
 EDGE = "static-sites@82.112.240.209"
+# The pinned checkout is 50 commits deep. VitePress dates a page, and its sitemap entry, from the
+# commit that last touched it, so past that depth the boundary commit's date moves with every push.
+# A huge depth rather than --unshallow, which refuses a repo that fits in 50 commits.
+FULL_HISTORY_STEP = {
+    "name": "Fetch the whole history (plain git)",
+    "env": {**GIT_AUTH, "REPO_URL": CHECKOUT["env"]["REPO_URL"], "REF": CHECKOUT["env"]["REF"]},
+    "run": 'git fetch -q --depth=2147483647 "$REPO_URL" "+$REF:refs/remotes/origin/ref"\n',
+}
 OPENSCAD_VERSION = "2026.04.26"
 # sha256 of OpenSCAD-2026.04.26-WebAssembly-node.zip, read 2026-10-30; bump both together.
 OPENSCAD_SHA256 = "cffe65689337f0ed16b3577545c53372ac556fe6e0ab582d481670602e39bfe8"
@@ -191,7 +199,7 @@ def gate_job(repo, gate_id, gate):
     checked_keys(f"{repo}/{gate_id}", gate, GATE_KEYS, GATE_REQUIRED)
     if gate["steps"].count("checkout") != 1:
         raise RenderError(f"{repo}/{gate_id}: a gate takes exactly one checkout")
-    named = {"checkout": CHECKOUT, "openscad": OPENSCAD_STEP}
+    named = {"checkout": CHECKOUT, "full-history": FULL_HISTORY_STEP, "openscad": OPENSCAD_STEP}
     steps = [named[s] if isinstance(s, str) else s for s in gate["steps"]]
     job = {"runs-on": runs_on(gate["class"]), "timeout-minutes": gate["timeout"]}
     env = {**gate.get("env", {}), **(OPENSCAD_ENV if "openscad" in gate["steps"] else {})}
@@ -385,6 +393,8 @@ def service_workflow(repo, entry, deploy_step_run):
         }
     if "deploy_url" in entry:
         jobs["deploy"] = deploy_job(deploy_step_run, entry["deploy_url"])
+    if "site" in entry:
+        jobs["publish-site"] = site_job(repo, entry["site"])
     triggers = {**GATED_TRIGGERS, "schedule": [{"cron": "0 4 * * 1"}]}
     return {"name": "CI/CD", "on": triggers, "jobs": jobs}, SERVICE_NOTE
 
@@ -441,6 +451,14 @@ def publish_step(site_dir):
             f"  {EDGE}\n"
         ),
     }
+
+
+def site_job(repo, site):
+    """A service's docs: its own job, so an edge that refuses the upload never holds a release back."""
+    checked_keys(f"{repo}/site", site, GATE_KEYS | {"dir", "served"}, GATE_REQUIRED | {"dir", "served"})
+    job = gate_job(repo, "site", {k: v for k, v in site.items() if k in GATE_KEYS})
+    job["steps"] = job["steps"] + [publish_step(site["dir"]), {**site["served"], "if": ON_MAIN}]
+    return {"if": ON_MAIN, **job}
 
 
 def note_comment(note):

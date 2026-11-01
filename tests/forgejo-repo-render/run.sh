@@ -70,7 +70,7 @@ for repo, wf in rendered.items():
     jobs = wf["jobs"]
     if "release" not in jobs:
         continue
-    gates = [j for j in jobs if plain(j) not in ("release", "docker", "rebuild", "deploy", "image", "smoke")]
+    gates = [j for j in jobs if plain(j) not in ("release", "docker", "rebuild", "deploy", "image", "smoke", "publish-site")]
     needs = jobs["release"].get("needs", [])
     needs = [needs] if isinstance(needs, str) else needs
     check(f"{repo}: release waits for every gate", sorted(needs) == sorted(gates))
@@ -112,6 +112,7 @@ PUBLISHERS = {
     "smoke": "needs.release.outputs.version != ''",
     "rebuild": "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
     "deploy": None,
+    "publish-site": "github.ref == 'refs/heads/main'",
 }
 LINT_ON = {
     "push": {"branches": ["main"], "paths": [
@@ -151,6 +152,46 @@ for repo, wf in rendered.items():
     check(f"{repo}: only the guarded steps hold a secret", "secrets." not in yaml.safe_dump({**job, "steps": built}))
     check(f"{repo}: uploads what it built", f"tar -cz -C {table[repo]['site_dir']} ." in guarded[0]["run"])
     check(f"{repo}: the key is never in argv", "printf '%s\\n' \"$DEPLOY_KEY\"" in guarded[0]["run"])
+
+# A service's docs publish on main only, and a release never waits for them.
+for repo, wf in rendered.items():
+    if "site" not in table[repo]:
+        continue
+    job = wf["jobs"]["publish-site"]
+    check(f"{repo}: publish and served close its site job", [s["name"] for s in job["steps"][-2:]] == ["Publish", "Served"])
+    check(f"{repo}: its site uploads what it built", f"tar -cz -C {table[repo]['site']['dir']} ." in job["steps"][-2]["run"])
+    check(f"{repo}: only the publish step holds a secret", "secrets." not in yaml.safe_dump({**job, "steps": job["steps"][:-2]}))
+    check(f"{repo}: a release does not wait for its site", "publish-site" not in wf["jobs"]["release"]["needs"])
+    names = [s["name"] for s in job["steps"]]
+    check(f"{repo}: its site dates pages from the whole history",
+          names.index(rr.FULL_HISTORY_STEP["name"]) == names.index(rr.CHECKOUT["name"]) + 1)
+
+# A page last touched past the checkout's depth keeps its own commit once the history step ran, and
+# the step does not refuse a repo that already fits in that depth.
+with tempfile.TemporaryDirectory() as tmp:
+    def git(cwd, *args, **env):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd, check=True,
+                              text=True, capture_output=True, env={**os.environ, **env}).stdout.strip()
+    def step(step_def, cwd):
+        return subprocess.run(["bash", "-c", step_def["run"]], cwd=cwd, text=True, capture_output=True, env={
+            **os.environ, "REPO_URL": f"file://{tmp}/src", "REF": "refs/heads/main", "SHA": git(f"{tmp}/src", "rev-parse", "HEAD")})
+    os.makedirs(f"{tmp}/src")
+    git(f"{tmp}/src", "init", "-q", "-b", "main")
+    open(f"{tmp}/src/page.md", "w").close()
+    git(f"{tmp}/src", "add", "page.md")
+    git(f"{tmp}/src", "commit", "-qm", "page", GIT_COMMITTER_DATE="2020-01-01T00:00:00Z")
+    page_commit = git(f"{tmp}/src", "rev-parse", "HEAD")
+    os.makedirs(f"{tmp}/small")
+    check("the checkout takes a repo that fits in its depth", step(rr.CHECKOUT, f"{tmp}/small").returncode == 0)
+    check("the history step does not refuse one", step(rr.FULL_HISTORY_STEP, f"{tmp}/small").returncode == 0)
+    for i in range(60):
+        git(f"{tmp}/src", "commit", "-q", "--allow-empty", "-m", str(i))
+    os.makedirs(f"{tmp}/big")
+    check("the checkout takes a deep repo", step(rr.CHECKOUT, f"{tmp}/big").returncode == 0)
+    check("the shallow checkout loses the page's commit (the bug this step fixes)",
+          git(f"{tmp}/big", "log", "-1", "--format=%H", "--", "page.md") != page_commit)
+    check("the history step fetches", step(rr.FULL_HISTORY_STEP, f"{tmp}/big").returncode == 0)
+    check("the page dates from its own commit", git(f"{tmp}/big", "log", "-1", "--format=%H", "--", "page.md") == page_commit)
 
 # These scripts were written against GitHub's shell, without pipefail.
 for repo, wf in rendered.items():
@@ -255,6 +296,11 @@ refuses("a package key on a service", service, {**table[service], "release_insta
 pages = next(r for r, e in table.items() if e["family"] == "pages")
 refuses("a site with no served proof", pages, {k: v for k, v in table[pages].items() if k != "served"}, "missing")
 refuses("a site split over two jobs", pages, {**table[pages], "gates": {**table[pages]["gates"], "extra": table[pages]["gates"]["publish"]}}, "one job")
+sited = next(r for r, e in table.items() if "site" in e)
+refuses("a service's site with no served proof", sited,
+        {**table[sited], "site": {k: v for k, v in table[sited]["site"].items() if k != "served"}}, "missing")
+refuses("a service's site with no directory", sited,
+        {**table[sited], "site": {k: v for k, v in table[sited]["site"].items() if k != "dir"}}, "missing")
 refuses("a lint repo with gates", lint, {"family": "lint", "gates": {}}, "does not carry")
 refuses("a service with no image timeout", service,
         {k: v for k, v in table[service].items() if k != "image_timeout"}, "missing")
