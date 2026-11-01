@@ -711,6 +711,9 @@ dinle:
     own hardware, and deploys after both: the app's start requeues failures, and the old worker must
     not spend the attempts on what the release fixed. A push with no release builds nothing, since
     srv-compute restarts on a new worker `latest` (a hand dispatch on main is that too).
+    A newer push cancels an older run, and this family has no rebuild to heal it: a release whose
+    images were cancelled ships with the next release, or by a hand dispatch while main is still on
+    its tag. Forgejo 15's queue can stall on a run with a skipped job (forgejo#14576), so none is set.
   gates:
     app:
       class: heavy

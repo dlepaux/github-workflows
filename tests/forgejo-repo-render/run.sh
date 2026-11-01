@@ -262,6 +262,11 @@ for repo, wf in rendered.items():
     for job_id in built:
         job = jobs[job_id]
         check(f"{repo}/{job_id}: follows the release", "release" in job["needs"])
+        check(f"{repo}/{job_id}: guard pinned", job["if"] == (
+            "always() && github.ref == 'refs/heads/main' && needs.app.result == 'success' && "
+            "needs.worker.result == 'success' && (github.event_name == 'workflow_dispatch' || "
+            "(github.event_name == 'push' && needs.release.result == 'success' && needs.release.outputs.version != ''))"
+        ))
         for gate in table[repo]["gates"]:
             check(f"{repo}/{job_id}: {gate} must be green", f"needs.{gate}.result == 'success'" in job["if"])
         check(f"{repo}/{job_id}: main only", "refs/heads/main" in job["if"])
