@@ -10,7 +10,8 @@ and its deploy target. A key this script does not know fails the render instead 
 Families:
   service  gates, then semantic-release, the image on a release, a weekly image rebuild, and
            optionally the deploy webhook. With multi_arch, each image is built natively per
-           architecture and merged into one manifest
+           architecture and merged into one manifest, and image_smoke runs against a release's
+           manifest on each architecture's own hardware
   package  gates, then semantic-release, which publishes the package
   image    gates, then the repo's own build script, publishing from main: no release and no rebuild
   lint     the fleet repos' loopback-binding check
@@ -37,7 +38,7 @@ CLASSES = ("heavy", "medium")
 GATE_REQUIRED = {"class", "timeout", "steps"}
 GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {
-    "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch"},
+    "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke"},
     "package": {"family", "gates", "release_install", "release_env"},
     "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request"},
     "lint": {"family"},
@@ -322,6 +323,36 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
     return {**legs, job_id: merge}
 
 
+def smoke_jobs(entry, docker_guard):
+    """A check of the published image, on each architecture's own hardware: no emulation stands in
+    for the binary a host will run. It holds a token only to pull, and logs in with its own config."""
+    return {
+        f"smoke-{arch}": {
+            "needs": ["release", "docker"],
+            "if": docker_guard["if"],
+            "runs-on": runs_on("heavy", arch),
+            "timeout-minutes": 10,
+            "steps": [{
+                "name": f"Smoke {platform}",
+                "env": {
+                    "IMAGE": "ghcr.io/${{ github.repository }}",
+                    "VERSION": "${{ needs.release.outputs.version }}",
+                    "PLATFORM": platform,
+                    "GHCR_WRITE_TOKEN": "${{ secrets.GHCR_WRITE_TOKEN }}",
+                },
+                "run": (
+                    "set -euo pipefail\n"
+                    + GHCR_LOGIN +
+                    """trap 'rm -rf "$DOCKER_CONFIG"' EXIT\n"""
+                    """printf '%s' "$GHCR_WRITE_TOKEN" | docker login ghcr.io -u dlepaux --password-stdin\n"""
+                    + entry["image_smoke"]
+                ),
+            }],
+        }
+        for arch, platform in IMAGE_PLATFORMS.items()
+    }
+
+
 def service_workflow(repo, entry, deploy_step_run):
     gates = gate_jobs(repo, entry)
     timeout = entry["image_timeout"]
@@ -331,8 +362,12 @@ def service_workflow(repo, entry, deploy_step_run):
     rebuild_guard = {"needs": "quality"} if "quality" in gates else {}
     # Named, not `!= 'push'`: a pull request must never publish :latest.
     rebuild_guard["if"] = "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+    if "image_smoke" in entry and not entry.get("multi_arch", False):
+        raise RenderError(f"{repo}: image_smoke needs multi_arch, whose legs it checks")
     if entry.get("multi_arch", False):
         jobs.update(multi_arch_jobs("docker", repo, entry, docker_guard, tag_checkout(), version=True))
+        if "image_smoke" in entry:
+            jobs.update(smoke_jobs(entry, docker_guard))
         jobs.update(multi_arch_jobs("rebuild", repo, entry, rebuild_guard, CHECKOUT, version=False))
     else:
         jobs["docker"] = {

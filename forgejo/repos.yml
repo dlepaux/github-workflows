@@ -121,6 +121,100 @@ image-update-exporter:
       - name: Security audit
         run: cargo deny check advisories
   image_timeout: 45
+epubarr:
+  family: service
+  multi_arch: true
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      env:
+        CARGO_TERM_COLOR: always
+        CARGO_INCREMENTAL: '0'
+        RUSTFLAGS: -D warnings
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Advisory, license, ban and source audit
+        run: cargo deny check
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      # The release writes the new version into Cargo.toml and Cargo.lock; a lock file it left
+      # inconsistent would fail the image build after the version is already published. Without
+      # --no-deps, cargo resolves the lock file, so --locked fails on a stale one; the crates are
+      # cached by the tests above, hence --offline.
+      - name: Release version bump keeps the lock file consistent
+        run: |
+          set -euo pipefail
+          scripts/bump-cargo-version.sh 0.0.0-check
+          cargo metadata --locked --offline --format-version 1 > .metadata.json
+          grep -q '"version":"0.0.0-check"' .metadata.json
+          git checkout -- Cargo.toml Cargo.lock
+    epubcheck:
+      class: heavy
+      timeout: 30
+      env:
+        CARGO_TERM_COLOR: always
+        EPUBCHECK_VERSION: 5.1.0
+        # Recorded from the release download on 2026-10-22; upstream publishes no checksum.
+        EPUBCHECK_SHA256: 74a59af8602bf59b1d04266a450d9cdcb5986e36d825adc403cde0d95e88c9e8
+        # No runner carries Java, and this one job needs it: Temurin 21's JRE, into the job's own
+        # workspace, which the runner discards. The sha is Adoptium's, read 2026-11-01.
+        JRE_URL: https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jre_aarch64_linux_hotspot_21.0.13_9.tar.gz
+        JRE_SHA256: b1734db7ade49c3f6acc6ae06233b8c2dd90e3e2f00f67000ae1c972aaa64d8c
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Install the JRE and epubcheck
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-delay 10 -o jre.tar.gz "$JRE_URL"
+          echo "$JRE_SHA256  jre.tar.gz" | sha256sum -c -
+          mkdir .jre && tar -xzf jre.tar.gz -C .jre --strip-components=1
+          curl -fsSL --retry 5 --retry-delay 10 -o epubcheck.zip \
+            "https://github.com/w3c/epubcheck/releases/download/v${EPUBCHECK_VERSION}/epubcheck-${EPUBCHECK_VERSION}.zip"
+          echo "$EPUBCHECK_SHA256  epubcheck.zip" | sha256sum -c -
+          python3 -I -m zipfile -e epubcheck.zip .
+      # A well-formed book and one of hostile markup; each test binary writes its own.
+      - name: Build the sample books
+        run: |
+          set -euo pipefail
+          mkdir .samples
+          EPUBARR_SAMPLE_OUT="$PWD/.samples" cargo test --locked \
+            --test convert --test hostile --test kf8 writes_the_sample_book_for_epubcheck
+          test "$(find .samples -name '*.epub' | wc -l)" -eq 3
+      # --failonwarnings: a warning today is a reader rendering bug tomorrow.
+      - name: Validate
+        run: |
+          set -euo pipefail
+          for book in .samples/*.epub; do
+            echo "$book"
+            .jre/bin/java -jar "epubcheck-${EPUBCHECK_VERSION}/epubcheck.jar" --failonwarnings "$book"
+          done
+  image_timeout: 45
+  image_smoke: |
+    printed=$(docker run --rm --pull always --platform "$PLATFORM" "$IMAGE:$VERSION" --version)
+    label=$(docker image inspect "$IMAGE:$VERSION" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+    echo "$PLATFORM: $printed, label $label"
+    [ "$printed" = "epubarr $VERSION" ] || { echo "::error::$PLATFORM prints '$printed'"; exit 1; }
+    [ "$label" = "$VERSION" ] || { echo "::error::$PLATFORM is labelled '$label'"; exit 1; }
+    minor=$(docker buildx imagetools inspect "$IMAGE:${VERSION%.*}" --format '{{ json .Manifest.Digest }}')
+    patch=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{ json .Manifest.Digest }}')
+    [ "$minor" = "$patch" ] || { echo "::error::${VERSION%.*} is not $VERSION"; exit 1; }
 protomaps-docker:
   family: service
   image_timeout: 30

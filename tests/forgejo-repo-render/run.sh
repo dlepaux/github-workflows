@@ -70,7 +70,7 @@ for repo, wf in rendered.items():
     jobs = wf["jobs"]
     if "release" not in jobs:
         continue
-    gates = [j for j in jobs if plain(j) not in ("release", "docker", "rebuild", "deploy", "image")]
+    gates = [j for j in jobs if plain(j) not in ("release", "docker", "rebuild", "deploy", "image", "smoke")]
     needs = jobs["release"].get("needs", [])
     needs = [needs] if isinstance(needs, str) else needs
     check(f"{repo}: release waits for every gate", sorted(needs) == sorted(gates))
@@ -107,6 +107,7 @@ for repo, wf in rendered.items():
 PUBLISHERS = {
     "release": "github.event_name == 'push'",
     "docker": "needs.release.outputs.version != ''",
+    "smoke": "needs.release.outputs.version != ''",
     "rebuild": "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
     "deploy": None,
 }
@@ -203,6 +204,15 @@ refused = subprocess.run(["bash", "-c", rr.MERGE_LEGS], text=True, capture_outpu
 })
 check("the manifest is checked before any tag moves",
       rr.MERGE_LEGS.index("--dry-run") < rr.MERGE_LEGS.index('create "${tags[@]}"'))
+smoke_entry = {**table[arch_repo], "multi_arch": True, "image_smoke": "true\n"}
+smoke_wf = yaml.safe_load(rr.render_repo(arch_repo, smoke_entry, DEPLOY))
+for arch, labels in (("arm64", "arm64"), ("x64", "x64")):
+    job = smoke_wf["jobs"][f"smoke-{arch}"]
+    check(f"smoke-{arch} runs on its own hardware", job["runs-on"] == ["self-hosted", labels, "ci-heavy"])
+    check(f"smoke-{arch} follows the manifest", job["needs"] == ["release", "docker"])
+    check(f"the smoke script parses ({arch})",
+          subprocess.run(["bash", "-n"], input=job["steps"][0]["run"], text=True).returncode == 0)
+refuses("a smoke with no manifest to check", arch_repo, {**table[arch_repo], "image_smoke": "true\n"}, "needs multi_arch")
 refuses("multi_arch with image_env", arch_repo, {**table[arch_repo], "multi_arch": True, "image_env": {"X": "1"}}, "image_env")
 check("a missing digest stops the merge before any login", refused.returncode == 1 and "left no digest" in refused.stdout)
 
