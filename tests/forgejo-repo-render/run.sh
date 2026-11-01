@@ -142,6 +142,9 @@ for repo, wf in rendered.items():
             pinned = {
                 **({"rebuild": EVERY_PUSH_REBUILD} if table[repo].get("image_on_every_push") else {}),
                 **({"deploy": DEPLOY_REBUILD} if table[repo].get("deploy_rebuild") else {}),
+                # The image job's PUBLISH condition: a pull request's or a branch's build is never published.
+                **({"deploy": "github.ref == 'refs/heads/main' && github.event_name != 'pull_request'"}
+                   if table[repo]["family"] == "image" else {}),
             }
             check(f"{repo}/{job_id}: guard pinned", job.get("if") == pinned.get(plain(job_id), PUBLISHERS[plain(job_id)]))
         elif table[repo]["family"] == "image" and job_id == "image":
@@ -225,6 +228,7 @@ for repo, wf in rendered.items():
     check(f"{repo}: deploy matches the table", (deploy is not None) == ("deploy_url" in table[repo]))
     if deploy:
         expected = ["docker", "rebuild"] if table[repo].get("deploy_rebuild") else "docker"
+        expected = "image" if table[repo]["family"] == "image" else expected
         check(f"{repo}: deploy follows the image", deploy["needs"] == expected)
         check(f"{repo}: deploy runs deploy.yml's step", deploy["steps"][0]["run"] == DEPLOY)
 

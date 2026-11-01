@@ -41,7 +41,7 @@ FAMILY_KEYS = {
     "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke", "site",
                 "image_arch", "image_on_every_push", "deploy_rebuild"},
     "package": {"family", "gates", "release_install", "release_env"},
-    "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request"},
+    "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request", "deploy_url"},
     "lint": {"family"},
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
@@ -460,7 +460,7 @@ def package_workflow(repo, entry):
     return {"name": "CI/CD", "on": GATED_TRIGGERS, "jobs": jobs}, ""
 
 
-def image_workflow(repo, entry):
+def image_workflow(repo, entry, deploy_step_run):
     """A pull request may build, so a review covers what will ship, but never holds the push token."""
     gates = gate_jobs(repo, entry)
     job = {"needs": needing(list(gates))}
@@ -478,7 +478,15 @@ def image_workflow(repo, entry):
             "run": BUILD_IMAGE,
         }],
     })
-    workflow = {"name": "CI", "on": GATED_TRIGGERS, "defaults": RUN_DEFAULTS, "jobs": {**gates, "image": job}}
+    jobs = {**gates, "image": job}
+    if "deploy_url" in entry:
+        # The same condition as PUBLISH: what the image job did not publish must not be deployed.
+        jobs["deploy"] = {
+            **deploy_job(deploy_step_run, entry["deploy_url"]),
+            "needs": "image",
+            "if": f"{ON_MAIN} && github.event_name != 'pull_request'",
+        }
+    workflow = {"name": "CI", "on": GATED_TRIGGERS, "defaults": RUN_DEFAULTS, "jobs": jobs}
     return workflow, note_comment(entry["note"])
 
 
@@ -574,7 +582,7 @@ def render_repo(repo, entry, deploy_step_run):
     elif family == "package":
         workflow, note = package_workflow(repo, entry)
     elif family == "image":
-        workflow, note = image_workflow(repo, entry)
+        workflow, note = image_workflow(repo, entry, deploy_step_run)
     elif family == "verify":
         workflow, note = verify_workflow(repo, entry)
     elif family == "pages":

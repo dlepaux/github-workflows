@@ -662,6 +662,48 @@ shelfwright:
       - name: Test
         run: cargo test --locked
   image_timeout: 45
+chat-model:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+  image_timeout: 60
+  multi_arch: true
+curatarr:
+  family: image
+  note: |-
+    verify lints and tests. image builds the standalone bundle on the runner and packages it, on pull
+    requests too, so its sharp gate judges a change before it merges; main pushes :latest and deploys.
+  gates:
+    verify:
+      class: heavy
+      timeout: 20
+      steps:
+      - checkout
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test
+  image_timeout: 30
+  image_on_pull_request: true
+  deploy_url: https://apps.webhook.lepaux.com/deploy
 hermes-image:
   family: image
   note: |-
