@@ -34,7 +34,9 @@ from render import CHECKOUT, GIT_AUTH, RELEASE_CHECKOUT, BlockDumper, RenderErro
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEMANTIC_RELEASE = "node /usr/local/lib/ci-toolchain/semantic-release/forge-release.mjs"
 BUILD_IMAGE = ".forgejo/build-image.sh"
-CLASSES = ("heavy", "medium")
+# large is a heavy job on the bigger reservation (docs/ci-capacity.md in homelab): arm64 only, and only
+# for a repo measured past lean's, as its own label is what routes it to that Nomad job.
+CLASSES = ("heavy", "medium", "large")
 GATE_REQUIRED = {"class", "timeout", "steps"}
 GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {

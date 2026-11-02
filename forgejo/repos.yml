@@ -911,3 +911,92 @@ dlepaux.github.io:
   image_timeout: 60
   deploy_url: https://webhook.lepaux.com/deploy
   deploy_rebuild: true
+
+getshortlisted-emails:
+  family: package
+  gates:
+    quality:
+      class: heavy
+      timeout: 15
+      env:
+        HUSKY: "0"
+      steps:
+      - checkout
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Type check
+        run: npm run lint:types
+      - name: Test
+        run: npm run test
+      - name: Build templates
+        run: npm run build
+
+getshortlisted-www:
+  family: service
+  gates:
+    quality:
+      class: heavy
+      timeout: 40
+      env:
+        HUSKY: "0"
+      steps:
+      - checkout
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Grep-based lints
+        run: bash .forgejo/grep-lints.sh
+      - name: Build brand assets
+        run: npm run build:brand
+      # Tokens, print CSS, icons and grain are committed, so a brand change that forgets to
+      # regenerate them would otherwise ship stale.
+      - name: Brand assets match their source
+        run: git diff --exit-code
+      - name: Type check
+        run: npm run lint:types
+      - name: Lint
+        run: npm run lint
+      - name: Translation check
+        run: npm run lint:translations
+      - name: Test + coverage
+        run: npm run test -- --coverage
+      - name: Build
+        run: npm run build:consent && npm run build
+      - name: CV PDF check (GS-4)
+        run: bash .forgejo/cv-pdf.sh
+      - name: Security audit
+        run: npm audit --audit-level=high --omit=dev
+    trivy:
+      class: medium
+      timeout: 15
+      steps:
+      - checkout
+      - name: Trivy fs scan
+        run: bash .forgejo/trivy.sh
+  image_arch: x64
+  image_timeout: 60
+  deploy_url: https://webhook.lepaux.com/deploy
+  deploy_rebuild: true
+
+getshortlisted-api:
+  family: service
+  gates:
+    quality:
+      class: large
+      timeout: 80
+      steps:
+      - checkout
+      - name: Migrations, lints, Clippy, coverage and cargo-deny against Postgres
+        run: bash .forgejo/gate.sh
+    trivy:
+      class: medium
+      timeout: 15
+      steps:
+      - checkout
+      - name: Trivy fs scan
+        run: bash .forgejo/trivy.sh
+  image_arch: x64
+  image_timeout: 60
+  deploy_url: https://webhook.lepaux.com/deploy
+  deploy_rebuild: true

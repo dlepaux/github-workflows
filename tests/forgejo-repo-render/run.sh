@@ -447,7 +447,7 @@ for name, mutate, word in [
     ("a gate with two checkouts", lambda g: g["steps"].append("checkout"), "exactly one checkout"),
     ("a gate with an unknown key", lambda g: g.update(needs="x"), "does not carry"),
     ("a gate with no timeout", lambda g: g.pop("timeout"), "missing"),
-    ("a gate on an unknown class", lambda g: g.update({"class": "large"}), "unknown job class"),
+    ("a gate on an unknown class", lambda g: g.update({"class": "huge"}), "unknown job class"),
 ]:
     entry = copy.deepcopy(table[service])
     mutate(next(iter(entry["gates"].values())))
