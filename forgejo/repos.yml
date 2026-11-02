@@ -1000,3 +1000,25 @@ getshortlisted-api:
   image_timeout: 60
   deploy_url: https://webhook.lepaux.com/deploy
   deploy_rebuild: true
+
+vps-edge:
+  family: verify
+  note: |-
+    ufw does NOT govern Docker-published ports on this host, as Docker's own rules run ahead of ufw's
+    INPUT chain: a `ports:` line in a compose file IS the firewall, and this lint is what reviews it.
+    It deliberately does not run `nginx -t`: that stats every ssl_certificate path, which do not exist
+    outside the host, so it would fail for a reason that has nothing to do with the config.
+  gates:
+    lint:
+      class: medium
+      timeout: 10
+      steps:
+      - checkout
+      # Every published port must be loopback- or tunnel-bound, or allowlisted with a stated reason.
+      - name: Loopback binding lint
+        run: bash scripts/check-loopback-bindings.sh
+      - name: Loopback binding lint tests
+        run: bash scripts/test-check-loopback-bindings.sh
+      # A variable referenced in compose but missing from .env.example fails here, not at deploy.
+      - name: Compose validity + .env.example drift
+        run: bash scripts/check-compose-validity.sh
