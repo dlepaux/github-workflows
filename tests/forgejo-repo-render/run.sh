@@ -105,7 +105,7 @@ for repo, wf in rendered.items():
             check(f"{repo}: a rebuild waits for every gate and the release", sorted(rebuild_needs) == sorted([*gates, "release"]))
             continue
         check(f"{repo}: a rebuild runs only on the schedule or by hand",
-              jobs["rebuild"]["if"] == "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'")
+              jobs["rebuild"]["if"] == "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')")
         check(f"{repo}: a rebuild waits for every gate", sorted(rebuild_needs) == sorted(gates))
 
 # A pull request gets gates and nothing that publishes; a host repo gets no check at all, which is
@@ -115,13 +115,13 @@ PUBLISHERS = {
     "release": "github.event_name == 'push'",
     "docker": "needs.release.outputs.version != ''",
     "smoke": "needs.release.outputs.version != ''",
-    "rebuild": "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+    "rebuild": "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')",
     "deploy": None,
     "publish-site": "github.ref == 'refs/heads/main'",
 }
 EVERY_PUSH_REBUILD = (
     "always() && needs.quality.result == 'success' && (github.event_name == 'schedule' || "
-    "github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && "
+    "(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && "
     "needs.release.result == 'success' && needs.release.outputs.version == ''))"
 )
 DEPLOY_REBUILD = "always() && (needs.docker.result == 'success' || needs.rebuild.result == 'success')"
@@ -385,10 +385,10 @@ check("every push: deploy follows either build", every_wf["jobs"]["deploy"]["nee
       and "needs.docker.result == 'success' || needs.rebuild.result == 'success'" in every_wf["jobs"]["deploy"]["if"])
 
 
-def guard_is(expr, event, quality, release, version):
+def guard_is(expr, event, quality, release, version, ref="refs/heads/main"):
     """The guard's truth for one run: the expression is only these names, `&&`, `||` and parentheses."""
     for word, value in (
-        ("github.event_name", repr(event)), ("needs.quality.result", repr(quality)),
+        ("github.event_name", repr(event)), ("github.ref", repr(ref)), ("needs.quality.result", repr(quality)),
         ("needs.release.result", repr(release)), ("needs.release.outputs.version", repr(version)),
         ("always()", "True"), ("&&", " and "), ("||", " or "),
     ):
@@ -410,6 +410,11 @@ for event, quality, release, version, builds in (
 ):
     check(f"every push guard: {event} quality={quality} release={release} version={version!r} -> {builds}",
           guard_is(guard, event, quality, release, version) is builds)
+check("every push guard: a dispatch on a branch builds nothing",
+      guard_is(guard, "workflow_dispatch", "success", "skipped", "", ref="refs/heads/forge-ci") is False)
+# Read from Forgejo's action_run: a schedule's ref is `main`, where a dispatch's is refs/heads/main.
+check("every push guard: a schedule builds on its bare ref",
+      guard_is(guard, "schedule", "success", "skipped", "", ref="main") is True)
 # A queue strands its first job until ci-dispatch can retry one (HL-738).
 for repo, wf in rendered.items():
     check(f"{repo}: no queue yet", "concurrency" not in wf)

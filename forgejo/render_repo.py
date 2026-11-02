@@ -85,6 +85,10 @@ RUN_DEFAULTS = {"run": {"shell": "bash -e {0}"}}
 # A pull request's ref is refs/pull/N/head, so a build there cannot publish by mistake. It is no
 # boundary: a run takes the workflow from the pull request's head, and only the owner and Renovate push.
 ON_MAIN = "github.ref == 'refs/heads/main'"
+# A dispatch names any branch, and a rebuild moves :latest and deploys, so it is held to main (HL-747).
+# A schedule is not: it only fires on the default branch, and Forgejo gives it the ref bare, `main`,
+# so ON_MAIN would silently skip every weekly rebuild.
+REBUILD_EVENTS = f"github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && {ON_MAIN})"
 TAG_PUSH = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
 EDGE = "static-sites@82.112.240.209"
 # The pinned checkout is 50 commits deep. VitePress dates a page, and its sitemap entry, from the
@@ -381,13 +385,14 @@ def every_push_guard(gates):
 
     `always()` because release is skipped on a schedule or a dispatch, and a skipped need otherwise skips
     this job; the gates are then named, so it still cannot publish past a red one. Named events, as a
-    pull request must never publish :latest. A release's own commit is the docker job's.
+    pull request must never publish :latest, and main only, as a dispatch names any branch. A release's
+    own commit is the docker job's.
     """
     green = " && ".join(f"needs.{g}.result == 'success'" for g in gates)
     return {
         "needs": list(gates) + ["release"],
         "if": (
-            f"always() && {green} && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+            f"always() && {green} && ({REBUILD_EVENTS}"
             " || (github.event_name == 'push' && needs.release.result == 'success'"
             " && needs.release.outputs.version == ''))"
         ),
@@ -403,7 +408,7 @@ def service_workflow(repo, entry, deploy_step_run):
     # Every gate, as for a release: a rebuild moves :latest too, so it may not publish past a red one.
     rebuild_guard = {"needs": needing(list(gates))} if gates else {}
     # Named, not `!= 'push'`: a pull request must never publish :latest.
-    rebuild_guard["if"] = "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
+    rebuild_guard["if"] = REBUILD_EVENTS
     if "image_smoke" in entry and not entry.get("multi_arch", False):
         raise RenderError(f"{repo}: image_smoke needs multi_arch, whose legs it checks")
     if entry.get("multi_arch", False) and "image_arch" in entry:
