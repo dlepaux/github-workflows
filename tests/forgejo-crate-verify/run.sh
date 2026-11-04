@@ -211,6 +211,39 @@ check("the job token's header is scoped to the forge",
 refuses_primary("release: a changed cargo-edit step", lambda wf: wf["jobs"]["release"]["steps"][3].__setitem__(
     "run", "curl -s x | sh"))
 
+# HL-798: a primary crate's nightly and a dispatch are their own file, without the release job, which
+# names a push and so only ever held a runner there to skip itself. Each file is the model's jobs,
+# untouched, for the model's triggers split in two.
+check("primary: two files", r.files(True) == ["ci.yml", "nightly.yml"])
+check("shadow: one file, the model", r.files(False) == ["ci.yml"]
+      and r.render(src_text, inputs(), "30 0 * * *", file="ci.yml") == out_text)
+split = {f: yaml.safe_load(r.render(src_text, inputs(), "30 0 * * *", primary=True, file=f)) for f in r.files(True)}
+ons = [set(wf["on"]) for wf in split.values()]
+check("split: each trigger in exactly one file", sorted(e for o in ons for e in o) == sorted(prim["on"]))
+check("split: each file keeps its triggers' values",
+      all(wf["on"][e] == prim["on"][e] for wf in split.values() for e in wf["on"]))
+check("split: a push or a pull request runs ci.yml", set(split["ci.yml"]["on"]) == {"push", "pull_request"})
+check("split: ci.yml is the model's jobs, release included", split["ci.yml"]["jobs"] == prim["jobs"])
+check("split: the schedule and a dispatch run nightly.yml", set(split["nightly.yml"]["on"]) == {"schedule", "workflow_dispatch"})
+check("split: nightly.yml has every check and no release",
+      split["nightly.yml"]["jobs"] == {j: v for j, v in prim["jobs"].items() if j != "release"})
+nightly_text = r.render(src_text, inputs(), "30 0 * * *", primary=True, file="nightly.yml")
+nightly_body = "".join(l for l in nightly_text.splitlines(True) if not l.startswith("#"))
+check("split: nothing in nightly.yml can publish",
+      all(w not in nightly_body for w in ("forge-release", "KELLNR_PUBLISH_TOKEN", "semantic-release")))
+check("split: no job in nightly.yml waits on a condition", all("if" not in j for j in split["nightly.yml"]["jobs"].values()))
+check("split: both files keep the name and the mail",
+      all(wf["name"] == prim["name"] and wf["enable-email-notifications"] is True for wf in split.values()))
+check("split: documented in the header", "split-nightly" in nightly_text.split("\nname:")[0])
+for name, kw in (("an unknown file", dict(primary=True, file="other.yml")),
+                 ("a shadow's nightly.yml", dict(primary=False, file="nightly.yml"))):
+    try:
+        r.render(src_text, inputs(), "30 0 * * *", **kw)
+    except r.RenderError:
+        check(f"refused: {name}", True)
+    else:
+        check(f"refused: {name}", False)
+
 print(f"render: {passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
 PY
@@ -220,7 +253,9 @@ ok() { pass=$((pass + 1)); }
 no() { fail=$((fail + 1)); echo "FAIL: $1"; }
 
 # Arguments are validated before anything is read.
-for bad in "Bad_Name 40 true x shadow" "demo forty true x shadow" "demo 40 yes x shadow" "demo 40 true x publish" "demo 40 true x"; do
+for bad in "Bad_Name 40 true x shadow ci.yml" "demo forty true x shadow ci.yml" "demo 40 yes x shadow ci.yml" \
+           "demo 40 true x publish ci.yml" "demo 40 true x shadow" "demo 40 true x shadow nightly.yml" \
+           "demo 40 true x primary other.yml" "--files publish"; do
   # shellcheck disable=SC2086
   if python3 "$ROOT/forgejo/render.py" $bad >/dev/null 2>&1; then no "accepted: $bad"; else ok; fi
 done
@@ -282,16 +317,26 @@ done < "$ROOT/forgejo/crates.tsv"
 export RENDER_REF=HEAD  # CI's checkout is shallow and carries no v1 tag
 if "$ROOT/forgejo/sync.sh" "$clones" >/dev/null; then ok; else no "sync.sh write"; fi
 if "$ROOT/forgejo/sync.sh" --check "$clones" >/dev/null; then ok; else no "--check after write"; fi
-# One nightly line for every crate (spec §1 Triggers): the in-flight cap serialises them.
-crons=$(grep -h -A1 'schedule:' "$clones"/*/.forgejo/workflows/ci.yml | grep cron | sed 's/^ *//' | sort -u)
+# HL-798: each crate's nightly is its own minute (schedule.py), and lives in nightly.yml alone.
+for dir in "$clones"/*/; do
+  repo=$(basename "$dir")
+  want="- cron: $(python3 "$ROOT/forgejo/schedule.py" "$repo" '*')"
+  got=$(grep -A1 'schedule:' "$dir/.forgejo/workflows/nightly.yml" | grep cron | sed 's/^ *//')
+  if [ "$got" = "$want" ]; then ok; else no "$repo: nightly is '$got', not '$want'"; fi
+  if grep -q 'schedule:' "$dir/.forgejo/workflows/ci.yml"; then no "$repo: ci.yml still carries a schedule"; else ok; fi
+done
+ncrons=$(cat "$clones"/*/.forgejo/workflows/nightly.yml | grep -c -- '- cron:')
 ncrates=$(find "$clones" -mindepth 1 -maxdepth 1 -type d | wc -l)
-nscheduled=$(grep -l -A1 'schedule:' "$clones"/*/.forgejo/workflows/ci.yml | wc -l)
-if [ "$crons" = "- cron: 30 0 * * *" ] && [ "$nscheduled" -eq "$ncrates" ]; then ok; else no "not one 00:30 line for every crate: $crons"; fi
+if [ "$ncrons" -eq "$ncrates" ]; then ok; else no "$ncrons nightly lines for $ncrates crates"; fi
 first=$(ls "$clones" | head -1)
-echo '# hand edit' >> "$clones/$first/.forgejo/workflows/ci.yml"
-if out=$("$ROOT/forgejo/sync.sh" --check "$clones"); then no "--check missed a hand edit"; else
-  case "$out" in *"stale: $clones/$first/"*) ok ;; *) no "--check named the wrong file: $out" ;; esac
-fi
+for workflow in ci.yml nightly.yml; do
+  cp "$clones/$first/.forgejo/workflows/$workflow" "$WORK/saved"
+  echo '# hand edit' >> "$clones/$first/.forgejo/workflows/$workflow"
+  if out=$("$ROOT/forgejo/sync.sh" --check "$clones"); then no "--check missed a hand edit in $workflow"; else
+    case "$out" in *"stale: $clones/$first/.forgejo/workflows/$workflow"*) ok ;; *) no "--check named the wrong file: $out" ;; esac
+  fi
+  cp "$WORK/saved" "$clones/$first/.forgejo/workflows/$workflow"
+done
 mkdir -p "$WORK/empty"
 if "$ROOT/forgejo/sync.sh" "$WORK/empty" >/dev/null 2>&1; then no "sync.sh wrote into a non-clone"; else ok; fi
 

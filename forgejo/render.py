@@ -14,8 +14,14 @@ rust-crate.yml this script does not know how to carry over (a new `uses:` step, 
 input it cannot substitute, a changed release step) fails the render instead of being copied
 across silently.
 
+A primary crate is written as two files (CRATE_FILES, HL-798): ci.yml for a push and a pull
+request, nightly.yml for the schedule and a dispatch. Neither of the latter can release, and Forgejo
+evaluates a job's `if:` only in a runner, so a release job in their file held one to skip itself
+every night. render() with no file is the one workflow the crate's tests reason about.
+
 Usage:
-  render.py <crate_name> <coverage_floor> <is_cli_tool> <cron> <shadow|primary>   # print it
+  render.py <crate_name> <coverage_floor> <is_cli_tool> <cron> <shadow|primary> <file>   # print it
+  render.py --files <shadow|primary>                                                     # its files
   RENDER_REF=<ref> overrides the ref rust-crate.yml is read at (default v1).
 """
 import os
@@ -60,7 +66,14 @@ PRIMARY_TRANSFORMS = (
     ("release-token", "the Kellnr publish token is the repo secret KELLNR_PUBLISH_TOKEN, in the release step's env only"),
     ("release-keys", "permissions and outputs go: Forgejo's job token is scoped to its repo, and nothing reads the outputs"),
     ("mail", "enable-email-notifications: the forge mails a failed run, and the first green after one (HL-651)"),
+    ("split-nightly", "the schedule and a dispatch run nightly.yml, the checks without release, which names a push (HL-798)"),
 )
+# A primary crate's files and the events each triggers on. A shadow has no release, so one file.
+CRATE_FILES = {"ci.yml": ("push", "pull_request"), "nightly.yml": ("schedule", "workflow_dispatch")}
+
+
+def files(primary):
+    return list(CRATE_FILES) if primary else ["ci.yml"]
 # GitHub's default for a `run:` step with no `shell:`. forgejo-runner maps "" to
 # `bash --noprofile --norc -e -o pipefail {0}` (act/runner/step_run.go, v13.2.0) and passes any
 # other string through, so pinning this one gives the shadow GitHub's semantics.
@@ -286,7 +299,10 @@ def substitute(node, inputs):
     return re.sub(r"\$\{\{\s*inputs\.([a-z_]+)\s*\}\}", literal, node)
 
 
-def render(source, inputs, cron, primary=False):
+def render(source, inputs, cron, primary=False, file=None):
+    """The crate's workflow; with `file`, the one of files(primary) sync.sh writes under that name."""
+    if file is not None and file not in files(primary):
+        raise RenderError(f"a {'primary' if primary else 'shadow'} crate renders {files(primary)}, not {file}")
     wf = yaml.safe_load(source)
     unknown = set(wf) - TOP_LEVEL
     if unknown:
@@ -325,6 +341,11 @@ def render(source, inputs, cron, primary=False):
         # Forgejo 15 mails a run only when its workflow opts in. The shadow never does, so GitHub
         # stays the only mail while it is the CI of record; a primary crate has no GitHub run left.
         out = {"enable-email-notifications": True, **out}
+    if primary and file is not None:
+        events = CRATE_FILES[file]
+        out["on"] = {e: t for e, t in out["on"].items() if e in events}
+        if "push" not in events:
+            out["jobs"] = {j: job for j, job in out["jobs"].items() if j != "release"}
     text = yaml.dump(out, Dumper=BlockDumper, sort_keys=False, width=1000, allow_unicode=True)
     if "inputs." in text or "visibility" in text:
         raise RenderError("an input or a visibility branch survived the render")
@@ -365,12 +386,15 @@ BlockDumper.add_representer(str, _str)
 
 
 def main(argv):
-    if len(argv) != 6:
+    if len(argv) == 3 and argv[1] == "--files" and argv[2] in ("shadow", "primary"):
+        print("\n".join(files(argv[2] == "primary")))
+        return 0
+    if len(argv) != 7:
         print(__doc__, file=sys.stderr)
         return 2
-    crate, floor, cli, cron, mode = argv[1:]
+    crate, floor, cli, cron, mode, file = argv[1:]
     if (not re.fullmatch(r"[a-z0-9-]+", crate) or not floor.isdigit() or cli not in ("true", "false")
-            or mode not in ("shadow", "primary")):
+            or mode not in ("shadow", "primary") or file not in files(mode == "primary")):
         print("render.py: bad arguments", file=sys.stderr)
         return 2
     inputs = {
@@ -392,7 +416,7 @@ def main(argv):
         print(f"render.py: cannot read {SOURCE} at {ref}: {e.stderr.strip()}", file=sys.stderr)
         return 1
     try:
-        sys.stdout.write(render(source, inputs, cron, primary=mode == "primary"))
+        sys.stdout.write(render(source, inputs, cron, primary=mode == "primary", file=file))
     except RenderError as e:
         print(f"render.py: {e}", file=sys.stderr)
         return 1
