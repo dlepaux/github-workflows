@@ -655,6 +655,12 @@ service="$(python3 "$ROOT/forgejo/render_repo.py" --list | awk '$2 == "rebuild.y
 for f in ci.yml pull-request.yml rebuild.yml; do
   [ -s "$WORK/$service/.forgejo/workflows/$f" ] || { echo "FAIL: $service: $f was not written"; exit 1; }
 done
+# Each file as written triggers on its own events, read from the file and not from the renderer.
+wf="$WORK/$service/.forgejo/workflows"
+triggers() { python3 -c 'import sys, yaml; print(" ".join(sorted(map(str, (lambda d: d.get("on", d.get(True, {})))(yaml.safe_load(open(sys.argv[1])))))))' "$1"; }
+[ "$(triggers "$wf/ci.yml")" = "push" ] || { echo "FAIL: $service: ci.yml triggers on $(triggers "$wf/ci.yml")"; exit 1; }
+[ "$(triggers "$wf/pull-request.yml")" = "pull_request" ] || { echo "FAIL: $service: pull-request.yml triggers wrong"; exit 1; }
+[ "$(triggers "$wf/rebuild.yml")" = "schedule workflow_dispatch" ] || { echo "FAIL: $service: rebuild.yml triggers wrong"; exit 1; }
 "$ROOT/forgejo/sync-repos.sh" "$WORK" > /dev/null
 echo "# by hand" >> "$WORK/$service/.forgejo/workflows/rebuild.yml"
 if "$ROOT/forgejo/sync-repos.sh" --check "$WORK" > "$WORK/out"; then
