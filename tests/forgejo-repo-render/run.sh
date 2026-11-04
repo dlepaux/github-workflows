@@ -83,8 +83,9 @@ for repo, wf in rendered.items():
             check(f"{repo}: {job_id} merges only after both legs", jobs[job_id]["needs"] == first + legs)
             leg_needs = first[0] if len(first) == 1 else first
             check(f"{repo}: {job_id}'s legs follow {first}", all(jobs[l]["needs"] == leg_needs for l in legs))
-            check(f"{repo}: {job_id} merges under the same guard",
-                  all(jobs[l]["if"] == jobs[job_id]["if"] for l in legs))
+            # The legs carry the guard; the merge needs them, so the server skips it past a skipped leg.
+            check(f"{repo}: {job_id}'s legs carry its guard and the merge has none",
+                  len({jobs[l].get("if") for l in legs}) == 1 and jobs[legs[0]].get("if") and "if" not in jobs[job_id])
             check(f"{repo}: each leg builds on its own hardware",
                   jobs[legs[0]]["runs-on"] == ["self-hosted", "arm64", "ci-heavy"]
                   and jobs[legs[1]]["runs-on"] == ["self-hosted", "x64", "ci-heavy"])
@@ -114,7 +115,8 @@ for repo, wf in rendered.items():
 PUBLISHERS = {
     "release": "github.event_name == 'push'",
     "docker": "needs.release.outputs.version != ''",
-    "smoke": "needs.release.outputs.version != ''",
+    # Needs docker, which succeeds only on a release (HL-798).
+    "smoke": None,
     "rebuild": "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')",
     "deploy": None,
     "publish-site": "github.ref == 'refs/heads/main'",
@@ -150,6 +152,8 @@ for repo, wf in rendered.items():
                 # Its own cases are below: one image's guard, and a deploy past all of them.
                 **({"docker": job.get("if"), "deploy": job.get("if")} if table[repo]["family"] == "images" else {}),
                 **({"release": rr.TAG_PUSH} if table[repo]["family"] == "tag-release" else {}),
+                # A multi-arch merge needs its legs, which carry the guard (HL-798).
+                **({job_id: None} if table[repo].get("multi_arch") and job_id in ("docker", "rebuild") else {}),
             }
             check(f"{repo}/{job_id}: guard pinned", job.get("if") == pinned.get(plain(job_id), PUBLISHERS[plain(job_id)]))
         elif table[repo]["family"] == "image" and job_id == "image":
@@ -458,6 +462,167 @@ for name, mutate, word in [
     mutate(next(iter(entry["gates"].values())))
     refuses(name, service, entry, word)
 
+# HL-798: a service ships as SERVICE_FILES, the model above split by trigger. The split must run the
+# same jobs as the model on every run, and leave no job holding a runner to skip itself on an event
+# its file already rules out. Forgejo 15.0.11's rule (services/actions/job_emitter.go): a job with
+# an `if:` always goes to a runner, which evaluates it; a job with none runs when every need succeeded
+# and is skipped by the server otherwise. A condition with no status function is success() && it.
+import itertools
+import schedule
+
+
+def needs_of(job):
+    n = job.get("needs", [])
+    return [n] if isinstance(n, str) else list(n)
+
+
+def evaluate(expr, event, ref, needs, results, versions):
+    """The conditions' whole vocabulary; any other word is a NameError, so the case fails loudly."""
+    def need(m, value):
+        if m.group(1) not in needs:
+            raise KeyError(f"{expr!r} reads needs.{m.group(1)}, which the job does not need")
+        return repr(value(m.group(1)))
+    py = re.sub(r"needs\.([a-z0-9-]+)\.result", lambda m: need(m, results.get), expr)
+    py = re.sub(r"needs\.([a-z0-9-]+)\.outputs\.version", lambda m: need(m, lambda j: versions.get(j, "")), py)
+    for word, value in (("github.event_name", repr(event)), ("github.ref", repr(ref)), ("always()", "True"),
+                        ("&&", " and "), ("||", " or ")):
+        py = py.replace(word, value)
+    return eval(py, {"__builtins__": {}})
+
+
+def run(wf, event, ref, outcome):
+    """Each job's result, and the jobs a runner took only to skip."""
+    jobs, results, versions, wasted = wf["jobs"], {}, {}, set()
+    pending = list(jobs)
+    while pending:
+        job_id = next(j for j in pending if all(n in results for n in needs_of(jobs[j])))
+        pending.remove(job_id)
+        job, needs = jobs[job_id], needs_of(jobs[job_id])
+        green = all(results[n] == "success" for n in needs)
+        if "if" not in job:
+            runs = green
+        else:
+            value = evaluate(job["if"], event, ref, needs, results, versions)
+            runs = value if "always()" in job["if"] else green and value
+            if not runs:
+                wasted.add(job_id)
+        results[job_id], version = outcome(job_id) if runs else ("skipped", "")
+        if version:
+            versions[job_id] = version
+    return results, wasted
+
+
+RUNS = (("push", "refs/heads/main"), ("pull_request", "refs/pull/7/head"), ("schedule", "main"),
+        ("workflow_dispatch", "refs/heads/main"), ("workflow_dispatch", "refs/heads/forge-ci"))
+OUTCOMES = list(itertools.product(("success", "failure"), (("success", "1.2.3"), ("success", ""), ("failure", "")),
+                                  ("success", "failure")))
+
+
+def outcome_of(gates, gate, release, build):
+    def outcome(job_id):
+        if job_id == "release":
+            return release
+        if job_id in gates:
+            return (gate if job_id == gates[0] else "success"), ""
+        return (build if plain(job_id) in ("docker", "rebuild") else "success"), ""
+    return outcome
+
+
+def split_cases(name, repo, entry):
+    model = yaml.safe_load(rr.render_repo(repo, entry, DEPLOY))
+    files = {f: yaml.safe_load(rr.render_file(repo, entry, f, DEPLOY)) for f in rr.files_of(entry)}
+    check(f"{name}: its files are SERVICE_FILES", list(files) == list(rr.SERVICE_FILES))
+    check(f"{name}: each event in exactly one file",
+          sorted(e for wf in files.values() for e in wf["on"]) == sorted(model["on"]))
+    check(f"{name}: each file triggers as the model does", all(wf["on"][e] == model["on"][e] for wf in files.values() for e in wf["on"]))
+    check(f"{name}: every file keeps the name required checks are keyed on", all(wf["name"] == "CI/CD" for wf in files.values()))
+    check(f"{name}: every file mails a failed run", all(wf["enable-email-notifications"] is True for wf in files.values()))
+    check(f"{name}: no file has a queue", all("concurrency" not in wf for wf in files.values()))
+    for f, wf in files.items():
+        for job_id, job in wf["jobs"].items():
+            same = {k: v for k, v in job.items() if k not in ("needs", "if")}
+            check(f"{name}/{f}/{job_id}: the model's job but for needs and if",
+                  job_id in model["jobs"] and same == {k: v for k, v in model["jobs"][job_id].items() if k not in ("needs", "if")})
+            check(f"{name}/{f}/{job_id}: needs only jobs in its file", set(needs_of(job)) <= set(wf["jobs"]))
+    gates = [j for j in model["jobs"] if "if" not in model["jobs"][j] and not needs_of(model["jobs"][j])]
+    wasted_model = wasted_split = 0
+    seen = {}  # per file and job: (runs, every need green) over the file's runs
+    for (event, ref), (gate, release, build) in itertools.product(RUNS, OUTCOMES):
+        outcome = outcome_of(gates, gate, release, build)
+        results, wasted = run(model, event, ref, outcome)
+        ran_model = {j for j, r in results.items() if r != "skipped"}
+        wasted_model += len(wasted)
+        ran = set()
+        for f, wf in files.items():
+            if event not in wf["on"]:
+                continue
+            results, wasted = run(wf, event, ref, outcome)
+            ran |= {j for j, r in results.items() if r != "skipped"}
+            wasted_split += len(wasted)
+            for job_id, job in wf["jobs"].items():
+                if "if" in job:
+                    green = all(results[n] == "success" for n in needs_of(job))
+                    seen.setdefault((f, job_id), set()).add((results[job_id] != "skipped", green))
+        if ran != ran_model:
+            check(f"{name}: {event} {ref} gate={gate} release={release} build={build} runs as the model", False)
+            break
+    else:
+        check(f"{name}: every run runs exactly the model's jobs", True)
+    # A condition that never holds in its file, or holds exactly when every need is green, is one the
+    # trigger already decided: the job holds a runner for nothing, or should have no `if:` at all.
+    for (f, job_id), pairs in seen.items():
+        check(f"{name}/{f}/{job_id}: its condition can hold", any(r for r, _ in pairs))
+        check(f"{name}/{f}/{job_id}: its condition decides something", any(r != g for r, g in pairs))
+    check(f"{name}: fewer runners taken to skip ({wasted_model} -> {wasted_split})", wasted_split < wasted_model)
+    return wasted_model, wasted_split
+
+
+variants = [(r, r, e) for r, e in table.items() if e["family"] == "service"] + [
+    ("multi_arch", arch_repo, {**table[arch_repo], "multi_arch": True}),
+    ("multi_arch with a smoke", arch_repo, smoke_entry),
+    ("an x64 image", single, {**table[single], "image_arch": "x64"}),
+    ("every push, deployed", single, every_entry),
+    ("a rebuild deployed", single, {**table[single], "deploy_rebuild": True, "deploy_url": "https://example.test/deploy"}),
+]
+covered = {k for _, _, e in variants for k in ("multi_arch", "image_smoke", "image_on_every_push", "deploy_rebuild", "site", "deploy_url") if e.get(k)}
+check("the split's cases cover every option that moves a job", covered == {
+    "multi_arch", "image_smoke", "image_on_every_push", "deploy_rebuild", "site", "deploy_url"})
+totals = [split_cases(*v) for v in variants]
+print(f"split: runners taken to skip over {len(RUNS) * len(OUTCOMES)} runs per variant: "
+      f"{sum(t[0] for t in totals)} -> {sum(t[1] for t in totals)}")
+
+# What the split moves, named: a pull request runs the gates alone, and only a push can release.
+for repo, entry in table.items():
+    if entry["family"] != "service":
+        continue
+    files = {f: yaml.safe_load(rr.render_file(repo, entry, f, DEPLOY)) for f in rr.files_of(entry)}
+    check(f"{repo}: a pull request runs its gates and nothing else",
+          set(files["pull-request.yml"]["jobs"]) == set(entry.get("gates", {})))
+    check(f"{repo}: the push file releases with no condition", "if" not in files["ci.yml"]["jobs"]["release"])
+    check(f"{repo}: nothing else releases", all("release" not in wf["jobs"] for f, wf in files.items() if f != "ci.yml"))
+    check(f"{repo}: the weekly line is its own minute, in rebuild.yml alone",
+          files["rebuild.yml"]["on"]["schedule"] == [{"cron": schedule.cron(repo, "1")}]
+          and all("schedule" not in wf["on"] for f, wf in files.items() if f != "rebuild.yml"))
+    check(f"{repo}: each file says why it is split", all("One of three files" in rr.render_file(repo, entry, f, DEPLOY)
+                                                          for f in files))
+check("the model does not claim to be split", "One of three files" not in rr.render_repo(single, table[single], DEPLOY))
+check("--list names a service's three files and one for the rest", [
+    line.split(" ") for line in subprocess.run([sys.executable, f"{root}/forgejo/render_repo.py", "--list"],
+                                               text=True, capture_output=True, check=True).stdout.splitlines()
+] == [[r, f] for r, e in table.items() for f in rr.files_of(e)])
+for name, call, word in (
+    ("a file the service does not have", lambda: rr.render_file(single, table[single], "other.yml", DEPLOY), "not other.yml"),
+    ("a split for a package", lambda: rr.render_repo(package, table[package], DEPLOY, ("push",)), "only a service"),
+    ("an event a service does not take", lambda: rr.render_repo(single, table[single], DEPLOY, ("release",)), "not a service's"),
+    ("no events at all", lambda: rr.render_repo(single, table[single], DEPLOY, ()), "not a service's"),
+):
+    try:
+        call()
+    except RenderError as e:
+        check(f"refused: {name} ({e})", word in str(e))
+    else:
+        check(f"refused: {name}", False)
+
 print(f"{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
 PY
@@ -486,6 +651,16 @@ if "$ROOT/forgejo/sync-repos.sh" --check "$WORK" > "$WORK/out"; then
   echo "FAIL: --check passed a hand-edited copy"; exit 1
 fi
 grep -q "stale: .*$victim/" "$WORK/out" || { echo "FAIL: --check named another file"; exit 1; }
+service="$(python3 "$ROOT/forgejo/render_repo.py" --list | awk '$2 == "rebuild.yml" { print $1; exit }')"
+for f in ci.yml pull-request.yml rebuild.yml; do
+  [ -s "$WORK/$service/.forgejo/workflows/$f" ] || { echo "FAIL: $service: $f was not written"; exit 1; }
+done
+"$ROOT/forgejo/sync-repos.sh" "$WORK" > /dev/null
+echo "# by hand" >> "$WORK/$service/.forgejo/workflows/rebuild.yml"
+if "$ROOT/forgejo/sync-repos.sh" --check "$WORK" > "$WORK/out"; then
+  echo "FAIL: --check passed a hand-edited rebuild.yml"; exit 1
+fi
+grep -q "stale: .*$service/.forgejo/workflows/rebuild.yml" "$WORK/out" || { echo "FAIL: --check did not name rebuild.yml"; exit 1; }
 rm -rf "$WORK/$victim"
 if "$ROOT/forgejo/sync-repos.sh" --check "$WORK" > /dev/null 2>&1; then
   echo "FAIL: a missing clone passed"; exit 1

@@ -367,9 +367,10 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
         for arch, platform in IMAGE_PLATFORMS.items()
     }
     merge_env = {**env, **{f"DIGEST_{a.upper()}": f"${{{{ needs.{job_id}-{a}.outputs.digest }}}}" for a in IMAGE_PLATFORMS}}
+    # No condition of its own: it needs both legs, which carry the guard, so past a skipped leg the
+    # server skips it, where an `if:` would hold a runner only to skip it there (HL-798).
     merge = {
         "needs": ([needs] if isinstance(needs, str) else needs) + list(legs),
-        "if": guard["if"],
         "runs-on": runs_on("medium"),
         "timeout-minutes": 10,
         "steps": [{"name": "Merge into one manifest", "env": merge_env, "run": MERGE_LEGS}],
@@ -377,13 +378,14 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
     return {**legs, job_id: merge}
 
 
-def smoke_jobs(entry, docker_guard):
+def smoke_jobs(entry):
     """A check of the published image, on each architecture's own hardware: no emulation stands in
-    for the binary a host will run. It uses the token to pull, the repo's only one, under its own config."""
+    for the binary a host will run. It uses the token to pull, the repo's only one, under its own config.
+    No condition: docker succeeds only on a release, so needing it is the guard, and the server skips
+    it past a skipped docker without a runner (HL-798)."""
     return {
         f"smoke-{arch}": {
             "needs": ["release", "docker"],
-            "if": docker_guard["if"],
             "runs-on": runs_on("heavy", arch),
             "timeout-minutes": 10,
             "steps": [{
@@ -469,7 +471,7 @@ def service_publishers(repo, entry, gates, events):
         if builds_release:
             jobs.update(multi_arch_jobs("docker", repo, entry, docker_guard, tag_checkout(), version=True))
             if "image_smoke" in entry:
-                jobs.update(smoke_jobs(entry, docker_guard))
+                jobs.update(smoke_jobs(entry))
         if rebuilds:
             jobs.update(multi_arch_jobs("rebuild", repo, entry, rebuild_guard, CHECKOUT, version=False))
         return jobs
