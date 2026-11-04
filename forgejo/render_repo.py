@@ -18,9 +18,17 @@ Families:
   verify   gates and nothing after them
   pages    one job that builds a static site, and on main uploads it to the edge and proves it serves
 
+A service is written as three files, one per kind of trigger (SERVICE_FILES, HL-798). Forgejo
+evaluates a job's `if:` only in a runner (services/actions/job_emitter.go, v15.0.11), so a job whose
+condition names another event still held a runner and a cap slot to skip itself: 28% of the forge's
+jobs did that. Split by trigger, each file carries only the jobs its events can run, and a job past a
+red or skipped need with no `if:` is skipped by the server without a runner. Every file is the same
+render, service_workflow(), for its own events; with every event it is the one workflow these
+families were written as, which is what tests/forgejo-repo-render reasons about.
+
 Usage:
-  render_repo.py --list        # print each "<repo> <workflow file>"
-  render_repo.py <repo>        # print its workflow
+  render_repo.py --list               # print each "<repo> <workflow file>", one line per file
+  render_repo.py <repo> <file>        # print that workflow
   RENDER_REF=<ref> overrides the ref deploy.yml is read at (default v1).
 """
 import os
@@ -29,6 +37,7 @@ import sys
 
 import yaml
 
+import schedule
 from render import CHECKOUT, GIT_AUTH, RELEASE_CHECKOUT, BlockDumper, RenderError
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -60,8 +69,8 @@ ALWAYS_PRESENT = {
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
 }
+# A service's files are SERVICE_FILES'.
 WORKFLOW_FILE = {
-    "service": "ci.yml",
     "package": "ci.yml",
     "image": "ci.yml",
     "images": "ci.yml",
@@ -69,6 +78,17 @@ WORKFLOW_FILE = {
     "lint": "loopback-bindings-lint.yml",
     "verify": "ci.yml",
     "pages": "pages.yml",
+}
+
+# A service's events, in the order its single workflow listed them, and the files they are split into.
+# A pull request's required check is named "<workflow name> / <job> (<event>)" (the forge's
+# protected_branch rows), and every file keeps the name CI/CD, so the split renames no check.
+# ci.yml stays the push's file, so the run history a push links to keeps its name.
+SERVICE_EVENTS = ("push", "pull_request", "workflow_dispatch", "schedule")
+SERVICE_FILES = {
+    "ci.yml": ("push",),
+    "pull-request.yml": ("pull_request",),
+    "rebuild.yml": ("workflow_dispatch", "schedule"),
 }
 
 # A pull request's run is the green check Renovate's automerge waits for (HL-130). The lint family
@@ -193,6 +213,11 @@ MERGE_LEGS = (
     "'\n"
     'docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST_ARM64" "$IMAGE@$DIGEST_X64"\n'
 )
+SPLIT_NOTE = """\
+# One of three files, one per kind of trigger: ci.yml (a push), pull-request.yml, and rebuild.yml (the
+# schedule and a dispatch). Forgejo reads a job's `if:` only in a runner, so a job left to skip itself
+# on another event's run would hold one (HL-798).
+"""
 LINT_NOTE = """\
 # Layer 1 of the three-layer auth model: every compose service is loopback-bound or allowlisted.
 """
@@ -237,7 +262,8 @@ def needing(jobs):
     return jobs[0] if len(jobs) == 1 else jobs
 
 
-def release_job(gates, install=False, release_env=None, version_output=False):
+def release_job(gates, install=False, release_env=None, version_output=False, push_only=False):
+    """`push_only`: the file triggers on a push alone, so the condition is the trigger's already."""
     steps = [RELEASE_CHECKOUT]
     if install:
         # npm publish's prepublishOnly builds, so this job needs the dependencies too. No scripts,
@@ -249,8 +275,9 @@ def release_job(gates, install=False, release_env=None, version_output=False):
         "run": SEMANTIC_RELEASE,
     })
     job = {"needs": needing(list(gates))} if gates else {}
+    if not push_only:
+        job["if"] = "github.event_name == 'push'"
     job.update({
-        "if": "github.event_name == 'push'",
         "runs-on": runs_on("medium"),
         "timeout-minutes": 15,
     })
@@ -380,17 +407,23 @@ def smoke_jobs(entry, docker_guard):
     }
 
 
-def every_push_guard(gates):
+def every_push_guard(gates, push_only=False):
     """A site whose content lives in its image ships every push, so a commit no release follows is built too.
 
     `always()` because release is skipped on a schedule or a dispatch, and a skipped need otherwise skips
     this job; the gates are then named, so it still cannot publish past a red one. Named events, as a
     pull request must never publish :latest, and main only, as a dispatch names any branch. A release's
     own commit is the docker job's.
+
+    In a file that triggers on a push alone there is no skipped release to let through, so the job needs
+    every gate and the release green, which is the default rule, and only the version is left to read.
     """
+    needs = list(gates) + ["release"]
+    if push_only:
+        return {"needs": needs, "if": "needs.release.outputs.version == ''"}
     green = " && ".join(f"needs.{g}.result == 'success'" for g in gates)
     return {
-        "needs": list(gates) + ["release"],
+        "needs": needs,
         "if": (
             f"always() && {green} && ({REBUILD_EVENTS}"
             " || (github.event_name == 'push' && needs.release.result == 'success'"
@@ -399,16 +432,7 @@ def every_push_guard(gates):
     }
 
 
-def service_workflow(repo, entry, deploy_step_run):
-    gates = gate_jobs(repo, entry)
-    timeout = entry["image_timeout"]
-    jobs = dict(gates)
-    jobs["release"] = release_job(gates, version_output=True)
-    docker_guard = {"needs": "release", "if": "needs.release.outputs.version != ''"}
-    # Every gate, as for a release: a rebuild moves :latest too, so it may not publish past a red one.
-    rebuild_guard = {"needs": needing(list(gates))} if gates else {}
-    # Named, not `!= 'push'`: a pull request must never publish :latest.
-    rebuild_guard["if"] = REBUILD_EVENTS
+def check_service(repo, entry):
     if "image_smoke" in entry and not entry.get("multi_arch", False):
         raise RenderError(f"{repo}: image_smoke needs multi_arch, whose legs it checks")
     if entry.get("multi_arch", False) and "image_arch" in entry:
@@ -416,8 +440,7 @@ def service_workflow(repo, entry, deploy_step_run):
     if entry.get("multi_arch", False) and "image_on_every_push" in entry:
         raise RenderError(f"{repo}: image_on_every_push is for one image, not two legs and a merge")
     # The arch the image runs on: vps-edge is x86_64, and the render's default is the arm64 pool.
-    image_arch = entry.get("image_arch", "arm64")
-    if image_arch not in IMAGE_PLATFORMS:
+    if entry.get("image_arch", "arm64") not in IMAGE_PLATFORMS:
         raise RenderError(f"{repo}: image_arch must be one of {sorted(IMAGE_PLATFORMS)}")
     every_push = entry.get("image_on_every_push", False)
     deploy_rebuild = entry.get("deploy_rebuild", False)
@@ -425,45 +448,96 @@ def service_workflow(repo, entry, deploy_step_run):
         raise RenderError(f"{repo}: deploy_rebuild needs a deploy_url")
     if every_push and "deploy_url" in entry and not deploy_rebuild:
         raise RenderError(f"{repo}: image_on_every_push needs deploy_rebuild, or a push builds and never ships")
-    if every_push:
-        rebuild_guard = every_push_guard(gates)
+
+
+def service_publishers(repo, entry, gates, events):
+    """docker, its smoke and rebuild, each only where the file's events can run it: a job whose
+    condition rules out every event the file triggers on would only hold a runner to skip itself."""
+    push_only = events == {"push"}
+    every_push = entry.get("image_on_every_push", False)
+    builds_release = "push" in events
+    rebuilds = bool(events & {"schedule", "workflow_dispatch"}) or (builds_release and every_push)
+    docker_guard = {"needs": "release", "if": "needs.release.outputs.version != ''"}
+    # Every gate, as for a release: a rebuild moves :latest too, so it may not publish past a red one.
+    rebuild_guard = {"needs": needing(list(gates))} if gates else {}
+    # Named, not `!= 'push'`: a pull request must never publish :latest.
+    rebuild_guard["if"] = REBUILD_EVENTS
+    if every_push and builds_release:
+        rebuild_guard = every_push_guard(gates, push_only)
+    jobs = {}
     if entry.get("multi_arch", False):
-        jobs.update(multi_arch_jobs("docker", repo, entry, docker_guard, tag_checkout(), version=True))
-        if "image_smoke" in entry:
-            jobs.update(smoke_jobs(entry, docker_guard))
-        jobs.update(multi_arch_jobs("rebuild", repo, entry, rebuild_guard, CHECKOUT, version=False))
-    else:
+        if builds_release:
+            jobs.update(multi_arch_jobs("docker", repo, entry, docker_guard, tag_checkout(), version=True))
+            if "image_smoke" in entry:
+                jobs.update(smoke_jobs(entry, docker_guard))
+        if rebuilds:
+            jobs.update(multi_arch_jobs("rebuild", repo, entry, rebuild_guard, CHECKOUT, version=False))
+        return jobs
+    image_arch = entry.get("image_arch", "arm64")
+    timeout = entry["image_timeout"]
+    if builds_release:
         jobs["docker"] = {
             **docker_guard,
             "runs-on": runs_on("heavy", image_arch),
             "timeout-minutes": timeout,
             "steps": [tag_checkout(), build_step(entry, version=True)],
         }
+    if rebuilds:
         jobs["rebuild"] = {
             **rebuild_guard,
             "runs-on": runs_on("heavy", image_arch),
             "timeout-minutes": timeout,
             "steps": [CHECKOUT, build_step(entry, version=False)],
         }
-    if "deploy_url" in entry:
-        jobs["deploy"] = deploy_job(deploy_step_run, entry["deploy_url"])
-        if deploy_rebuild:
-            # The image roller leaves a webhook-deployed service to its pipeline, so a rebuild no deploy
-            # follows never reaches the host. Either build published, and the other was skipped, so the
-            # default rule that a skipped need skips the job would never deploy.
-            jobs["deploy"] = {
-                "needs": ["docker", "rebuild"],
-                "if": "always() && (needs.docker.result == 'success' || needs.rebuild.result == 'success')",
-                **{k: v for k, v in jobs["deploy"].items() if k != "needs"},
-            }
-    if "site" in entry:
-        jobs["publish-site"] = site_job(repo, entry["site"])
-    triggers = {**GATED_TRIGGERS, "schedule": [{"cron": "0 4 * * 1"}]}
+    return jobs
+
+
+def service_deploy(entry, jobs, deploy_step_run):
+    """The deploy follows whichever builds this file carries, or is absent when it carries none."""
+    builders = [j for j in ("docker", "rebuild") if j in jobs and (j == "docker" or entry.get("deploy_rebuild", False))]
+    if "deploy_url" not in entry or not builders:
+        return None
+    deploy = deploy_job(deploy_step_run, entry["deploy_url"])
+    if len(builders) == 1:
+        # One build, so the default rule (every need green) is the whole condition, and the server
+        # skips the job past a skipped build without a runner.
+        return {**deploy, "needs": builders[0]}
+    # The image roller leaves a webhook-deployed service to its pipeline, so a rebuild no deploy
+    # follows never reaches the host. Either build published, and the other was skipped, so the
+    # default rule that a skipped need skips the job would never deploy.
+    return {
+        "needs": builders,
+        "if": "always() && (needs.docker.result == 'success' || needs.rebuild.result == 'success')",
+        **{k: v for k, v in deploy.items() if k != "needs"},
+    }
+
+
+def service_workflow(repo, entry, deploy_step_run, events=SERVICE_EVENTS):
+    """The whole service for `events`. With every event it is the one workflow the tests reason about;
+    sync-repos.sh writes it as SERVICE_FILES, each the same render for its own events."""
+    check_service(repo, entry)
+    events = frozenset(events)
+    if not events or events - set(SERVICE_EVENTS):
+        raise RenderError(f"{repo}: events {sorted(events)} are not a service's")
+    gates = gate_jobs(repo, entry)
+    jobs = dict(gates)
+    if "push" in events:
+        jobs["release"] = release_job(gates, version_output=True, push_only=events == {"push"})
+    jobs.update(service_publishers(repo, entry, gates, events))
+    deploy = service_deploy(entry, jobs, deploy_step_run)
+    if deploy:
+        jobs["deploy"] = deploy
+    # A pull request never publishes a site, and a push is to main, as its trigger says.
+    if "site" in entry and events - {"pull_request"}:
+        site = site_job(repo, entry["site"])
+        jobs["publish-site"] = {k: v for k, v in site.items() if k != "if"} if events == {"push"} else site
+    triggers = {**GATED_TRIGGERS, "schedule": [{"cron": schedule.cron(repo, "1")}]}
     # No `concurrency`, though these repos queued under GitHub: a queued job's runner finds no task and
     # exits, and ci-dispatch never retries it (HL-738). Forgejo's default cancels the older push instead,
     # so the newest commit still wins, and a release a push cancelled heals at the next rebuild's deploy.
-    note = REBUILD_DEPLOY_NOTE if deploy_rebuild else NO_REBUILD_DEPLOY_NOTE
-    return {"name": "CI/CD", "on": triggers, "jobs": jobs}, SERVICE_NOTE + note
+    note = REBUILD_DEPLOY_NOTE if entry.get("deploy_rebuild", False) else NO_REBUILD_DEPLOY_NOTE
+    on = {e: t for e, t in triggers.items() if e in events}
+    return {"name": "CI/CD", "on": on, "jobs": jobs}, SERVICE_NOTE + note + (SPLIT_NOTE if len(events) < len(SERVICE_EVENTS) else "")
 
 
 def package_workflow(repo, entry):
@@ -643,13 +717,16 @@ def lint_workflow():
     return workflow, LINT_NOTE
 
 
-def render_repo(repo, entry, deploy_step_run):
+def render_repo(repo, entry, deploy_step_run, events=SERVICE_EVENTS):
+    """One workflow. `events` scopes a service's (see SERVICE_FILES); the other families have one file."""
     family = entry.get("family")
     if family not in FAMILY_KEYS:
         raise RenderError(f"{repo}: unknown family {family}")
     checked_keys(repo, entry, FAMILY_KEYS[family], ALWAYS_PRESENT[family])
+    if family != "service" and tuple(events) != SERVICE_EVENTS:
+        raise RenderError(f"{repo}: only a service is split by event")
     if family == "service":
-        workflow, note = service_workflow(repo, entry, deploy_step_run)
+        workflow, note = service_workflow(repo, entry, deploy_step_run, events)
     elif family == "package":
         workflow, note = package_workflow(repo, entry)
     elif family == "image":
@@ -667,6 +744,24 @@ def render_repo(repo, entry, deploy_step_run):
     # Forgejo 15 mails a run only when its workflow opts in, and the forge is these repos' only CI.
     workflow = {"enable-email-notifications": True, **workflow}
     return HEADER + note + yaml.dump(workflow, Dumper=BlockDumper, sort_keys=False, width=1000, allow_unicode=True)
+
+
+def files_of(entry):
+    family = entry.get("family")
+    if family == "service":
+        return list(SERVICE_FILES)
+    if family not in WORKFLOW_FILE:
+        raise RenderError(f"unknown family {family}")
+    return [WORKFLOW_FILE[family]]
+
+
+def render_file(repo, entry, name, deploy_step_run):
+    """The file sync-repos.sh writes as `name`."""
+    if name not in files_of(entry):
+        raise RenderError(f"{repo}: renders {files_of(entry)}, not {name}")
+    if entry["family"] == "service":
+        return render_repo(repo, entry, deploy_step_run, SERVICE_FILES[name])
+    return render_repo(repo, entry, deploy_step_run)
 
 
 def deploy_step_source(ref):
@@ -688,20 +783,25 @@ def load_table():
 
 
 def main(argv):
-    if len(argv) != 2:
+    table = load_table()
+    if argv[1:] == ["--list"]:
+        try:
+            for repo, entry in table.items():
+                for name in files_of(entry):
+                    print(repo, name)
+        except RenderError as e:
+            print(f"render_repo.py: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if len(argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
-    table = load_table()
-    if argv[1] == "--list":
-        for repo, entry in table.items():
-            print(repo, WORKFLOW_FILE[entry["family"]])
-        return 0
     if argv[1] not in table:
         print(f"render_repo.py: {argv[1]} is not in repos.yml", file=sys.stderr)
         return 2
     try:
         run = deploy_step_source(os.environ.get("RENDER_REF", "v1"))
-        sys.stdout.write(render_repo(argv[1], table[argv[1]], run))
+        sys.stdout.write(render_file(argv[1], table[argv[1]], argv[2], run))
     except (RenderError, subprocess.CalledProcessError) as e:
         print(f"render_repo.py: {e}", file=sys.stderr)
         return 1

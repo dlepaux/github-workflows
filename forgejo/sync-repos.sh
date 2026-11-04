@@ -16,7 +16,7 @@ list="$(python3 "$HERE/render_repo.py" --list)"
 while read -r repo workflow; do
   dir="$clones/$repo"
   [ -d "$dir/.git" ] || [ -f "$dir/.git" ] || { echo "sync-repos.sh: $dir is not a clone" >&2; exit 1; }
-  want="$(python3 "$HERE/render_repo.py" "$repo")"
+  want="$(python3 "$HERE/render_repo.py" "$repo" "$workflow")"
   target="$dir/.forgejo/workflows/$workflow"
   if $check; then
     if [ "$(cat "$target" 2>/dev/null)" != "$want" ]; then echo "stale: $target"; stale=1; fi
