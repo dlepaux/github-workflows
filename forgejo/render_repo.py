@@ -50,7 +50,7 @@ GATE_REQUIRED = {"class", "timeout", "steps"}
 GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {
     "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke", "site",
-                "image_arch", "image_on_every_push", "deploy_rebuild"},
+                "image_arch", "image_on_every_push", "deploy_rebuild", "registry"},
     "package": {"family", "gates", "release_install", "release_env"},
     "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request", "deploy_url"},
     "images": {"family", "gates", "note", "images", "deploy_url"},
@@ -170,6 +170,25 @@ GHCR_LOGIN = (
     'DOCKER_CONFIG=$(mktemp -d)\n'
     'export DOCKER_CONFIG\n'
 )
+GHCR_LOGIN_LINE = """printf '%s' "$GHCR_WRITE_TOKEN" | docker login ghcr.io -u dlepaux --password-stdin\n"""
+# The forge registry (homelab HL-696, HL-787). A private repo's images move there one repo at a time
+# (`registry: forge`); a public repo's stay on GHCR. FORGE_REGISTRY_TOKEN is owner-wide write:package,
+# as Forgejo 15 cannot scope a package token to a repo, so a job that holds it could overwrite any
+# image. It is therefore in the env of the push step alone, and empty there unless the run is on
+# main: a pull request's, or a branch's, never reads it, whatever the job's own condition says. A
+# schedule's ref is the bare `main` (REBUILD_EVENTS), hence both forms.
+FORGE_REGISTRY = "forgejo.lepaux.com"
+FORGE_PUBLISHES = "github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'main')"
+FORGE_TOKEN = f"${{{{ {FORGE_PUBLISHES} && secrets.FORGE_REGISTRY_TOKEN || '' }}}}"
+FORGE_LOGIN = (
+    ': "${FORGE_REGISTRY_TOKEN:?FORGE_REGISTRY_TOKEN is empty: not set on this repo (homelab forgejo_registry_repos), or the run is not on main}"\n'
+    'DOCKER_CONFIG=$(mktemp -d)\n'
+    'export DOCKER_CONFIG\n'
+)
+FORGE_LOGIN_LINE = (
+    """printf '%s' "$FORGE_REGISTRY_TOKEN" | docker login forgejo.lepaux.com -u "$FORGE_REGISTRY_USER" --password-stdin\n"""
+)
+REGISTRIES = ("ghcr", "forge")
 BUILD_LEG = (
     "set -euo pipefail\n"
     + GHCR_LOGIN +
@@ -315,8 +334,8 @@ def tag_checkout():
     }
 
 
-def build_step(entry, version):
-    env = {"GHCR_WRITE_TOKEN": "${{ secrets.GHCR_WRITE_TOKEN }}", **entry.get("image_env", {})}
+def build_step(repo, entry, version):
+    env = {**push_env(repo, entry), **entry.get("image_env", {})}
     if version:
         env["VERSION"] = "${{ needs.release.outputs.version }}"
     return {"name": "Build and push", "env": env, "run": BUILD_IMAGE}
@@ -342,13 +361,37 @@ def deploy_job(deploy_step_run, url):
     }
 
 
+def registry_of(entry):
+    return entry.get("registry", "ghcr")
+
+
+def push_env(repo, entry):
+    """The push credential, and on the forge the image's name, for the one step that pushes."""
+    if registry_of(entry) == "ghcr":
+        return {"GHCR_WRITE_TOKEN": "${{ secrets.GHCR_WRITE_TOKEN }}"}
+    return {
+        "IMAGE": f"{FORGE_REGISTRY}/dlepaux/{repo}",
+        "FORGE_REGISTRY_USER": "${{ vars.FORGE_REGISTRY_USER }}",
+        "FORGE_REGISTRY_TOKEN": FORGE_TOKEN,
+    }
+
+
+def for_registry(script, entry):
+    """A GHCR script as written, or the same script logging in to the forge."""
+    if registry_of(entry) == "ghcr":
+        return script
+    assert script.count(GHCR_LOGIN) == 1 and script.count(GHCR_LOGIN_LINE) == 1
+    return script.replace(GHCR_LOGIN, FORGE_LOGIN).replace(GHCR_LOGIN_LINE, FORGE_LOGIN_LINE)
+
+
 def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
     """One leg per architecture, then a job under the plain name that merges their digests, so
     whatever follows `docker` follows the manifest. A failed leg leaves no manifest at all."""
     if "image_env" in entry:
         raise RenderError(f"{repo}: multi_arch carries no image_env, as a leg's build takes only its own args")
     needs = guard.get("needs", [])
-    env = {"IMAGE": f"ghcr.io/dlepaux/{repo}", "GHCR_WRITE_TOKEN": "${{ secrets.GHCR_WRITE_TOKEN }}"}
+    # On the forge, push_env names the image, over GHCR's.
+    env = {"IMAGE": f"ghcr.io/dlepaux/{repo}", **push_env(repo, entry)}
     if version:
         env["VERSION"] = "${{ needs.release.outputs.version }}"
     legs = {
@@ -361,7 +404,7 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
                 "name": f"Build and push {platform} by digest",
                 "id": "leg",
                 "env": {**env, "PLATFORM": platform},
-                "run": BUILD_LEG,
+                "run": for_registry(BUILD_LEG, entry),
             }],
         }
         for arch, platform in IMAGE_PLATFORMS.items()
@@ -373,7 +416,7 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
         "needs": ([needs] if isinstance(needs, str) else needs) + list(legs),
         "runs-on": runs_on("medium"),
         "timeout-minutes": 10,
-        "steps": [{"name": "Merge into one manifest", "env": merge_env, "run": MERGE_LEGS}],
+        "steps": [{"name": "Merge into one manifest", "env": merge_env, "run": for_registry(MERGE_LEGS, entry)}],
     }
     return {**legs, job_id: merge}
 
@@ -435,6 +478,12 @@ def every_push_guard(gates, push_only=False):
 
 
 def check_service(repo, entry):
+    if registry_of(entry) not in REGISTRIES:
+        raise RenderError(f"{repo}: registry must be one of {list(REGISTRIES)}")
+    # The smoke pulls with the push token, which the forge's is too wide to lend a pull: a forge smoke
+    # needs a read token of its own, which no repo has yet.
+    if registry_of(entry) == "forge" and "image_smoke" in entry:
+        raise RenderError(f"{repo}: image_smoke pulls with the push token, so it is GHCR's until a forge read token is wired")
     if "image_smoke" in entry and not entry.get("multi_arch", False):
         raise RenderError(f"{repo}: image_smoke needs multi_arch, whose legs it checks")
     if entry.get("multi_arch", False) and "image_arch" in entry:
@@ -482,14 +531,14 @@ def service_publishers(repo, entry, gates, events):
             **docker_guard,
             "runs-on": runs_on("heavy", image_arch),
             "timeout-minutes": timeout,
-            "steps": [tag_checkout(), build_step(entry, version=True)],
+            "steps": [tag_checkout(), build_step(repo, entry, version=True)],
         }
     if rebuilds:
         jobs["rebuild"] = {
             **rebuild_guard,
             "runs-on": runs_on("heavy", image_arch),
             "timeout-minutes": timeout,
-            "steps": [CHECKOUT, build_step(entry, version=False)],
+            "steps": [CHECKOUT, build_step(repo, entry, version=False)],
         }
     return jobs
 
@@ -605,7 +654,7 @@ def images_workflow(repo, entry, deploy_step_run):
             "steps": [
                 {**CHECKOUT, "if": f"{version} == ''"},
                 {**tag_checkout(), "if": f"{version} != ''"},
-                {**build_step(entry, True), "run": f"{BUILD_IMAGE} {name}"},
+                {**build_step(repo, entry, True), "run": f"{BUILD_IMAGE} {name}"},
             ],
         }
     deploy = {

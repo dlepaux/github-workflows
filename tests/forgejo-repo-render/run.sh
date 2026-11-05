@@ -623,6 +623,81 @@ for name, call, word in (
     else:
         check(f"refused: {name}", False)
 
+# The forge registry (homelab HL-787 item 6). FORGE_REGISTRY_TOKEN is owner-wide write:package, so
+# it may sit in the env of a pushing step alone, and only behind FORGE_PUBLISHES: a pull request's or
+# a branch's run reads it empty whatever its job's condition. Each GHCR render stays as it was.
+def ghcr_twin(repo):
+    return copy.deepcopy(table[repo])
+
+
+single = next(r for r, e in table.items() if e["family"] == "service" and not e.get("multi_arch") and "image_env" not in e)
+multi = next(r for r, e in table.items() if e["family"] == "service" and e.get("multi_arch") and "image_smoke" not in e)
+forge_renders = {}
+for repo in (single, multi):
+    entry = {**ghcr_twin(repo), "registry": "forge"}
+    for events in [rr.SERVICE_EVENTS, *rr.SERVICE_FILES.values()]:
+        forge_renders[(repo, tuple(events))] = rr.render_repo(repo, entry, DEPLOY, events=events)
+    check(f"{repo}: registry ghcr renders as no registry key",
+          rr.render_repo(repo, {**ghcr_twin(repo), "registry": "ghcr"}, DEPLOY) == rr.render_repo(repo, ghcr_twin(repo), DEPLOY))
+
+
+def token_steps(wf):
+    for job_id, job in wf["jobs"].items():
+        for step in job.get("steps", []):
+            if "FORGE_REGISTRY_TOKEN" in yaml.safe_dump(step):
+                yield job_id, step
+
+
+for (repo, events), text in forge_renders.items():
+    where = f"{repo} forge {'+'.join(events)}"
+    wf = yaml.safe_load(text)
+    check(f"{where}: no GHCR credential left", "GHCR_WRITE_TOKEN" not in text and "docker login ghcr.io" not in text)
+    # Each mention of the secret is the guarded expression, so no step reads it bare.
+    check(f"{where}: the secret is read only behind FORGE_PUBLISHES",
+          text.count("secrets.FORGE_REGISTRY_TOKEN") == text.count(rr.FORGE_TOKEN))
+    steps = list(token_steps(wf))
+    for job_id, step in steps:
+        env = step.get("env", {})
+        check(f"{where}/{job_id}: the token is guarded", env.get("FORGE_REGISTRY_TOKEN") == rr.FORGE_TOKEN)
+        check(f"{where}/{job_id}: the image is the forge's", env.get("IMAGE") == f"forgejo.lepaux.com/dlepaux/{repo}")
+        check(f"{where}/{job_id}: the user is the repo var", env.get("FORGE_REGISTRY_USER") == "${{ vars.FORGE_REGISTRY_USER }}")
+        run = step.get("run", "")
+        # A step that holds it pushes: the inline login, or the repo's build script.
+        check(f"{where}/{job_id}: only a pushing step holds the token",
+              run == rr.BUILD_IMAGE or (rr.FORGE_LOGIN_LINE in run and "--password-stdin" in run))
+        check(f"{where}/{job_id}: the token is in no argv", "$FORGE_REGISTRY_TOKEN\" |" in run or run == rr.BUILD_IMAGE)
+    builders = [j for j in wf["jobs"] if plain(j) in ("docker", "rebuild")]
+    check(f"{where}: every build job pushes with the forge token",
+          {j for j, _ in steps} == set(builders))
+    for job_id, job in wf["jobs"].items():
+        if job_id not in builders:
+            check(f"{where}/{job_id}: holds no registry token", "FORGE_REGISTRY_TOKEN" not in yaml.safe_dump(job))
+
+# FORGE_PUBLISHES read the way the forge does, on the events a service file triggers on.
+def publishes(event, ref):
+    expr = rr.FORGE_PUBLISHES.replace("&&", " and ").replace("||", " or ")
+    return eval(expr, {}, {"github": type("G", (), {"event_name": event, "ref": ref})})
+
+
+for event, ref, want in [
+    ("push", "refs/heads/main", True),
+    ("workflow_dispatch", "refs/heads/main", True),
+    ("schedule", "main", True),  # Forgejo hands a schedule the bare branch
+    ("workflow_dispatch", "refs/heads/feature", False),
+    ("push", "refs/heads/feature", False),
+    ("pull_request", "refs/pull/3/head", False),
+    ("pull_request", "refs/heads/main", False),
+]:
+    check(f"FORGE_PUBLISHES on {event} {ref} is {want}", publishes(event, ref) is want)
+
+refuses("an unknown registry", single, {**ghcr_twin(single), "registry": "quay"}, "registry must be one of")
+smoked = next((r for r, e in table.items() if "image_smoke" in e), None)
+if smoked:
+    refuses("a forge smoke", smoked, {**ghcr_twin(smoked), "registry": "forge"}, "image_smoke pulls with the push token")
+image_family = next((r for r, e in table.items() if e["family"] == "image"), None)
+if image_family:
+    refuses("a registry on the image family", image_family, {**ghcr_twin(image_family), "registry": "forge"}, "registry")
+
 print(f"{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
 PY
