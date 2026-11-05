@@ -2,6 +2,7 @@
 # Render every repo in repos.yml into <clones>/<repo>/.forgejo/workflows/ (HL-711).
 #   sync-repos.sh <clones-dir>          write the files
 #   sync-repos.sh --check <clones-dir>  exit 1 if any file differs from its render, or a build script it names is missing
+#                                       or, on the forge, breaks the build script contract
 # Re-run after any change to repos.yml or render_repo.py, and after deploy.yml's webhook step moves v1.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,6 +25,11 @@ while read -r repo workflow; do
     # fails to build its image, and nothing short of the first release would show that.
     if grep -q '\.forgejo/build-image\.sh' <<< "$want" && [ ! -x "$dir/.forgejo/build-image.sh" ]; then
       echo "no build script: $dir/.forgejo/build-image.sh"; stale=1
+    fi
+    # A forge render hands that script the owner-wide push token (render_repo.py forge_script_faults).
+    if grep -q '\.forgejo/build-image\.sh' <<< "$want" && grep -q 'FORGE_REGISTRY_TOKEN' <<< "$want" \
+      && [ -f "$dir/.forgejo/build-image.sh" ]; then
+      python3 "$HERE/render_repo.py" --check-forge-script "$dir/.forgejo/build-image.sh" || stale=1
     fi
   else
     mkdir -p "$(dirname "$target")"

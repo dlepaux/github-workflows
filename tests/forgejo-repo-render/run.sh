@@ -626,14 +626,21 @@ for name, call, word in (
 # The forge registry (homelab HL-787 item 6). FORGE_REGISTRY_TOKEN is owner-wide write:package, so
 # it may sit in the env of a pushing step alone, and only behind FORGE_PUBLISHES: a pull request's or
 # a branch's run reads it empty whatever its job's condition. Each GHCR render stays as it was.
+FORGE_STDIN_LOGIN = """printf '%s' "$FORGE_REGISTRY_TOKEN" | docker login forgejo.lepaux.com -u "$FORGE_REGISTRY_USER" --password-stdin"""
+
+
 def ghcr_twin(repo):
     return copy.deepcopy(table[repo])
 
 
 single = next(r for r, e in table.items() if e["family"] == "service" and not e.get("multi_arch") and "image_env" not in e)
 multi = next(r for r, e in table.items() if e["family"] == "service" and e.get("multi_arch") and "image_smoke" not in e)
+with_env = next(r for r, e in table.items() if e["family"] == "service" and "image_env" in e
+                and not e.get("image_on_every_push") and "image_smoke" not in e)
+# The real forge entries too, once repos.yml has any, so a flip is checked as written.
+real_forge = [r for r, e in table.items() if rr.registry_of(e) == "forge"]
 forge_renders = {}
-for repo in (single, multi):
+for repo in dict.fromkeys((single, multi, with_env, *real_forge)):
     entry = {**ghcr_twin(repo), "registry": "forge"}
     for events in [rr.SERVICE_EVENTS, *rr.SERVICE_FILES.values()]:
         forge_renders[(repo, tuple(events))] = rr.render_repo(repo, entry, DEPLOY, events=events)
@@ -648,6 +655,7 @@ def token_steps(wf):
                 yield job_id, step
 
 
+rendered_tokens = set()
 for (repo, events), text in forge_renders.items():
     where = f"{repo} forge {'+'.join(events)}"
     wf = yaml.safe_load(text)
@@ -659,13 +667,22 @@ for (repo, events), text in forge_renders.items():
     for job_id, step in steps:
         env = step.get("env", {})
         check(f"{where}/{job_id}: the token is guarded", env.get("FORGE_REGISTRY_TOKEN") == rr.FORGE_TOKEN)
+        rendered_tokens.add(env.get("FORGE_REGISTRY_TOKEN"))
         check(f"{where}/{job_id}: the image is the forge's", env.get("IMAGE") == f"forgejo.lepaux.com/dlepaux/{repo}")
         check(f"{where}/{job_id}: the user is the repo var", env.get("FORGE_REGISTRY_USER") == "${{ vars.FORGE_REGISTRY_USER }}")
         run = step.get("run", "")
         # A step that holds it pushes: the inline login, or the repo's build script.
         check(f"{where}/{job_id}: only a pushing step holds the token",
               run == rr.BUILD_IMAGE or (rr.FORGE_LOGIN_LINE in run and "--password-stdin" in run))
-        check(f"{where}/{job_id}: the token is in no argv", "$FORGE_REGISTRY_TOKEN\" |" in run or run == rr.BUILD_IMAGE)
+        # Past its emptiness check and its stdin login, a script names the token nowhere: an echo, a
+        # `docker login -p` or a `-e` beside them would leak it.
+        # The two lines are written out here, not read from the generator, so a constant that gains a
+        # leak fails this check instead of redefining it.
+        named = [line for line in run.splitlines() if "FORGE_REGISTRY_TOKEN" in line]
+        allowed = [line for line in named if re.fullmatch(r': "\$\{FORGE_REGISTRY_TOKEN:\?[^}$`]*\}"', line)
+                   or line == FORGE_STDIN_LOGIN]
+        check(f"{where}/{job_id}: the token is in no argv or log",
+              named == allowed and (run == rr.BUILD_IMAGE or len(named) == 2))
     builders = [j for j in wf["jobs"] if plain(j) in ("docker", "rebuild")]
     check(f"{where}: every build job pushes with the forge token",
           {j for j, _ in steps} == set(builders))
@@ -673,24 +690,70 @@ for (repo, events), text in forge_renders.items():
         if job_id not in builders:
             check(f"{where}/{job_id}: holds no registry token", "FORGE_REGISTRY_TOKEN" not in yaml.safe_dump(job))
 
-# FORGE_PUBLISHES read the way the forge does, on the events a service file triggers on.
-def publishes(event, ref):
-    expr = rr.FORGE_PUBLISHES.replace("&&", " and ").replace("||", " or ")
-    return eval(expr, {}, {"github": type("G", (), {"event_name": event, "ref": ref})})
+# The token expression the renders carry, evaluated here: what a step reads on each event. It is
+# the rendered string, not FORGE_PUBLISHES, so a constant that drops the guard fails the table.
+# Python's and/or mirror the expression language's &&/|| on these strings; this checks the logic,
+# not how Forgejo's parser reads it (GitHub, for one, compares strings case-insensitively).
+check("every forge step carries one token expression", len(rendered_tokens) == 1)
+token_expr = next(iter(rendered_tokens))
+check("the token expression is a ${{ }} block", token_expr.startswith("${{ ") and token_expr.endswith(" }}"))
+
+
+def step_reads(event, ref):
+    expr = token_expr[4:-3].replace("&&", " and ").replace("||", " or ")
+    names = {"github": type("G", (), {"event_name": event, "ref": ref}),
+             "secrets": type("S", (), {"FORGE_REGISTRY_TOKEN": "the-secret"})}
+    return eval(expr, {"__builtins__": {}}, names)
 
 
 for event, ref, want in [
     ("push", "refs/heads/main", True),
     ("workflow_dispatch", "refs/heads/main", True),
     ("schedule", "main", True),  # Forgejo hands a schedule the bare branch
+    ("schedule", "refs/heads/main", True),
     ("workflow_dispatch", "refs/heads/feature", False),
+    ("workflow_dispatch", "main", False),
     ("push", "refs/heads/feature", False),
+    ("push", "refs/tags/v1.0.0", False),
     ("pull_request", "refs/pull/3/head", False),
     ("pull_request", "refs/heads/main", False),
+    ("pull_request_target", "refs/heads/main", False),
+    ("release", "refs/heads/main", False),
 ]:
-    check(f"FORGE_PUBLISHES on {event} {ref} is {want}", publishes(event, ref) is want)
+    check(f"a step on {event} {ref} reads {'the token' if want else 'nothing'}",
+          step_reads(event, ref) == ("the-secret" if want else ""))
 
 refuses("an unknown registry", single, {**ghcr_twin(single), "registry": "quay"}, "registry must be one of")
+for registry in rr.REGISTRIES:
+    for key in ("FORGE_REGISTRY_TOKEN", "GHCR_WRITE_TOKEN", "IMAGE"):
+        refuses(f"a {registry} image_env setting {key}", single,
+                {**ghcr_twin(single), "registry": registry, "image_env": {key: "${{ secrets.FORGE_REGISTRY_TOKEN }}"}},
+                "image_env may not set")
+# The forge build script's contract, on scripts written the ways a port could go wrong.
+GOOD_SCRIPT = (
+    '#!/usr/bin/env bash\nset -euo pipefail\n'
+    ': "${FORGE_REGISTRY_TOKEN:?FORGE_REGISTRY_TOKEN is empty}"\n'
+    'DOCKER_CONFIG=$(mktemp -d)\nexport DOCKER_CONFIG\n'
+    + FORGE_STDIN_LOGIN + '\n'
+    'docker buildx build --push -t "$IMAGE:sha-${GIT_SHA:0:7}" .\n'
+)
+check("a forge build script that keeps the contract passes", rr.forge_script_faults(GOOD_SCRIPT) == [])
+for name, script, word in [
+    ("still on GHCR", GOOD_SCRIPT.replace('"$IMAGE', 'ghcr.io/dlepaux/x'), "names GHCR"),
+    ("a hardcoded image", GOOD_SCRIPT.replace('"$IMAGE', '"forgejo.lepaux.com/dlepaux/x'), "does not push to $IMAGE"),
+    ("no stdin login", GOOD_SCRIPT.replace(FORGE_STDIN_LOGIN, 'docker login forgejo.lepaux.com -u u -p "$FORGE_REGISTRY_TOKEN"'), "on stdin"),
+    ("the token lent to trivy", GOOD_SCRIPT + 'docker run -e TRIVY_PASSWORD="$FORGE_REGISTRY_TOKEN" aquasec/trivy image "$IMAGE"\n', "hands the token on"),
+    ("the token passed into a container", GOOD_SCRIPT + 'docker run -e FORGE_REGISTRY_TOKEN alpine true\n', "hands the token on"),
+    ("the token copied first", GOOD_SCRIPT + 'tok=$FORGE_REGISTRY_TOKEN\n', "hands the token on"),
+    ("the token echoed", GOOD_SCRIPT + 'echo "$FORGE_REGISTRY_TOKEN"\n', "hands the token on"),
+]:
+    faults = rr.forge_script_faults(script)
+    check(f"a forge build script with {name} is refused", any(word in f for f in faults))
+
+every_push = next((r for r, e in table.items() if e.get("image_on_every_push")), None)
+if every_push:
+    refuses("a forge image on every push", every_push, {**ghcr_twin(every_push), "registry": "forge"},
+            "image_on_every_push builds on branches")
 smoked = next((r for r, e in table.items() if "image_smoke" in e), None)
 if smoked:
     refuses("a forge smoke", smoked, {**ghcr_twin(smoked), "registry": "forge"}, "image_smoke pulls with the push token")
@@ -746,4 +809,40 @@ rm -rf "$WORK/$victim"
 if "$ROOT/forgejo/sync-repos.sh" --check "$WORK" > /dev/null 2>&1; then
   echo "FAIL: a missing clone passed"; exit 1
 fi
-echo "ok: sync-repos.sh writes the table, and --check names a hand edit, a missing build script and refuses a missing clone"
+# A forge render's build script is held to its contract: a scratch copy of this repo with one
+# service flipped, its script a GHCR one (a port not yet done), then the contract's own.
+FORGE_COPY="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$FORGE_COPY"' EXIT
+cp -R "$ROOT/." "$FORGE_COPY/"
+flipped="$(python3 - "$FORGE_COPY/forgejo/repos.yml" <<'FLIP'
+import sys, yaml
+path = sys.argv[1]
+table = yaml.safe_load(open(path))
+repos = table["repos"] if "repos" in table else table
+repo = next(r for r, e in repos.items() if e.get("family") == "service" and not e.get("multi_arch")
+            and "image_smoke" not in e and not e.get("image_on_every_push"))
+repos[repo]["registry"] = "forge"
+yaml.safe_dump(table, open(path, "w"), sort_keys=False)
+print(repo)
+FLIP
+)"
+FORGE_WORK="$FORGE_COPY/clones"
+mkdir -p "$FORGE_WORK/$flipped/.git"
+for repo in $repos; do mkdir -p "$FORGE_WORK/$repo/.git"; done
+"$FORGE_COPY/forgejo/sync-repos.sh" "$FORGE_WORK" > /dev/null
+for dir in $(grep -l 'forgejo/build-image\.sh' "$FORGE_WORK"/*/.forgejo/workflows/* | sed -E 's|/\.forgejo/.*||'); do
+  printf '#!/bin/sh\n' > "$dir/.forgejo/build-image.sh"; chmod +x "$dir/.forgejo/build-image.sh"
+done
+script="$FORGE_WORK/$flipped/.forgejo/build-image.sh"
+printf '#!/bin/sh\nIMAGE=ghcr.io/dlepaux/%s\nprintf %%s "$GHCR_WRITE_TOKEN" | docker login ghcr.io -u dlepaux --password-stdin\n' "$flipped" > "$script"
+if "$FORGE_COPY/forgejo/sync-repos.sh" --check "$FORGE_WORK" > "$FORGE_WORK/out"; then
+  echo "FAIL: --check passed $flipped's forge render with a GHCR build script"; exit 1
+fi
+grep -q "forge build script $script: still names GHCR" "$FORGE_WORK/out" \
+  || { echo "FAIL: --check did not name $flipped's GHCR build script:"; cat "$FORGE_WORK/out"; exit 1; }
+python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import render_repo as rr; open(sys.argv[2], "w").write(
+  "#!/bin/sh\n: \"${FORGE_REGISTRY_TOKEN:?empty}\"\n" + rr.FORGE_SCRIPT_LOGIN + "\ndocker push \"$IMAGE\"\n")' \
+  "$FORGE_COPY/forgejo" "$script"
+"$FORGE_COPY/forgejo/sync-repos.sh" --check "$FORGE_WORK" > "$FORGE_WORK/out" \
+  || { echo "FAIL: --check refused $flipped's contract-keeping build script:"; cat "$FORGE_WORK/out"; exit 1; }
+echo "ok: sync-repos.sh writes the table, and --check names a hand edit, a missing build script, a forge build script off its contract, and refuses a missing clone"

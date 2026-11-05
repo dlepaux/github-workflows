@@ -28,10 +28,12 @@ families were written as, which is what tests/forgejo-repo-render reasons about.
 
 Usage:
   render_repo.py --list               # print each "<repo> <workflow file>", one line per file
+  render_repo.py --check-forge-script <path>   # exit 1 naming each way a forge build script breaks its contract
   render_repo.py <repo> <file>        # print that workflow
   RENDER_REF=<ref> overrides the ref deploy.yml is read at (default v1).
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -178,10 +180,17 @@ GHCR_LOGIN_LINE = """printf '%s' "$GHCR_WRITE_TOKEN" | docker login ghcr.io -u d
 # main: a pull request's, or a branch's, never reads it, whatever the job's own condition says. A
 # schedule's ref is the bare `main` (REBUILD_EVENTS), hence both forms.
 FORGE_REGISTRY = "forgejo.lepaux.com"
-FORGE_PUBLISHES = "github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'main')"
-FORGE_TOKEN = f"${{{{ {FORGE_PUBLISHES} && secrets.FORGE_REGISTRY_TOKEN || '' }}}}"
+# An allowlist of events, not a denylist: pull_request_target reports the base ref, so a
+# `!= 'pull_request'` guard would hand it the token the day a service file triggers on it. A schedule
+# takes both ref forms, so a forge that stops sending the bare branch keeps its rebuilds.
+FORGE_PUBLISHES = (
+    "(github.event_name == 'schedule' && (github.ref == 'main' || github.ref == 'refs/heads/main'))"
+    " || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')"
+)
+FORGE_TOKEN = f"${{{{ ({FORGE_PUBLISHES}) && secrets.FORGE_REGISTRY_TOKEN || '' }}}}"
 FORGE_LOGIN = (
     ': "${FORGE_REGISTRY_TOKEN:?FORGE_REGISTRY_TOKEN is empty: not set on this repo (homelab forgejo_registry_repos), or the run is not on main}"\n'
+    ': "${FORGE_REGISTRY_USER:?FORGE_REGISTRY_USER is empty: the repo var homelab forgejo_registry_repos sets is missing}"\n'
     'DOCKER_CONFIG=$(mktemp -d)\n'
     'export DOCKER_CONFIG\n'
 )
@@ -376,6 +385,34 @@ def push_env(repo, entry):
     }
 
 
+# A forge service's own .forgejo/build-image.sh receives the push step's env: IMAGE (the forge path),
+# FORGE_REGISTRY_USER and the owner-wide FORGE_REGISTRY_TOKEN. Its contract: push to "$IMAGE", log in
+# with the token on stdin, and hand the token to nothing else, a scanner's pull included (trivy's
+# TRIVY_PASSWORD, a `-e` into another container), since that token could overwrite any image.
+# sync-repos.sh --check holds each forge repo's script to it.
+FORGE_SCRIPT_LOGIN = (
+    """printf '%s' "$FORGE_REGISTRY_TOKEN" | docker login forgejo.lepaux.com -u "$FORGE_REGISTRY_USER" --password-stdin"""
+)
+
+
+def forge_script_faults(script):
+    """What a forge build script does against that contract, one line per fault; empty if it holds."""
+    faults = []
+    if "ghcr.io" in script or "GHCR_WRITE_TOKEN" in script:
+        faults.append("still names GHCR (ghcr.io or GHCR_WRITE_TOKEN)")
+    if not re.search(r'\$\{?IMAGE\b', script):
+        faults.append("does not push to $IMAGE")
+    if FORGE_SCRIPT_LOGIN not in script:
+        faults.append("does not log in with the token on stdin")
+    for line in script.splitlines():
+        stripped = line.strip()
+        if "FORGE_REGISTRY_TOKEN" not in stripped or stripped == FORGE_SCRIPT_LOGIN:
+            continue
+        if not re.fullmatch(r': "\$\{FORGE_REGISTRY_TOKEN:\?[^}$`]*\}"', stripped):
+            faults.append(f"hands the token on: {stripped}")
+    return faults
+
+
 def for_registry(script, entry):
     """A GHCR script as written, or the same script logging in to the forge."""
     if registry_of(entry) == "ghcr":
@@ -480,6 +517,14 @@ def every_push_guard(gates, push_only=False):
 def check_service(repo, entry):
     if registry_of(entry) not in REGISTRIES:
         raise RenderError(f"{repo}: registry must be one of {list(REGISTRIES)}")
+    # image_env is merged after the push env, so a key in both would replace the credential or the image.
+    push_keys = set(push_env(repo, {"registry": "ghcr"})) | set(push_env(repo, {"registry": "forge"}))
+    clash = sorted(set(entry.get("image_env", {})) & push_keys)
+    if clash:
+        raise RenderError(f"{repo}: image_env may not set {clash}, the push step's own credential and image")
+    # A branch push reads the forge token empty, so every branch's image job would fail its login.
+    if registry_of(entry) == "forge" and entry.get("image_on_every_push", False):
+        raise RenderError(f"{repo}: image_on_every_push builds on branches, which the forge token never reaches")
     # The smoke pulls with the push token, which the forge's is too wide to lend a pull: a forge smoke
     # needs a read token of its own, which no repo has yet.
     if registry_of(entry) == "forge" and "image_smoke" in entry:
@@ -844,6 +889,12 @@ def main(argv):
             print(f"render_repo.py: {e}", file=sys.stderr)
             return 1
         return 0
+    if len(argv) == 3 and argv[1] == "--check-forge-script":
+        with open(argv[2], encoding="utf-8") as f:
+            faults = forge_script_faults(f.read())
+        for fault in faults:
+            print(f"forge build script {argv[2]}: {fault}")
+        return 1 if faults else 0
     if len(argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
