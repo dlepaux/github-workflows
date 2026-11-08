@@ -400,7 +400,12 @@ def forge_script_faults(script):
     faults = []
     if "ghcr.io" in script or "GHCR_WRITE_TOKEN" in script:
         faults.append("still names GHCR (ghcr.io or GHCR_WRITE_TOKEN)")
-    if not re.search(r'\$\{?IMAGE\b', script):
+    # A static read, not dataflow: the script must push, and use $IMAGE beyond its `:?` guard. Comments
+    # count for neither, and a guard alone once passed as a push (GS-116).
+    code = [ln.strip() for ln in script.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if not any(re.search(r'docker (push|manifest push|buildx imagetools create)\b|--push\b', ln) for ln in code):
+        faults.append("does not push")
+    if not any(re.search(r'\$\{?IMAGE\b', ln) and not re.fullmatch(r': "\$\{IMAGE:\?[^}$`]*\}"', ln) for ln in code):
         faults.append("does not push to $IMAGE")
     if FORGE_SCRIPT_LOGIN not in script:
         faults.append("does not log in with the token on stdin")

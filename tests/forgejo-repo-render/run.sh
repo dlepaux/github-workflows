@@ -744,6 +744,13 @@ check("a forge build script that keeps the contract passes", rr.forge_script_fau
 for name, script, word in [
     ("still on GHCR", GOOD_SCRIPT.replace('"$IMAGE', 'ghcr.io/dlepaux/x'), "names GHCR"),
     ("a hardcoded image", GOOD_SCRIPT.replace('"$IMAGE', '"forgejo.lepaux.com/dlepaux/x'), "does not push to $IMAGE"),
+    ("$IMAGE only in its guard", GOOD_SCRIPT.replace('"$IMAGE:sha-${GIT_SHA:0:7}"', '"forgejo.lepaux.com/dlepaux/x"')
+     + ': "${IMAGE:?unset}"\n', "does not push to $IMAGE"),
+    ("$IMAGE only in a comment", GOOD_SCRIPT.replace('"$IMAGE:sha-${GIT_SHA:0:7}"', '"forgejo.lepaux.com/dlepaux/x"')
+     + '# pushes to "$IMAGE"\n', "does not push to $IMAGE"),
+    ("no push at all", GOOD_SCRIPT.replace("docker buildx build --push", "docker buildx build"), "does not push"),
+    ("a push only in a comment", GOOD_SCRIPT.replace("docker buildx build --push", "docker buildx build")
+     + '# then docker push "$IMAGE"\n', "does not push"),
     ("no stdin login", GOOD_SCRIPT.replace(FORGE_STDIN_LOGIN, 'docker login forgejo.lepaux.com -u u -p "$FORGE_REGISTRY_TOKEN"'), "on stdin"),
     ("the token lent to trivy", GOOD_SCRIPT + 'docker run -e TRIVY_PASSWORD="$FORGE_REGISTRY_TOKEN" aquasec/trivy image "$IMAGE"\n', "hands the token on"),
     ("the token passed into a container", GOOD_SCRIPT + 'docker run -e FORGE_REGISTRY_TOKEN alpine true\n', "hands the token on"),
