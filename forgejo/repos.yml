@@ -978,6 +978,8 @@ getshortlisted-www:
   image_timeout: 60
   deploy_url: https://webhook.lepaux.com/deploy
   deploy_rebuild: true
+  # Publishes to the forge registry (GS-116): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 
 getshortlisted-api:
   family: service
@@ -1000,6 +1002,8 @@ getshortlisted-api:
   image_timeout: 60
   deploy_url: https://webhook.lepaux.com/deploy
   deploy_rebuild: true
+  # Publishes to the forge registry (GS-116): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 
 vps-edge:
   family: verify

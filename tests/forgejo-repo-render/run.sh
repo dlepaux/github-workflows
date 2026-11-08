@@ -630,7 +630,10 @@ FORGE_STDIN_LOGIN = """printf '%s' "$FORGE_REGISTRY_TOKEN" | docker login forgej
 
 
 def ghcr_twin(repo):
-    return copy.deepcopy(table[repo])
+    """The entry as it would be on GHCR: a real forge entry (GS-116 was the first) loses its key."""
+    entry = copy.deepcopy(table[repo])
+    entry.pop("registry", None)
+    return entry
 
 
 single = next(r for r, e in table.items() if e["family"] == "service" and not e.get("multi_arch") and "image_env" not in e)
@@ -774,7 +777,11 @@ for repo in $repos; do mkdir -p "$WORK/$repo/.git"; done
 "$ROOT/forgejo/sync-repos.sh" "$WORK" > /dev/null
 needs_script="$(grep -l 'forgejo/build-image\.sh' "$WORK"/*/.forgejo/workflows/* | sed -E 's|/\.forgejo/.*||')"
 [ -n "$needs_script" ] || { echo "FAIL: no repo renders the build script, so the check below proves nothing"; exit 1; }
-for dir in $needs_script; do printf '#!/bin/sh\n' > "$dir/.forgejo/build-image.sh"; chmod +x "$dir/.forgejo/build-image.sh"; done
+# Each stub keeps the forge contract, since a real repo may render for the forge (GS-116 onwards); a
+# GHCR render never applies it.
+stub_script="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import render_repo as rr; print(
+  "#!/bin/sh\n: \"${FORGE_REGISTRY_TOKEN:?empty}\"\n" + rr.FORGE_SCRIPT_LOGIN + "\ndocker push \"$IMAGE\"")' "$ROOT/forgejo")"
+for dir in $needs_script; do printf '%s\n' "$stub_script" > "$dir/.forgejo/build-image.sh"; chmod +x "$dir/.forgejo/build-image.sh"; done
 "$ROOT/forgejo/sync-repos.sh" --check "$WORK"
 script_victim="$(printf '%s\n' $needs_script | head -1)"
 chmod -x "$script_victim/.forgejo/build-image.sh"
@@ -831,7 +838,7 @@ mkdir -p "$FORGE_WORK/$flipped/.git"
 for repo in $repos; do mkdir -p "$FORGE_WORK/$repo/.git"; done
 "$FORGE_COPY/forgejo/sync-repos.sh" "$FORGE_WORK" > /dev/null
 for dir in $(grep -l 'forgejo/build-image\.sh' "$FORGE_WORK"/*/.forgejo/workflows/* | sed -E 's|/\.forgejo/.*||'); do
-  printf '#!/bin/sh\n' > "$dir/.forgejo/build-image.sh"; chmod +x "$dir/.forgejo/build-image.sh"
+  printf '%s\n' "$stub_script" > "$dir/.forgejo/build-image.sh"; chmod +x "$dir/.forgejo/build-image.sh"
 done
 script="$FORGE_WORK/$flipped/.forgejo/build-image.sh"
 printf '#!/bin/sh\nIMAGE=ghcr.io/dlepaux/%s\nprintf %%s "$GHCR_WRITE_TOKEN" | docker login ghcr.io -u dlepaux --password-stdin\n' "$flipped" > "$script"
