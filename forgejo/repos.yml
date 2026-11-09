@@ -25,6 +25,8 @@ homelab-hub:
   image_env:
     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
   deploy_url: https://apps.webhook.lepaux.com/deploy
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 homelab-maps:
   family: service
   gates:
@@ -44,6 +46,8 @@ homelab-maps:
         run: npm test
   image_timeout: 30
   deploy_url: https://apps.webhook.lepaux.com/deploy
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 pihole-exporter:
   family: service
   gates:
@@ -78,6 +82,8 @@ pihole-exporter:
       - name: Security audit
         run: cargo deny check advisories
   image_timeout: 45
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 image-update-exporter:
   family: service
   multi_arch: true
@@ -121,6 +127,8 @@ image-update-exporter:
       - name: Security audit
         run: cargo deny check advisories
   image_timeout: 45
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 epubarr:
   family: service
   multi_arch: true
@@ -215,6 +223,8 @@ epubarr:
     minor=$(docker buildx imagetools inspect "$IMAGE:${VERSION%.*}" --format '{{ json .Manifest.Digest }}')
     patch=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{ json .Manifest.Digest }}')
     [ "$minor" = "$patch" ] || { echo "::error::${VERSION%.*} is not $VERSION"; exit 1; }
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 homelab-webhook:
   family: service
   multi_arch: true
@@ -291,9 +301,13 @@ homelab-webhook:
     [ "$printed" = "homelab-webhook $VERSION" ] || { echo "::error::$PLATFORM prints '$printed'"; exit 1; }
     [ "$label" = "$VERSION" ] || { echo "::error::$PLATFORM is labelled '$label'"; exit 1; }
     docker run --rm --platform "$PLATFORM" --entrypoint docker "$IMAGE:$VERSION" compose version
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 protomaps-docker:
   family: service
   image_timeout: 30
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 homelab-grafana-generator:
   family: package
   gates:
@@ -704,6 +718,8 @@ curatarr:
   image_timeout: 30
   image_on_pull_request: true
   deploy_url: https://apps.webhook.lepaux.com/deploy
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 dinle:
   family: images
   note: |-
