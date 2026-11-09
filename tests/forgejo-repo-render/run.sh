@@ -147,7 +147,8 @@ for repo, wf in rendered.items():
                 **({"rebuild": EVERY_PUSH_REBUILD} if table[repo].get("image_on_every_push") else {}),
                 **({"deploy": DEPLOY_REBUILD} if table[repo].get("deploy_rebuild") else {}),
                 # The image job's PUBLISH condition: a pull request's or a branch's build is never published.
-                **({"deploy": "github.ref == 'refs/heads/main' && github.event_name != 'pull_request'"}
+                **({"deploy": "github.ref == 'refs/heads/main' && github.event_name != 'pull_request'"
+                    if rr.registry_of(table[repo]) == "ghcr" else rr.FORGE_PUBLISHES}
                    if table[repo]["family"] == "image" else {}),
                 # Its own cases are below: one image's guard, and a deploy past all of them.
                 **({"docker": job.get("if"), "deploy": job.get("if")} if table[repo]["family"] == "images" else {}),
@@ -242,27 +243,35 @@ for repo, wf in rendered.items():
         check(f"{repo}: deploy follows the image", deploy["needs"] == expected)
         check(f"{repo}: deploy runs deploy.yml's step", deploy["steps"][0]["run"] == DEPLOY)
 
-# The real deploy.yml still has the step the render takes.
-# The image family: its publish sits behind every gate, and a pull request never holds the token.
-for repo, wf in rendered.items():
-    if table[repo]["family"] != "image":
-        continue
+# The image family: its publish sits behind every gate, and a pull request never holds the token. On
+# the forge PUBLISH is the token's own guard, so the token is there exactly when the script may push.
+def image_family_checks(repo, entry, wf):
     job = wf["jobs"]["image"]
     needs = [job["needs"]] if isinstance(job["needs"], str) else job["needs"]
-    check(f"{repo}: image needs every gate", set(needs) == set(table[repo]["gates"]))
+    check(f"{repo}: image needs every gate", set(needs) == set(entry["gates"]))
     env = job["steps"][-1]["env"]
-    check(f"{repo}: a pull request holds no token", "github.event_name != 'pull_request' &&" in env["GHCR_WRITE_TOKEN"])
-    check(f"{repo}: only main publishes", "refs/heads/main" in env["PUBLISH"] and "pull_request" in env["PUBLISH"])
+    if rr.registry_of(entry) == "forge":
+        check(f"{repo}: PUBLISH is the token's guard",
+              env.get("PUBLISH") == "${{ " + rr.FORGE_PUBLISHES + " }}" and env.get("FORGE_REGISTRY_TOKEN") == rr.FORGE_TOKEN)
+        check(f"{repo}: deploys what PUBLISH published",
+              "deploy" not in wf["jobs"] or wf["jobs"]["deploy"].get("if") == rr.FORGE_PUBLISHES)
+    else:
+        check(f"{repo}: a pull request holds no token", "github.event_name != 'pull_request' &&" in env.get("GHCR_WRITE_TOKEN", ""))
+        check(f"{repo}: only main publishes", "refs/heads/main" in env.get("PUBLISH", "") and "pull_request" in env.get("PUBLISH", ""))
     check(f"{repo}: image builds on a pull request only if asked",
-          ("if" in job) != table[repo].get("image_on_pull_request", False))
+          ("if" in job) != entry.get("image_on_pull_request", False))
+
+
+for repo, wf in rendered.items():
+    if table[repo]["family"] == "image":
+        image_family_checks(repo, table[repo], wf)
+
 
 # The images family: nothing builds on a pull request or a push without a release, and the deploy
 # waits for every image, since the app's start requeues failures onto the worker's image (dinle).
-for repo, wf in rendered.items():
-    if table[repo]["family"] != "images":
-        continue
+def images_family_checks(repo, entry, wf):
     jobs = wf["jobs"]
-    built = [f"{n}-image" for n in table[repo]["images"]]
+    built = [f"{n}-image" for n in entry["images"]]
     for job_id in built:
         job = jobs[job_id]
         check(f"{repo}/{job_id}: follows the release", "release" in job["needs"])
@@ -271,7 +280,7 @@ for repo, wf in rendered.items():
             "needs.worker.result == 'success' && (github.event_name == 'workflow_dispatch' || "
             "(github.event_name == 'push' && needs.release.result == 'success' && needs.release.outputs.version != ''))"
         ))
-        for gate in table[repo]["gates"]:
+        for gate in entry["gates"]:
             check(f"{repo}/{job_id}: {gate} must be green", f"needs.{gate}.result == 'success'" in job["if"])
         check(f"{repo}/{job_id}: main only", "refs/heads/main" in job["if"])
         check(f"{repo}/{job_id}: a push needs a release", "needs.release.outputs.version != ''" in job["if"])
@@ -285,7 +294,13 @@ for repo, wf in rendered.items():
     for job_id in built:
         check(f"{repo}: deploy needs {job_id} green", f"needs.{job_id}.result == 'success'" in jobs["deploy"]["if"])
     check(f"{repo}: a checkout holds no token",
-          all("GHCR_WRITE_TOKEN" not in jobs[j]["steps"][i].get("env", {}) for j in built for i in (0, 1)))
+          all(not {"GHCR_WRITE_TOKEN", "FORGE_REGISTRY_TOKEN"} & set(jobs[j]["steps"][i].get("env", {}))
+              for j in built for i in (0, 1)))
+
+
+for repo, wf in rendered.items():
+    if table[repo]["family"] == "images":
+        images_family_checks(repo, table[repo], wf)
 
 # The tag-release family: only a pushed tag publishes, past every gate, and a tag runs the gates.
 for repo, wf in rendered.items():
@@ -336,19 +351,27 @@ with tempfile.TemporaryDirectory() as stub_dir:
               "run --rm") echo "epubarr ${STUB_PRINTS:-1.2.3}" ;;
               "image inspect") echo "${STUB_LABEL:-1.2.3}" ;;
               "buildx imagetools") case "$4" in *:1.2) echo "${STUB_MINOR:-same}" ;; *) echo same ;; esac ;;
+              "login forgejo.lepaux.com") [ "$(cat)" = "${STUB_TOKEN:-}" ] || exit 9 ;;
               *) echo "unexpected docker $*" >&2; exit 9 ;;
             esac
             """))
     os.chmod(stub, 0o755)
-    def smoke(**env):
+    def smoke(script="set -euo pipefail\n" + table["epubarr"]["image_smoke"], **env):
         return subprocess.run(
-            ["bash", "-c", "set -euo pipefail\n" + table["epubarr"]["image_smoke"]],
+            ["bash", "-c", script],
             env={"PATH": f"{stub_dir}:{os.environ['PATH']}", "IMAGE": "img", "VERSION": "1.2.3",
                  "PLATFORM": "linux/arm64", **env}, capture_output=True, text=True).returncode
     check("epubarr's smoke passes a right image", smoke() == 0)
     check("epubarr's smoke fails a wrong --version", smoke(STUB_PRINTS="1.2.2") == 1)
     check("epubarr's smoke fails a wrong label", smoke(STUB_LABEL="1.2.2") == 1)
     check("epubarr's smoke fails a minor tag on another digest", smoke(STUB_MINOR="other") == 1)
+    # The step a forge render runs: the read token's login, then the same smoke.
+    forge_smoke = yaml.safe_load(rr.render_repo("epubarr", {**table["epubarr"], "registry": "forge"}, DEPLOY))
+    forge_smoke = forge_smoke["jobs"]["smoke-arm64"]["steps"][0]["run"]
+    read = {"FORGE_REGISTRY_USER": "dlepaux", "FORGE_PACKAGE_READ_TOKEN": "the-read-token", "STUB_TOKEN": "the-read-token"}
+    check("epubarr's forge smoke logs in with the read token, then passes a right image", smoke(forge_smoke, **read) == 0)
+    check("epubarr's forge smoke still fails a wrong --version", smoke(forge_smoke, **read, STUB_PRINTS="1.2.2") == 1)
+    check("epubarr's forge smoke stops on an empty read token", smoke(forge_smoke, **{**read, "FORGE_PACKAGE_READ_TOKEN": ""}) != 0)
 for repo, entry in table.items():
     if "image_smoke" in entry:
         check(f"{repo}: its smoke script parses",
@@ -623,10 +646,19 @@ for name, call, word in (
     else:
         check(f"refused: {name}", False)
 
-# The forge registry (homelab HL-787 item 6). FORGE_REGISTRY_TOKEN is owner-wide write:package, so
-# it may sit in the env of a pushing step alone, and only behind FORGE_PUBLISHES: a pull request's or
-# a branch's run reads it empty whatever its job's condition. Each GHCR render stays as it was.
+# The forge registry (homelab HL-787 item 6, HL-843). FORGE_REGISTRY_TOKEN is owner-wide
+# write:package, so it may sit in the env of a pushing step alone, and only behind FORGE_PUBLISHES: a
+# pull request's or a branch's run reads it empty whatever its job's condition. A smoke pulls with
+# FORGE_PACKAGE_READ_TOKEN, owner-wide too and guarded the same way. Each GHCR render stays as it was.
 FORGE_STDIN_LOGIN = """printf '%s' "$FORGE_REGISTRY_TOKEN" | docker login forgejo.lepaux.com -u "$FORGE_REGISTRY_USER" --password-stdin"""
+FORGE_READ_STDIN_LOGIN = """printf '%s' "$FORGE_PACKAGE_READ_TOKEN" | docker login forgejo.lepaux.com -u "$FORGE_REGISTRY_USER" --password-stdin"""
+# Each token: its guarded expression, the line that logs in with it, and the jobs that may hold it.
+# The lines are written out here, not read from the generator, so a constant that gains a leak fails
+# these checks instead of redefining them.
+TOKENS = {
+    "FORGE_REGISTRY_TOKEN": (rr.FORGE_TOKEN, FORGE_STDIN_LOGIN, ("docker", "rebuild", "image")),
+    "FORGE_PACKAGE_READ_TOKEN": (rr.FORGE_READ_TOKEN, FORGE_READ_STDIN_LOGIN, ("smoke",)),
+}
 
 
 def ghcr_twin(repo):
@@ -636,97 +668,264 @@ def ghcr_twin(repo):
     return entry
 
 
-single = next(r for r, e in table.items() if e["family"] == "service" and not e.get("multi_arch") and "image_env" not in e)
-multi = next(r for r, e in table.items() if e["family"] == "service" and e.get("multi_arch") and "image_smoke" not in e)
-with_env = next(r for r, e in table.items() if e["family"] == "service" and "image_env" in e
-                and not e.get("image_on_every_push") and "image_smoke" not in e)
-# The real forge entries too, once repos.yml has any, so a flip is checked as written.
-real_forge = [r for r, e in table.items() if rr.registry_of(e) == "forge"]
-forge_renders = {}
-for repo in dict.fromkeys((single, multi, with_env, *real_forge)):
-    entry = {**ghcr_twin(repo), "registry": "forge"}
-    for events in [rr.SERVICE_EVENTS, *rr.SERVICE_FILES.values()]:
-        forge_renders[(repo, tuple(events))] = rr.render_repo(repo, entry, DEPLOY, events=events)
-    check(f"{repo}: registry ghcr renders as no registry key",
-          rr.render_repo(repo, {**ghcr_twin(repo), "registry": "ghcr"}, DEPLOY) == rr.render_repo(repo, ghcr_twin(repo), DEPLOY))
+def script_call(run):
+    """The repo's own build script, alone or told which image; sync-repos.sh holds it to its contract."""
+    return re.fullmatch(re.escape(rr.BUILD_IMAGE) + r"( [a-z][a-z0-9-]*)?", run) is not None
 
 
-def token_steps(wf):
+def token_steps(wf, name):
     for job_id, job in wf["jobs"].items():
         for step in job.get("steps", []):
-            if "FORGE_REGISTRY_TOKEN" in yaml.safe_dump(step):
+            if name in yaml.safe_dump(step):
                 yield job_id, step
 
 
-rendered_tokens = set()
-for (repo, events), text in forge_renders.items():
-    where = f"{repo} forge {'+'.join(events)}"
-    wf = yaml.safe_load(text)
-    check(f"{where}: no GHCR credential left", "GHCR_WRITE_TOKEN" not in text and "docker login ghcr.io" not in text)
-    # Each mention of the secret is the guarded expression, so no step reads it bare.
-    check(f"{where}: the secret is read only behind FORGE_PUBLISHES",
-          text.count("secrets.FORGE_REGISTRY_TOKEN") == text.count(rr.FORGE_TOKEN))
-    steps = list(token_steps(wf))
-    for job_id, step in steps:
-        env = step.get("env", {})
-        check(f"{where}/{job_id}: the token is guarded", env.get("FORGE_REGISTRY_TOKEN") == rr.FORGE_TOKEN)
-        rendered_tokens.add(env.get("FORGE_REGISTRY_TOKEN"))
-        check(f"{where}/{job_id}: the image is the forge's", env.get("IMAGE") == f"forgejo.lepaux.com/dlepaux/{repo}")
-        check(f"{where}/{job_id}: the user is the repo var", env.get("FORGE_REGISTRY_USER") == "${{ vars.FORGE_REGISTRY_USER }}")
-        run = step.get("run", "")
-        # A step that holds it pushes: the inline login, or the repo's build script.
-        check(f"{where}/{job_id}: only a pushing step holds the token",
-              run == rr.BUILD_IMAGE or (rr.FORGE_LOGIN_LINE in run and "--password-stdin" in run))
-        # Past its emptiness check and its stdin login, a script names the token nowhere: an echo, a
-        # `docker login -p` or a `-e` beside them would leak it.
-        # The two lines are written out here, not read from the generator, so a constant that gains a
-        # leak fails this check instead of redefining it.
-        named = [line for line in run.splitlines() if "FORGE_REGISTRY_TOKEN" in line]
-        allowed = [line for line in named if re.fullmatch(r': "\$\{FORGE_REGISTRY_TOKEN:\?[^}$`]*\}"', line)
-                   or line == FORGE_STDIN_LOGIN]
-        check(f"{where}/{job_id}: the token is in no argv or log",
-              named == allowed and (run == rr.BUILD_IMAGE or len(named) == 2))
-    builders = [j for j in wf["jobs"] if plain(j) in ("docker", "rebuild")]
-    check(f"{where}: every build job pushes with the forge token",
-          {j for j, _ in steps} == set(builders))
-    for job_id, job in wf["jobs"].items():
-        if job_id not in builders:
-            check(f"{where}/{job_id}: holds no registry token", "FORGE_REGISTRY_TOKEN" not in yaml.safe_dump(job))
+single = next(r for r, e in table.items() if e["family"] == "service" and not e.get("multi_arch") and "image_env" not in e)
+image_family = next(r for r, e in table.items() if e["family"] == "image")
+images_family = next(r for r, e in table.items() if e["family"] == "images")
+# Every entry whose family can carry a registry renders for the forge, so each repo HL-843 flips is
+# checked before its flip as well as after it.
+forge_renders = {}
+for repo in [r for r, e in table.items() if "registry" in rr.FAMILY_KEYS[e["family"]]]:
+    entry = {**ghcr_twin(repo), "registry": "forge"}
+    scopes = [rr.SERVICE_EVENTS, *rr.SERVICE_FILES.values()] if entry["family"] == "service" else [rr.SERVICE_EVENTS]
+    for events in scopes:
+        forge_renders[(repo, tuple(events))] = rr.render_repo(repo, entry, DEPLOY, events=events)
+    check(f"{repo}: registry ghcr renders as no registry key",
+          rr.render_repo(repo, {**ghcr_twin(repo), "registry": "ghcr"}, DEPLOY) == rr.render_repo(repo, ghcr_twin(repo), DEPLOY))
+# The table is the coverage, so it must keep a case of every option and family that moves a token.
+forge_covered = {table[r]["family"] for r, _ in forge_renders} | {
+    k for r, _ in forge_renders for k in ("multi_arch", "image_smoke", "image_env", "image_on_every_push",
+                                           "deploy_rebuild", "deploy_url") if table[r].get(k)}
+check(f"the forge renders cover every option and family that moves a token ({sorted(forge_covered)})", forge_covered >= {
+    "service", "image", "images", "multi_arch", "image_smoke", "image_env", "image_on_every_push", "deploy_rebuild", "deploy_url"})
 
-# The token expression the renders carry, evaluated here: what a step reads on each event. It is
-# the rendered string, not FORGE_PUBLISHES, so a constant that drops the guard fails the table.
+rendered_tokens = {name: set() for name in TOKENS}
+for (repo, events), text in forge_renders.items():
+    wf = yaml.safe_load(text)
+    where = f"{repo} forge {'+'.join(wf['on'])}"
+    check(f"{where}: no GHCR credential left", "GHCR_WRITE_TOKEN" not in text and "docker login ghcr.io" not in text)
+    for name, (guarded, stdin_login, holders) in TOKENS.items():
+        # Each mention of the secret is the guarded expression, so no step reads it bare.
+        check(f"{where}: {name} is read only behind FORGE_PUBLISHES", text.count(f"secrets.{name}") == text.count(guarded))
+        steps = list(token_steps(wf, name))
+        for job_id, step in steps:
+            env, body = step.get("env", {}), step.get("run", "")
+            check(f"{where}/{job_id}: {name} is guarded", env.get(name) == guarded)
+            if name in env:
+                rendered_tokens[name].add(env[name])
+            check(f"{where}/{job_id}: the image is the forge's", env.get("IMAGE") == f"forgejo.lepaux.com/dlepaux/{repo}")
+            check(f"{where}/{job_id}: the user is the repo var", env.get("FORGE_REGISTRY_USER") == "${{ vars.FORGE_REGISTRY_USER }}")
+            # A step that holds it logs in with it: inline, or in the repo's build script.
+            check(f"{where}/{job_id}: only a step that logs in holds {name}", script_call(body) or stdin_login + "\n" in body)
+            # Past its emptiness check and its stdin login, a script names the token nowhere: an echo, a
+            # `docker login -p` or a `-e` beside them would leak it.
+            named = [line for line in body.splitlines() if name in line]
+            allowed = [line for line in named if re.fullmatch(r': "\$\{' + name + r':\?[^}$`]*\}"', line) or line == stdin_login]
+            check(f"{where}/{job_id}: {name} is in no argv or log", named == allowed and (script_call(body) or len(named) == 2))
+        check(f"{where}: every {'/'.join(holders)} job holds {name}, and no other job",
+              {j for j, _ in steps} == {j for j in wf["jobs"] if plain(j) in holders})
+        check(f"{where}: no job holds {name} outside its steps",
+              all(name not in yaml.safe_dump({k: v for k, v in job.items() if k != "steps"}) for job in wf["jobs"].values()))
+    family_checks = {"image": image_family_checks, "images": images_family_checks}.get(table[repo]["family"])
+    if family_checks:
+        family_checks(f"{repo} forge", {**ghcr_twin(repo), "registry": "forge"}, wf)
+
+# The token expressions the renders carry, evaluated here: what a step reads on each event. They are
+# the rendered strings, not FORGE_PUBLISHES, so a constant that drops the guard fails the table.
 # Python's and/or mirror the expression language's &&/|| on these strings; this checks the logic,
 # not how Forgejo's parser reads it (GitHub, for one, compares strings case-insensitively).
-check("every forge step carries one token expression", len(rendered_tokens) == 1)
-token_expr = next(iter(rendered_tokens))
-check("the token expression is a ${{ }} block", token_expr.startswith("${{ ") and token_expr.endswith(" }}"))
+SECRETS = {"FORGE_REGISTRY_TOKEN": "the-push-token", "FORGE_PACKAGE_READ_TOKEN": "the-read-token"}
 
 
-def step_reads(event, ref):
-    expr = token_expr[4:-3].replace("&&", " and ").replace("||", " or ")
-    names = {"github": type("G", (), {"event_name": event, "ref": ref}),
-             "secrets": type("S", (), {"FORGE_REGISTRY_TOKEN": "the-secret"})}
-    return eval(expr, {"__builtins__": {}}, names)
+def value_of(expr, event, ref):
+    """One `${{ }}` expression on a run: a token reads its secret's value or '', PUBLISH a bool."""
+    py = expr[4:-3].replace("&&", " and ").replace("||", " or ")
+    names = {"github": type("G", (), {"event_name": event, "ref": ref}), "secrets": type("S", (), SECRETS)}
+    return eval(py, {"__builtins__": {}}, names)
 
 
-for event, ref, want in [
-    ("push", "refs/heads/main", True),
-    ("workflow_dispatch", "refs/heads/main", True),
-    ("schedule", "main", True),  # Forgejo hands a schedule the bare branch
-    ("schedule", "refs/heads/main", True),
-    ("workflow_dispatch", "refs/heads/feature", False),
-    ("workflow_dispatch", "main", False),
-    ("push", "refs/heads/feature", False),
-    ("push", "refs/tags/v1.0.0", False),
-    ("pull_request", "refs/pull/3/head", False),
-    ("pull_request", "refs/heads/main", False),
-    ("pull_request_target", "refs/heads/main", False),
-    ("release", "refs/heads/main", False),
-]:
-    check(f"a step on {event} {ref} reads {'the token' if want else 'nothing'}",
-          step_reads(event, ref) == ("the-secret" if want else ""))
+for name in TOKENS:
+    check(f"every forge step carries one {name} expression", len(rendered_tokens[name]) == 1)
+    if len(rendered_tokens[name]) != 1:
+        continue  # the check above failed, and no one expression is left to evaluate
+    expr = next(iter(rendered_tokens[name]))
+    check(f"the {name} expression is a ${{{{ }}}} block", expr.startswith("${{ ") and expr.endswith(" }}"))
+    for event, ref, want in [
+        ("push", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/heads/main", True),
+        ("schedule", "main", True),  # Forgejo hands a schedule the bare branch
+        ("schedule", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/heads/feature", False),
+        ("workflow_dispatch", "main", False),
+        ("push", "refs/heads/feature", False),
+        ("push", "refs/tags/v1.0.0", False),
+        ("pull_request", "refs/pull/3/head", False),
+        ("pull_request", "refs/heads/main", False),
+        ("pull_request_target", "refs/heads/main", False),
+        ("release", "refs/heads/main", False),
+    ]:
+        check(f"a {name} step on {event} {ref} reads {'it' if want else 'nothing'}",
+              value_of(expr, event, ref) == (SECRETS[name] if want else ""))
 
-refuses("an unknown registry", single, {**ghcr_twin(single), "registry": "quay"}, "registry must be one of")
+# Every run of every forge render, through the simulator above: a job that runs holding a token finds
+# it set, so no publish fails on an empty one. The image family's build alone runs where it may not
+# publish, and its script reads PUBLISH, so it must find the token set exactly when PUBLISH is true.
+for (repo, events), text in forge_renders.items():
+    wf = yaml.safe_load(text)
+    where = f"{repo} forge {'+'.join(wf['on'])}"
+    # RUNS' one push is to main, which holds only while the trigger takes no other branch: a branch's
+    # push would read the token empty, and an image on every push would then fail its login there.
+    check(f"{where}: a push runs on main only", "push" not in wf["on"] or wf["on"]["push"] == {"branches": ["main"]})
+    gates = [j for j in wf["jobs"] if "if" not in wf["jobs"][j] and not needs_of(wf["jobs"][j])]
+    holding = [(j, s) for name in TOKENS for j, s in token_steps(wf, name)]
+    wrong = []
+    for (event, ref), (gate, release, build) in itertools.product(RUNS, OUTCOMES):
+        if event not in wf["on"]:
+            continue
+        results, _ = run(wf, event, ref, outcome_of(gates, gate, release, build))
+        for job_id, step in holding:
+            if results[job_id] == "skipped":
+                continue
+            env = step["env"]
+            publish = value_of(env["PUBLISH"], event, ref) if "PUBLISH" in env else True
+            reads = {name: value_of(env[name], event, ref) for name in TOKENS if name in env}
+            if any(bool(value) != publish for value in reads.values()):
+                wrong.append(f"{job_id} on {event} {ref} gate={gate} release={release} build={build}: "
+                             f"PUBLISH={publish}, reads {reads}")
+    check(f"{where}: a job that runs finds its token set exactly when it may publish"
+          + (f" ({len(wrong)} runs, first: {wrong[0]})" if wrong else ""), not wrong)
+
+# The forge's leg and merge against a stub docker that logs each call, takes a login only with the
+# token on stdin and into the script's own config, and answers `manifest inspect` as the registry
+# would: a leg's one manifest, or a list of the legs unless told to serve another.
+for name, script in (("forge leg", rr.FORGE_BUILD_LEG), ("forge merge", rr.FORGE_MERGE_LEGS)):
+    check(f"the {name} script parses", subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0)
+FORGE_STUB = textwrap.dedent("""\
+    #!/bin/bash
+    printf '%s\\n' "$*" >> "$STUB_LOG"
+    list() {
+      printf '{"schemaVersion": 2, "manifests": [{"digest": "%s", "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"}}, {"digest": "%s", "platform": {"architecture": "amd64", "os": "linux"}}]}\\n' "$1" "$2"
+    }
+    case "$1" in
+      login)
+        for a in "$@"; do case "$a" in -p|--password|--password=*) exit 9 ;; esac; done
+        [ "$(cat)" = "$STUB_TOKEN" ] || { echo "login without the token on stdin" >&2; exit 9; }
+        [ -d "$DOCKER_CONFIG" ] && echo "config $DOCKER_CONFIG" >> "$STUB_LOG" ;;
+      build|push) ;;
+      manifest)
+        case "$2" in
+          create) ;;
+          push) [ "$4" != "${STUB_FAIL_PUSH:-}" ] || exit 1; touch "$STUB_LOG.pushed" ;;
+          inspect)
+            if [ "$3" = "--verbose" ]; then
+              [ -z "${STUB_LIST:-}" ] || { printf '[{"Descriptor": {"digest": "%s"}}]\\n' "$STUB_DIGEST"; exit 0; }
+              printf '{"Ref": "%s", "Descriptor": {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "%s", "size": 952, "platform": {"architecture": "%s", "os": "linux"}}}\\n' "$4" "$STUB_DIGEST" "$STUB_ARCH"
+            elif [ -e "$STUB_LOG.pushed" ] && [ -n "${STUB_SERVES:-}" ]; then
+              list "$DIGEST_ARM64" "$STUB_SERVES"
+            else
+              list "$DIGEST_ARM64" "${STUB_LIST_X64:-$DIGEST_X64}"
+            fi ;;
+          *) exit 9 ;;
+        esac ;;
+      *) echo "unexpected docker $*" >&2; exit 9 ;;
+    esac
+    """)
+with tempfile.TemporaryDirectory() as tmp:
+    os.makedirs(f"{tmp}/bin")
+    with open(f"{tmp}/bin/docker", "w") as f:
+        f.write(FORGE_STUB)
+    os.chmod(f"{tmp}/bin/docker", 0o755)
+    subprocess.run(["git", "init", "-q", "-b", "main", f"{tmp}/src"], check=True)
+    subprocess.run(["git", "-C", f"{tmp}/src", "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "c"], check=True)
+    head = subprocess.run(["git", "-C", f"{tmp}/src", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    IMG, ARM, X64 = "forgejo.lepaux.com/dlepaux/x", "sha256:" + "a" * 64, "sha256:" + "b" * 64
+    seen_calls, configs = [], []
+
+    def forge_script(script, **env):
+        """The script's status, its docker calls, and what it wrote to GITHUB_OUTPUT."""
+        log, out = f"{tmp}/log", f"{tmp}/out"
+        for path in (log, f"{log}.pushed", out):
+            if os.path.exists(path):
+                os.remove(path)
+        open(out, "w").close()
+        done = subprocess.run(["bash", "-c", script], cwd=f"{tmp}/src", capture_output=True, text=True, env={
+            "PATH": f"{tmp}/bin:{os.environ['PATH']}", "HOME": tmp, "STUB_LOG": log, "STUB_TOKEN": "the-token",
+            "FORGE_REGISTRY_TOKEN": "the-token", "FORGE_REGISTRY_USER": "dlepaux", "IMAGE": IMG,
+            "GITHUB_OUTPUT": out, "GITHUB_SHA": head, **env})
+        calls = open(log).read().splitlines() if os.path.exists(log) else []
+        seen_calls.extend(calls)
+        configs.extend(c.split(" ", 1)[1] for c in calls if c.startswith("config "))
+        said = done.stdout + done.stderr
+        return done.returncode, [c for c in calls if not c.startswith("config ")], open(out).read(), said
+
+    leg = {"PLATFORM": "linux/arm64", "STUB_ARCH": "arm64", "STUB_DIGEST": ARM}
+    rc, calls, output, _ = forge_script(rr.FORGE_BUILD_LEG, VERSION="1.2.3", **leg)
+    tag = f"{IMG}:1.2.3-arm64"
+    build = next((c for c in calls if c.startswith("build ")), "")
+    check("the forge leg passes", rc == 0)
+    check("the forge leg hands on the digest the registry serves", output == f"digest={ARM}\n")
+    check("the forge leg logs in, builds, pushes its own tag and reads it back",
+          [c.split(" ")[0] for c in calls] == ["login", "build", "push", "manifest"]
+          and calls[2] == f"push {tag}" and calls[3] == f"manifest inspect --verbose {tag}")
+    check("the forge leg builds one plain image of a patched base for its platform",
+          "--pull --platform linux/arm64 --provenance=false " in build and build.endswith(f" --tag {tag} ."))
+    check("a released leg labels its version", "--label org.opencontainers.image.version=1.2.3 " in build)
+    rc, calls, output, _ = forge_script(rr.FORGE_BUILD_LEG, PLATFORM="linux/amd64", STUB_ARCH="amd64", STUB_DIGEST=X64)
+    check("a rebuild's leg tags its commit and claims no version", rc == 0 and output == f"digest={X64}\n"
+          and f"push {IMG}:sha-{head[:7]}-amd64" in calls
+          and "org.opencontainers.image.version" not in next(c for c in calls if c.startswith("build ")))
+    # Each refusal names its own guard, so a guard deleted is not covered by another failing later.
+    for case, env, reason in (
+        ("a manifest list", {**leg, "STUB_LIST": "1"}, "the leg pushed a manifest list"),
+        ("another platform's manifest", {**leg, "STUB_ARCH": "amd64"}, "not linux/arm64"),
+        ("no digest", {**leg, "STUB_DIGEST": ""}, "::error::no image digest: \n"),
+        ("a malformed digest", {**leg, "STUB_DIGEST": "sha256:zz"}, "::error::no image digest: sha256:zz"),
+    ):
+        rc, calls, output, said = forge_script(rr.FORGE_BUILD_LEG, VERSION="1.2.3", **env)
+        check(f"a forge leg whose push reads back as {case} fails on that, handing on nothing",
+              rc != 0 and output == "" and reason in said)
+    rc, calls, output, said = forge_script(rr.FORGE_BUILD_LEG, VERSION="1.2.3", **leg, FORGE_REGISTRY_TOKEN="")
+    check("a forge leg with no token stops before any docker call",
+          rc != 0 and calls == [] and "FORGE_REGISTRY_TOKEN is empty" in said)
+
+    merge = {"DIGEST_ARM64": ARM, "DIGEST_X64": X64}
+
+    def pushed(calls):
+        return [c.split(" ")[3] for c in calls if c.startswith("manifest push --purge ")]
+
+    rc, calls, _, _ = forge_script(rr.FORGE_MERGE_LEGS, VERSION="1.2.3", **merge)
+    tags = [f"{IMG}:sha-{head[:7]}", f"{IMG}:1.2.3", f"{IMG}:1.2", f"{IMG}:latest"]
+    creates = [i for i, c in enumerate(calls) if c.startswith("manifest create ")]
+    pushes = [i for i, c in enumerate(calls) if c.startswith("manifest push ")]
+    check("the forge merge passes, logged in first", rc == 0 and bool(calls) and calls[0].startswith("login "))
+    check("each tag's list is the two legs by digest",
+          [calls[i] for i in creates] == [f"manifest create {t} {IMG}@{ARM} {IMG}@{X64}" for t in tags])
+    check("every list is checked before any tag moves", creates and pushes and max(creates) < min(pushes))
+    check("the tags move in order, :latest last", pushed(calls) == tags)
+    check("each list is read back after it is made and after it is pushed",
+          all(calls[i + 1] == f"manifest inspect {calls[i].split(' ')[-1 if i in pushes else 2]}" for i in creates + pushes))
+    rc, calls, _, _ = forge_script(rr.FORGE_MERGE_LEGS, **merge)
+    check("a rebuild's merge moves its commit's tag and :latest only", rc == 0 and pushed(calls) == [tags[0], tags[-1]])
+    rc, calls, _, said = forge_script(rr.FORGE_MERGE_LEGS, VERSION="1.2.3", **merge, STUB_LIST_X64=ARM)
+    check("a list that is not the legs moves no tag", rc != 0 and pushed(calls) == [] and "not the legs" in said)
+    rc, calls, _, said = forge_script(rr.FORGE_MERGE_LEGS, VERSION="1.2.3", **merge, STUB_SERVES="sha256:" + "c" * 64)
+    check("a push the registry serves otherwise stops the merge there",
+          rc != 0 and pushed(calls) == tags[:1] and "not the legs" in said)
+    rc, calls, _, _ = forge_script(rr.FORGE_MERGE_LEGS, VERSION="1.2.3", **merge, STUB_FAIL_PUSH=tags[2])
+    check("a failed push leaves :latest where it was", rc != 0 and pushed(calls) == tags[:3])
+    rc, calls, _, said = forge_script(rr.FORGE_MERGE_LEGS, VERSION="1.2.3", DIGEST_ARM64="", DIGEST_X64=X64)
+    check("a leg that left no digest stops the forge merge before any docker call",
+          rc == 1 and calls == [] and "a leg left no digest" in said)
+    check("no docker call ever carries the token", seen_calls and not any("the-token" in c for c in seen_calls))
+    check("each script logged in to a config of its own, gone once it exits",
+          configs and all(not c.startswith(f"{tmp}/.docker") and not os.path.exists(c) for c in configs))
+
+for repo in (single, image_family, images_family):
+    refuses(f"an unknown registry ({table[repo]['family']})", repo, {**ghcr_twin(repo), "registry": "quay"},
+            "registry must be one of")
+refuses("a registry on a package", package, {**table[package], "registry": "forge"}, "does not carry")
 for registry in rr.REGISTRIES:
     for key in ("FORGE_REGISTRY_TOKEN", "GHCR_WRITE_TOKEN", "IMAGE"):
         refuses(f"a {registry} image_env setting {key}", single,
@@ -759,17 +958,6 @@ for name, script, word in [
 ]:
     faults = rr.forge_script_faults(script)
     check(f"a forge build script with {name} is refused", any(word in f for f in faults))
-
-every_push = next((r for r, e in table.items() if e.get("image_on_every_push")), None)
-if every_push:
-    refuses("a forge image on every push", every_push, {**ghcr_twin(every_push), "registry": "forge"},
-            "image_on_every_push builds on branches")
-smoked = next((r for r, e in table.items() if "image_smoke" in e), None)
-if smoked:
-    refuses("a forge smoke", smoked, {**ghcr_twin(smoked), "registry": "forge"}, "image_smoke pulls with the push token")
-image_family = next((r for r, e in table.items() if e["family"] == "image"), None)
-if image_family:
-    refuses("a registry on the image family", image_family, {**ghcr_twin(image_family), "registry": "forge"}, "registry")
 
 print(f"{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

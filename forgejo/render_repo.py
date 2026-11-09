@@ -18,6 +18,9 @@ Families:
   verify   gates and nothing after them
   pages    one job that builds a static site, and on main uploads it to the edge and proves it serves
 
+service, image and images push to GHCR, or with `registry: forge` to the forge's registry (HL-696,
+HL-843), where only a run on main reads the push token.
+
 A service is written as three files, one per kind of trigger (SERVICE_FILES, HL-798). Forgejo
 evaluates a job's `if:` only in a runner (services/actions/job_emitter.go, v15.0.11), so a job whose
 condition names another event still held a runner and a cap slot to skip itself: 28% of the forge's
@@ -54,8 +57,8 @@ FAMILY_KEYS = {
     "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke", "site",
                 "image_arch", "image_on_every_push", "deploy_rebuild", "registry"},
     "package": {"family", "gates", "release_install", "release_env"},
-    "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request", "deploy_url"},
-    "images": {"family", "gates", "note", "images", "deploy_url"},
+    "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request", "deploy_url", "registry"},
+    "images": {"family", "gates", "note", "images", "deploy_url", "registry"},
     "tag-release": {"family", "gates", "note", "release_script", "release_timeout"},
     "lint": {"family"},
     "verify": {"family", "gates", "note"},
@@ -197,6 +200,20 @@ FORGE_LOGIN = (
 FORGE_LOGIN_LINE = (
     """printf '%s' "$FORGE_REGISTRY_TOKEN" | docker login forgejo.lepaux.com -u "$FORGE_REGISTRY_USER" --password-stdin\n"""
 )
+# A forge smoke pulls with the owner's read:package token (homelab `packages-read`, which a repo that
+# installs from the forge in CI already carries under this name), never the push token. It is
+# owner-wide too, as Forgejo 15 lets no other account read a private user's packages, so it is
+# guarded as the push token is.
+FORGE_READ_TOKEN = f"${{{{ ({FORGE_PUBLISHES}) && secrets.FORGE_PACKAGE_READ_TOKEN || '' }}}}"
+FORGE_READ_LOGIN = (
+    ': "${FORGE_PACKAGE_READ_TOKEN:?FORGE_PACKAGE_READ_TOKEN is empty: not set on this repo (homelab forgejo_actions_repo_secrets), or the run is not on main}"\n'
+    ': "${FORGE_REGISTRY_USER:?FORGE_REGISTRY_USER is empty: the repo var homelab forgejo_registry_repos sets is missing}"\n'
+    'DOCKER_CONFIG=$(mktemp -d)\n'
+    'export DOCKER_CONFIG\n'
+)
+FORGE_READ_LOGIN_LINE = (
+    """printf '%s' "$FORGE_PACKAGE_READ_TOKEN" | docker login forgejo.lepaux.com -u "$FORGE_REGISTRY_USER" --password-stdin\n"""
+)
 REGISTRIES = ("ghcr", "forge")
 BUILD_LEG = (
     "set -euo pipefail\n"
@@ -240,6 +257,76 @@ MERGE_LEGS = (
     'sys.exit(0 if {"amd64", "arm64"} <= seen else f"manifest has only {sorted(map(str, seen))}")\n'
     "'\n"
     'docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST_ARM64" "$IMAGE@$DIGEST_X64"\n'
+)
+# The forge's legs and merge. Its registry fails `buildx imagetools create`, the GHCR merge's tool
+# (forgejo#780), so each leg pushes one plain manifest under a tag of its own and the merge joins the
+# two by digest with `docker manifest`, as mako-spawner's release does. `docker manifest` joins plain
+# manifests only, so a forge image carries no SBOM or provenance attestation where a GHCR one does:
+# nothing in the fleet reads them, a trade HL-843 records. The leg builds on the runner's own daemon,
+# whose weekly prune (homelab roles/ci-runner) clears the image it leaves there.
+FORGE_BUILD_LEG = (
+    "set -euo pipefail\n"
+    + FORGE_LOGIN +
+    """trap 'rm -rf "$DOCKER_CONFIG"' EXIT\n"""
+    + FORGE_LOGIN_LINE +
+    'sha=$(git rev-parse HEAD)\n'
+    'args=(--build-arg "GIT_SHA=$sha" --build-arg "VERSION=${VERSION:-sha-${sha:0:7}}"\n'
+    '  --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)")\n'
+    "# A released image names its version whether or not its Dockerfile labels one.\n"
+    'if [ -n "${VERSION:-}" ]; then args+=(--label "org.opencontainers.image.version=$VERSION"); fi\n'
+    "# The leg's own tag: the merge reads it by digest, and no host pulls it.\n"
+    'leg="$IMAGE:${VERSION:-sha-${sha:0:7}}-${PLATFORM#linux/}"\n'
+    "# --pull: a rebuild exists to take a patched base, so a cached one must not stand in for it.\n"
+    'docker build --pull --platform "$PLATFORM" --provenance=false "${args[@]}" --tag "$leg" .\n'
+    'docker push "$leg"\n'
+    "# What the registry now serves under that tag: one manifest, for this leg's platform.\n"
+    """digest=$(docker manifest inspect --verbose "$leg" | python3 -I -c '\n"""
+    "import json, os, sys\n"
+    "d = json.load(sys.stdin)\n"
+    "if not isinstance(d, dict):\n"
+    '    sys.exit("the leg pushed a manifest list, which docker manifest cannot join")\n'
+    'p = d["Descriptor"].get("platform", {})\n'
+    'if p.get("os", "") + "/" + p.get("architecture", "") != os.environ["PLATFORM"]:\n'
+    '    sys.exit("the leg pushed " + json.dumps(p) + ", not " + os.environ["PLATFORM"])\n'
+    'print(d["Descriptor"]["digest"])\n'
+    "')\n"
+    '[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest: $digest"; exit 1; }\n'
+    'echo "digest=$digest" >> "$GITHUB_OUTPUT"\n'
+)
+# Every tag's list is made and checked against the legs' digests before any is pushed, and :latest
+# moves last: a list that is not the two legs moves no tag, and a push that fails leaves :latest where
+# it was. --purge drops the local list, so the check after each push reads what the registry serves.
+FORGE_MERGE_LEGS = (
+    "set -euo pipefail\n"
+    'for digest in "$DIGEST_ARM64" "$DIGEST_X64"; do\n'
+    '  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::a leg left no digest: \'$digest\'"; exit 1; }\n'
+    'done\n'
+    + FORGE_LOGIN +
+    """trap 'rm -rf "$DOCKER_CONFIG"' EXIT\n"""
+    + FORGE_LOGIN_LINE +
+    "is_the_legs() {\n"
+    "  python3 -I -c '\n"
+    "import json, os, sys\n"
+    'want = sorted([["linux/arm64", os.environ["DIGEST_ARM64"]], ["linux/amd64", os.environ["DIGEST_X64"]]])\n'
+    "got = sorted([m.get(\"platform\", {}).get(\"os\", \"\") + \"/\" + m.get(\"platform\", {}).get(\"architecture\", \"\"),\n"
+    '              m.get("digest", "")] for m in json.load(sys.stdin).get("manifests", []))\n'
+    'sys.exit(0 if got == want else "the list is " + json.dumps(got) + ", not the legs " + json.dumps(want))\n'
+    "'\n"
+    "}\n"
+    'tags=("$IMAGE:sha-${GITHUB_SHA:0:7}")\n'
+    'if [ -n "${VERSION:-}" ]; then tags+=("$IMAGE:$VERSION"); fi\n'
+    'if [[ "${VERSION:-}" =~ ^([0-9]+)\\.([0-9]+)\\.[0-9]+$ ]]; then\n'
+    '  tags+=("$IMAGE:${BASH_REMATCH[1]}.${BASH_REMATCH[2]}")\n'
+    'fi\n'
+    'tags+=("$IMAGE:latest")\n'
+    'for tag in "${tags[@]}"; do\n'
+    '  docker manifest create "$tag" "$IMAGE@$DIGEST_ARM64" "$IMAGE@$DIGEST_X64"\n'
+    '  docker manifest inspect "$tag" | is_the_legs\n'
+    'done\n'
+    'for tag in "${tags[@]}"; do\n'
+    '  docker manifest push --purge "$tag"\n'
+    '  docker manifest inspect "$tag" | is_the_legs\n'
+    'done\n'
 )
 SPLIT_NOTE = """\
 # One of three files, one per kind of trigger: ci.yml (a push), pull-request.yml, and rebuild.yml (the
@@ -385,10 +472,13 @@ def push_env(repo, entry):
     }
 
 
-# A forge service's own .forgejo/build-image.sh receives the push step's env: IMAGE (the forge path),
+# A forge repo's own .forgejo/build-image.sh receives the push step's env: IMAGE (the forge path),
 # FORGE_REGISTRY_USER and the owner-wide FORGE_REGISTRY_TOKEN. Its contract: push to "$IMAGE", log in
 # with the token on stdin, and hand the token to nothing else, a scanner's pull included (trivy's
-# TRIVY_PASSWORD, a `-e` into another container), since that token could overwrite any image.
+# TRIVY_PASSWORD, a `-e` into another container), since that token could overwrite any image. The
+# image family's script also reads PUBLISH, and the token is set exactly when PUBLISH is true, so it
+# checks the token and logs in past that test only: a pull request's build has neither. An images
+# repo's script names its other images from "$IMAGE" (dinle's worker: "$IMAGE-worker").
 # sync-repos.sh --check holds each forge repo's script to it.
 FORGE_SCRIPT_LOGIN = (
     """printf '%s' "$FORGE_REGISTRY_TOKEN" | docker login forgejo.lepaux.com -u "$FORGE_REGISTRY_USER" --password-stdin"""
@@ -418,19 +508,12 @@ def forge_script_faults(script):
     return faults
 
 
-def for_registry(script, entry):
-    """A GHCR script as written, or the same script logging in to the forge."""
-    if registry_of(entry) == "ghcr":
-        return script
-    assert script.count(GHCR_LOGIN) == 1 and script.count(GHCR_LOGIN_LINE) == 1
-    return script.replace(GHCR_LOGIN, FORGE_LOGIN).replace(GHCR_LOGIN_LINE, FORGE_LOGIN_LINE)
-
-
 def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
     """One leg per architecture, then a job under the plain name that merges their digests, so
     whatever follows `docker` follows the manifest. A failed leg leaves no manifest at all."""
     if "image_env" in entry:
         raise RenderError(f"{repo}: multi_arch carries no image_env, as a leg's build takes only its own args")
+    leg_script, merge_script = (BUILD_LEG, MERGE_LEGS) if registry_of(entry) == "ghcr" else (FORGE_BUILD_LEG, FORGE_MERGE_LEGS)
     needs = guard.get("needs", [])
     # On the forge, push_env names the image, over GHCR's.
     env = {"IMAGE": f"ghcr.io/dlepaux/{repo}", **push_env(repo, entry)}
@@ -446,7 +529,7 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
                 "name": f"Build and push {platform} by digest",
                 "id": "leg",
                 "env": {**env, "PLATFORM": platform},
-                "run": for_registry(BUILD_LEG, entry),
+                "run": leg_script,
             }],
         }
         for arch, platform in IMAGE_PLATFORMS.items()
@@ -458,16 +541,25 @@ def multi_arch_jobs(job_id, repo, entry, guard, checkout, version):
         "needs": ([needs] if isinstance(needs, str) else needs) + list(legs),
         "runs-on": runs_on("medium"),
         "timeout-minutes": 10,
-        "steps": [{"name": "Merge into one manifest", "env": merge_env, "run": for_registry(MERGE_LEGS, entry)}],
+        "steps": [{"name": "Merge into one manifest", "env": merge_env, "run": merge_script}],
     }
     return {**legs, job_id: merge}
 
 
-def smoke_jobs(entry):
+def smoke_jobs(repo, entry):
     """A check of the published image, on each architecture's own hardware: no emulation stands in
-    for the binary a host will run. It uses the token to pull, the repo's only one, under its own config.
-    No condition: docker succeeds only on a release, so needing it is the guard, and the server skips
-    it past a skipped docker without a runner (HL-798)."""
+    for the binary a host will run. On GHCR it pulls with the push token, the repo's only one there; on
+    the forge with the read token (FORGE_READ_TOKEN), as the push token could overwrite any image.
+    Either way under its own config. No condition: docker succeeds only on a release, so needing it is
+    the guard, and the server skips it past a skipped docker without a runner (HL-798)."""
+    if registry_of(entry) == "ghcr":
+        image = "ghcr.io/${{ github.repository }}"
+        credential = {"GHCR_WRITE_TOKEN": "${{ secrets.GHCR_WRITE_TOKEN }}"}
+        login, login_line = GHCR_LOGIN, GHCR_LOGIN_LINE
+    else:
+        image = f"{FORGE_REGISTRY}/dlepaux/{repo}"
+        credential = {"FORGE_REGISTRY_USER": "${{ vars.FORGE_REGISTRY_USER }}", "FORGE_PACKAGE_READ_TOKEN": FORGE_READ_TOKEN}
+        login, login_line = FORGE_READ_LOGIN, FORGE_READ_LOGIN_LINE
     return {
         f"smoke-{arch}": {
             "needs": ["release", "docker"],
@@ -476,16 +568,16 @@ def smoke_jobs(entry):
             "steps": [{
                 "name": f"Smoke {platform}",
                 "env": {
-                    "IMAGE": "ghcr.io/${{ github.repository }}",
+                    "IMAGE": image,
                     "VERSION": "${{ needs.release.outputs.version }}",
                     "PLATFORM": platform,
-                    "GHCR_WRITE_TOKEN": "${{ secrets.GHCR_WRITE_TOKEN }}",
+                    **credential,
                 },
                 "run": (
                     "set -euo pipefail\n"
-                    + GHCR_LOGIN +
+                    + login +
                     """trap 'rm -rf "$DOCKER_CONFIG"' EXIT\n"""
-                    """printf '%s' "$GHCR_WRITE_TOKEN" | docker login ghcr.io -u dlepaux --password-stdin\n"""
+                    + login_line
                     + entry["image_smoke"]
                 ),
             }],
@@ -520,20 +612,11 @@ def every_push_guard(gates, push_only=False):
 
 
 def check_service(repo, entry):
-    if registry_of(entry) not in REGISTRIES:
-        raise RenderError(f"{repo}: registry must be one of {list(REGISTRIES)}")
     # image_env is merged after the push env, so a key in both would replace the credential or the image.
     push_keys = set(push_env(repo, {"registry": "ghcr"})) | set(push_env(repo, {"registry": "forge"}))
     clash = sorted(set(entry.get("image_env", {})) & push_keys)
     if clash:
         raise RenderError(f"{repo}: image_env may not set {clash}, the push step's own credential and image")
-    # A branch push reads the forge token empty, so every branch's image job would fail its login.
-    if registry_of(entry) == "forge" and entry.get("image_on_every_push", False):
-        raise RenderError(f"{repo}: image_on_every_push builds on branches, which the forge token never reaches")
-    # The smoke pulls with the push token, which the forge's is too wide to lend a pull: a forge smoke
-    # needs a read token of its own, which no repo has yet.
-    if registry_of(entry) == "forge" and "image_smoke" in entry:
-        raise RenderError(f"{repo}: image_smoke pulls with the push token, so it is GHCR's until a forge read token is wired")
     if "image_smoke" in entry and not entry.get("multi_arch", False):
         raise RenderError(f"{repo}: image_smoke needs multi_arch, whose legs it checks")
     if entry.get("multi_arch", False) and "image_arch" in entry:
@@ -570,7 +653,7 @@ def service_publishers(repo, entry, gates, events):
         if builds_release:
             jobs.update(multi_arch_jobs("docker", repo, entry, docker_guard, tag_checkout(), version=True))
             if "image_smoke" in entry:
-                jobs.update(smoke_jobs(entry))
+                jobs.update(smoke_jobs(repo, entry))
         if rebuilds:
             jobs.update(multi_arch_jobs("rebuild", repo, entry, rebuild_guard, CHECKOUT, version=False))
         return jobs
@@ -650,22 +733,26 @@ def package_workflow(repo, entry):
 
 
 def image_workflow(repo, entry, deploy_step_run):
-    """A pull request may build, so a review covers what will ship, but never holds the push token."""
+    """A pull request may build, so a review covers what will ship, but never holds the push token.
+    On the forge, PUBLISH is FORGE_PUBLISHES itself, which this family's triggers make the same runs as
+    GHCR's condition, so the token is set exactly when the script may push."""
     gates = gate_jobs(repo, entry)
     job = {"needs": needing(list(gates))}
     if not entry.get("image_on_pull_request", False):
         job["if"] = "github.event_name != 'pull_request'"
+    if registry_of(entry) == "ghcr":
+        publishes = f"{ON_MAIN} && github.event_name != 'pull_request'"
+        env = {
+            "PUBLISH": f"${{{{ {publishes} }}}}",
+            "GHCR_WRITE_TOKEN": "${{ github.event_name != 'pull_request' && secrets.GHCR_WRITE_TOKEN || '' }}",
+        }
+    else:
+        publishes = FORGE_PUBLISHES
+        env = {"PUBLISH": f"${{{{ {publishes} }}}}", **push_env(repo, entry)}
     job.update({
         "runs-on": runs_on("heavy"),
         "timeout-minutes": entry["image_timeout"],
-        "steps": [CHECKOUT, {
-            "name": "Build, and publish from main",
-            "env": {
-                "PUBLISH": f"${{{{ {ON_MAIN} && github.event_name != 'pull_request' }}}}",
-                "GHCR_WRITE_TOKEN": "${{ github.event_name != 'pull_request' && secrets.GHCR_WRITE_TOKEN || '' }}",
-            },
-            "run": BUILD_IMAGE,
-        }],
+        "steps": [CHECKOUT, {"name": "Build, and publish from main", "env": env, "run": BUILD_IMAGE}],
     })
     jobs = {**gates, "image": job}
     if "deploy_url" in entry:
@@ -673,7 +760,7 @@ def image_workflow(repo, entry, deploy_step_run):
         jobs["deploy"] = {
             **deploy_job(deploy_step_run, entry["deploy_url"]),
             "needs": "image",
-            "if": f"{ON_MAIN} && github.event_name != 'pull_request'",
+            "if": publishes,
         }
     workflow = {"name": "CI", "on": GATED_TRIGGERS, "defaults": RUN_DEFAULTS, "jobs": jobs}
     return workflow, note_comment(entry["note"])
@@ -824,6 +911,9 @@ def render_repo(repo, entry, deploy_step_run, events=SERVICE_EVENTS):
     if family not in FAMILY_KEYS:
         raise RenderError(f"{repo}: unknown family {family}")
     checked_keys(repo, entry, FAMILY_KEYS[family], ALWAYS_PRESENT[family])
+    # Only the families whose FAMILY_KEYS carry `registry` get this far with one.
+    if registry_of(entry) not in REGISTRIES:
+        raise RenderError(f"{repo}: registry must be one of {list(REGISTRIES)}")
     if family != "service" and tuple(events) != SERVICE_EVENTS:
         raise RenderError(f"{repo}: only a service is split by event")
     if family == "service":
