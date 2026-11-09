@@ -652,6 +652,8 @@ livrarr-mcp:
       - name: Test
         run: cargo test --locked
   image_timeout: 45
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 shelfwright:
   family: image
   note: |-
@@ -676,6 +678,8 @@ shelfwright:
       - name: Test
         run: cargo test --locked
   image_timeout: 45
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 chat-model:
   family: service
   gates:
@@ -698,6 +702,8 @@ chat-model:
         run: cargo test --locked
   image_timeout: 60
   multi_arch: true
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 curatarr:
   family: image
   note: |-
@@ -753,6 +759,8 @@ dinle:
       arch: x64
       timeout: 60
   deploy_url: https://apps.webhook.lepaux.com/deploy
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 kaneo-mcp:
   family: tag-release
   note: |-
@@ -795,6 +803,8 @@ hermes-image:
         run: bash .forgejo/test-patches.sh
   image_timeout: 45
   image_on_pull_request: true
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 katha:
   family: service
   gates:
@@ -902,6 +912,8 @@ nilufer:
   image_timeout: 60
   deploy_url: https://webhook.lepaux.com/deploy
   deploy_rebuild: true
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 
 dlepaux.github.io:
   family: service
@@ -927,6 +939,8 @@ dlepaux.github.io:
   image_timeout: 60
   deploy_url: https://webhook.lepaux.com/deploy
   deploy_rebuild: true
+  # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
+  registry: forge
 
 getshortlisted-emails:
   family: package
