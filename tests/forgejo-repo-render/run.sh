@@ -798,21 +798,32 @@ for (repo, events), text in forge_renders.items():
 
 # The forge's leg and merge against a stub docker that logs each call, takes a login only with the
 # token on stdin and into the script's own config, and answers `manifest inspect` as the registry
-# would: a leg's one manifest, or a list of the legs unless told to serve another.
+# would: a leg's one manifest, or a list of the legs unless told to serve another. It knows no plain
+# `build` or `push`, so a leg that pushed a tag would fail here.
 for name, script in (("forge leg", rr.FORGE_BUILD_LEG), ("forge merge", rr.FORGE_MERGE_LEGS)):
     check(f"the {name} script parses", subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0)
 FORGE_STUB = textwrap.dedent("""\
     #!/bin/bash
     printf '%s\\n' "$*" >> "$STUB_LOG"
     list() {
-      printf '{"schemaVersion": 2, "manifests": [{"digest": "%s", "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"}}, {"digest": "%s", "platform": {"architecture": "amd64", "os": "linux"}}]}\\n' "$1" "$2"
+      printf '{"schemaVersion": 2, "manifests": [{"digest": "%s", "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"}}, {"digest": "%s", "platform": {"architecture": "%s", "os": "linux"}}]}\\n' "$1" "$2" "${STUB_X64_ARCH:-amd64}"
     }
     case "$1" in
       login)
         for a in "$@"; do case "$a" in -p|--password|--password=*) exit 9 ;; esac; done
         [ "$(cat)" = "$STUB_TOKEN" ] || { echo "login without the token on stdin" >&2; exit 9; }
         [ -d "$DOCKER_CONFIG" ] && echo "config $DOCKER_CONFIG" >> "$STUB_LOG" ;;
-      build|push) ;;
+      buildx)
+        case "$2" in
+          create|rm) ;;
+          build)
+            prev=""
+            for a in "$@"; do
+              [ "$prev" != "--metadata-file" ] || printf '{"containerimage.digest": "%s"}\\n' "$STUB_DIGEST" > "$a"
+              prev="$a"
+            done ;;
+          *) exit 9 ;;
+        esac ;;
       manifest)
         case "$2" in
           create) ;;
@@ -820,11 +831,11 @@ FORGE_STUB = textwrap.dedent("""\
           inspect)
             if [ "$3" = "--verbose" ]; then
               [ -z "${STUB_LIST:-}" ] || { printf '[{"Descriptor": {"digest": "%s"}}]\\n' "$STUB_DIGEST"; exit 0; }
-              printf '{"Ref": "%s", "Descriptor": {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "%s", "size": 952, "platform": {"architecture": "%s", "os": "linux"}}}\\n' "$4" "$STUB_DIGEST" "$STUB_ARCH"
+              printf '{"Ref": "%s", "Descriptor": {"mediaType": "application/vnd.docker.distribution.manifest.v2+json", "digest": "%s", "size": 952, "platform": {"architecture": "%s", "os": "linux"}}}\\n' "$4" "$STUB_DIGEST" "$STUB_ARCH"
             elif [ -e "$STUB_LOG.pushed" ] && [ -n "${STUB_SERVES:-}" ]; then
               list "$DIGEST_ARM64" "$STUB_SERVES"
             else
-              list "$DIGEST_ARM64" "${STUB_LIST_X64:-$DIGEST_X64}"
+              list "$DIGEST_ARM64" "$DIGEST_X64"
             fi ;;
           *) exit 9 ;;
         esac ;;
@@ -853,7 +864,7 @@ with tempfile.TemporaryDirectory() as tmp:
         done = subprocess.run(["bash", "-c", script], cwd=f"{tmp}/src", capture_output=True, text=True, env={
             "PATH": f"{tmp}/bin:{os.environ['PATH']}", "HOME": tmp, "STUB_LOG": log, "STUB_TOKEN": "the-token",
             "FORGE_REGISTRY_TOKEN": "the-token", "FORGE_REGISTRY_USER": "dlepaux", "IMAGE": IMG,
-            "GITHUB_OUTPUT": out, "GITHUB_SHA": head, **env})
+            "GITHUB_OUTPUT": out, "GITHUB_SHA": head, "GITHUB_RUN_ID": "7", "GITHUB_JOB": "docker-arm64", **env})
         calls = open(log).read().splitlines() if os.path.exists(log) else []
         seen_calls.extend(calls)
         configs.extend(c.split(" ", 1)[1] for c in calls if c.startswith("config "))
@@ -861,21 +872,29 @@ with tempfile.TemporaryDirectory() as tmp:
         return done.returncode, [c for c in calls if not c.startswith("config ")], open(out).read(), said
 
     leg = {"PLATFORM": "linux/arm64", "STUB_ARCH": "arm64", "STUB_DIGEST": ARM}
+    builder = "forge-7-docker-arm64"
     rc, calls, output, _ = forge_script(rr.FORGE_BUILD_LEG, VERSION="1.2.3", **leg)
-    tag = f"{IMG}:1.2.3-arm64"
-    build = next((c for c in calls if c.startswith("build ")), "")
+    build = next((c for c in calls if c.startswith("buildx build ")), "")
     check("the forge leg passes", rc == 0)
-    check("the forge leg hands on the digest the registry serves", output == f"digest={ARM}\n")
-    check("the forge leg logs in, builds, pushes its own tag and reads it back",
-          [c.split(" ")[0] for c in calls] == ["login", "build", "push", "manifest"]
-          and calls[2] == f"push {tag}" and calls[3] == f"manifest inspect --verbose {tag}")
-    check("the forge leg builds one plain image of a patched base for its platform",
-          "--pull --platform linux/arm64 --provenance=false " in build and build.endswith(f" --tag {tag} ."))
+    check("the forge leg hands on the digest it pushed", output == f"digest={ARM}\n")
+    check("the forge leg logs in, builds in a builder of its own, reads its digest back and removes the builder",
+          [" ".join(c.split(" ")[:2]) for c in calls]
+          == ["login forgejo.lepaux.com", "buildx create", "buildx build", "manifest inspect", "buildx rm"]
+          and calls[1].startswith(f"buildx create --name {builder} --driver docker-container ")
+          and calls[3] == f"manifest inspect --verbose {IMG}@{ARM}" and calls[4] == f"buildx rm --force {builder}")
+    # By digest and under no tag: a tag a later run of the commit re-pushed would delete the child
+    # every live list built from it names (render_repo.py, FORGE_BUILD_LEG).
+    check("the forge leg pushes one plain image of a patched base for its platform, by digest",
+          build.startswith(f"buildx build --builder {builder} --pull --platform linux/arm64 --provenance=false --sbom=false ")
+          and build.endswith(f" --output type=image,name={IMG},push-by-digest=true,name-canonical=true,push=true,"
+                             "oci-mediatypes=false ."))
+    check("no forge leg call names a tag of the image", calls and not any(f"{IMG}:" in c for c in calls))
     check("a released leg labels its version", "--label org.opencontainers.image.version=1.2.3 " in build)
     rc, calls, output, _ = forge_script(rr.FORGE_BUILD_LEG, PLATFORM="linux/amd64", STUB_ARCH="amd64", STUB_DIGEST=X64)
-    check("a rebuild's leg tags its commit and claims no version", rc == 0 and output == f"digest={X64}\n"
-          and f"push {IMG}:sha-{head[:7]}-amd64" in calls
-          and "org.opencontainers.image.version" not in next(c for c in calls if c.startswith("build ")))
+    build = next((c for c in calls if c.startswith("buildx build ")), "")
+    check("a rebuild's leg builds its commit, claims no version and names no tag", rc == 0 and output == f"digest={X64}\n"
+          and f"--build-arg VERSION=sha-{head[:7]} " in build and "org.opencontainers.image.version" not in build
+          and f"manifest inspect --verbose {IMG}@{X64}" in calls and not any(f"{IMG}:" in c for c in calls))
     # Each refusal names its own guard, so a guard deleted is not covered by another failing later.
     for case, env, reason in (
         ("a manifest list", {**leg, "STUB_LIST": "1"}, "the leg pushed a manifest list"),
@@ -884,8 +903,8 @@ with tempfile.TemporaryDirectory() as tmp:
         ("a malformed digest", {**leg, "STUB_DIGEST": "sha256:zz"}, "::error::no image digest: sha256:zz"),
     ):
         rc, calls, output, said = forge_script(rr.FORGE_BUILD_LEG, VERSION="1.2.3", **env)
-        check(f"a forge leg whose push reads back as {case} fails on that, handing on nothing",
-              rc != 0 and output == "" and reason in said)
+        check(f"a forge leg whose push reads back as {case} fails on that, handing on nothing, its builder removed",
+              rc != 0 and output == "" and reason in said and calls[-1:] == [f"buildx rm --force {builder}"])
     rc, calls, output, said = forge_script(rr.FORGE_BUILD_LEG, VERSION="1.2.3", **leg, FORGE_REGISTRY_TOKEN="")
     check("a forge leg with no token stops before any docker call",
           rc != 0 and calls == [] and "FORGE_REGISTRY_TOKEN is empty" in said)
@@ -908,8 +927,11 @@ with tempfile.TemporaryDirectory() as tmp:
           all(calls[i + 1] == f"manifest inspect {calls[i].split(' ')[-1 if i in pushes else 2]}" for i in creates + pushes))
     rc, calls, _, _ = forge_script(rr.FORGE_MERGE_LEGS, **merge)
     check("a rebuild's merge moves its commit's tag and :latest only", rc == 0 and pushed(calls) == [tags[0], tags[-1]])
-    rc, calls, _, said = forge_script(rr.FORGE_MERGE_LEGS, VERSION="1.2.3", **merge, STUB_LIST_X64=ARM)
-    check("a list that is not the legs moves no tag", rc != 0 and pushed(calls) == [] and "not the legs" in said)
+    # `create` fetches each leg by its digest, so before a push only the platforms can be wrong: here
+    # the x64 leg's digest names an arm64 image.
+    rc, calls, _, said = forge_script(rr.FORGE_MERGE_LEGS, VERSION="1.2.3", **merge, STUB_X64_ARCH="arm64")
+    check("a list whose legs are not one arm64 and one amd64 moves no tag",
+          rc != 0 and pushed(calls) == [] and "not the legs" in said)
     rc, calls, _, said = forge_script(rr.FORGE_MERGE_LEGS, VERSION="1.2.3", **merge, STUB_SERVES="sha256:" + "c" * 64)
     check("a push the registry serves otherwise stops the merge there",
           rc != 0 and pushed(calls) == tags[:1] and "not the legs" in said)

@@ -168,7 +168,7 @@ REBUILD_DEPLOY_NOTE = """\
 """
 # Each architecture builds on its own hardware, since a rootless runner cannot register QEMU (HL-722).
 # A leg's Docker config and builder are its own: the runner keeps one daemon across jobs, and
-# docker-container is the driver that can push by digest with attestations.
+# docker-container is the driver that can push by digest, which each registry's legs do.
 IMAGE_PLATFORMS = {"arm64": "linux/arm64", "x64": "linux/amd64"}
 GHCR_LOGIN = (
     ': "${GHCR_WRITE_TOKEN:?GHCR_WRITE_TOKEN is not set on this repo (homelab forgejo_actions_repo_secrets)}"\n'
@@ -259,28 +259,37 @@ MERGE_LEGS = (
     'docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST_ARM64" "$IMAGE@$DIGEST_X64"\n'
 )
 # The forge's legs and merge. Its registry fails `buildx imagetools create`, the GHCR merge's tool
-# (forgejo#780), so each leg pushes one plain manifest under a tag of its own and the merge joins the
-# two by digest with `docker manifest`, as mako-spawner's release does. `docker manifest` joins plain
-# manifests only, so a forge image carries no SBOM or provenance attestation where a GHCR one does:
-# nothing in the fleet reads them, a trade HL-843 records. The leg builds on the runner's own daemon,
-# whose weekly prune (homelab roles/ci-runner) clears the image it leaves there.
+# (forgejo#780), so each leg pushes one plain manifest and the merge joins the two by digest with
+# `docker manifest`. `docker manifest` joins plain manifests only, so a forge image carries no SBOM or
+# provenance attestation where a GHCR one does: nothing in the fleet reads them, a trade HL-843 records.
+# A leg pushes by digest and under no tag. Forgejo 15 deletes a re-pushed tag's old version with its
+# files at once (createPackageAndVersion), and serves a list's child only while some version holds it,
+# so a leg tag that a later run of the commit re-pushed would pull the child out from under every
+# live list built from it, until that run's merge, or for good if the merge never ran. Untagged, a
+# leg is a `sha256:` version: cleanup rules skip it, and the cleanup cron drops it only once no list
+# names it (homelab roles/forgejo readme, Registry retention). The leg names Docker's media types
+# rather than take the default of the floating BuildKit image its builder runs, so a BuildKit release
+# cannot change the type of what it pushes.
 FORGE_BUILD_LEG = (
     "set -euo pipefail\n"
     + FORGE_LOGIN +
-    """trap 'rm -rf "$DOCKER_CONFIG"' EXIT\n"""
+    'builder="forge-${GITHUB_RUN_ID}-${GITHUB_JOB}"\n'
+    """trap 'docker buildx rm --force "$builder" >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT\n"""
     + FORGE_LOGIN_LINE +
     'sha=$(git rev-parse HEAD)\n'
     'args=(--build-arg "GIT_SHA=$sha" --build-arg "VERSION=${VERSION:-sha-${sha:0:7}}"\n'
     '  --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)")\n'
     "# A released image names its version whether or not its Dockerfile labels one.\n"
     'if [ -n "${VERSION:-}" ]; then args+=(--label "org.opencontainers.image.version=$VERSION"); fi\n'
-    "# The leg's own tag: the merge reads it by digest, and no host pulls it.\n"
-    'leg="$IMAGE:${VERSION:-sha-${sha:0:7}}-${PLATFORM#linux/}"\n'
+    'docker buildx create --name "$builder" --driver docker-container --bootstrap >/dev/null\n'
     "# --pull: a rebuild exists to take a patched base, so a cached one must not stand in for it.\n"
-    'docker build --pull --platform "$PLATFORM" --provenance=false "${args[@]}" --tag "$leg" .\n'
-    'docker push "$leg"\n'
-    "# What the registry now serves under that tag: one manifest, for this leg's platform.\n"
-    """digest=$(docker manifest inspect --verbose "$leg" | python3 -I -c '\n"""
+    'docker buildx build --builder "$builder" --pull --platform "$PLATFORM" \\\n'
+    '  --provenance=false --sbom=false "${args[@]}" --metadata-file "$DOCKER_CONFIG/meta.json" \\\n'
+    '  --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false" .\n'
+    """digest=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "$DOCKER_CONFIG/meta.json")\n"""
+    '[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest: $digest"; exit 1; }\n'
+    "# What the registry now serves under that digest: one manifest, for this leg's platform.\n"
+    """docker manifest inspect --verbose "$IMAGE@$digest" | python3 -I -c '\n"""
     "import json, os, sys\n"
     "d = json.load(sys.stdin)\n"
     "if not isinstance(d, dict):\n"
@@ -288,14 +297,14 @@ FORGE_BUILD_LEG = (
     'p = d["Descriptor"].get("platform", {})\n'
     'if p.get("os", "") + "/" + p.get("architecture", "") != os.environ["PLATFORM"]:\n'
     '    sys.exit("the leg pushed " + json.dumps(p) + ", not " + os.environ["PLATFORM"])\n'
-    'print(d["Descriptor"]["digest"])\n'
-    "')\n"
-    '[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest: $digest"; exit 1; }\n'
+    "'\n"
     'echo "digest=$digest" >> "$GITHUB_OUTPUT"\n'
 )
-# Every tag's list is made and checked against the legs' digests before any is pushed, and :latest
-# moves last: a list that is not the two legs moves no tag, and a push that fails leaves :latest where
-# it was. --purge drops the local list, so the check after each push reads what the registry serves.
+# Every tag's list is made and checked before any is pushed, and :latest moves last. `create` fetches
+# each leg by its digest, so the check before a push proves the platforms: a list that is not one
+# arm64 and one amd64 leg moves no tag. --purge drops the local list, so the check after each push
+# reads what the registry serves, digests and platforms both, and a push that fails leaves the tags
+# not yet pushed, :latest among them, where they were.
 FORGE_MERGE_LEGS = (
     "set -euo pipefail\n"
     'for digest in "$DIGEST_ARM64" "$DIGEST_X64"; do\n'
