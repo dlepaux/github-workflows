@@ -994,7 +994,14 @@ for name, script in [("the old docker push", DOCKER_PUSH_SCRIPT), ("a buildx pus
                      ("a buildx push to type=registry", SCRIPT_HEAD + 'docker buildx build --output type=registry,name="$IMAGE" .\n'),
                      ("the forge leg's own push", SCRIPT_HEAD + rr.FORGE_BUILD_LEG),
                      # bash still runs a last command left on a continuation
-                     ("a last push left on a continuation", SCRIPT_HEAD + 'docker push "$IMAGE" \\')]:
+                     ("a last push left on a continuation", SCRIPT_HEAD + 'docker push "$IMAGE" \\'),
+                     ("docker image push", SCRIPT_HEAD + 'docker build -t "$IMAGE" .\ndocker image push "$IMAGE"\n'),
+                     ("a buildx bake push", SCRIPT_HEAD + 'IMAGE="$IMAGE" docker buildx bake --push\n'),
+                     # a `#` inside quotes or a parameter expansion is no comment
+                     ("a # that is no comment", SCRIPT_HEAD + 'n=${#IMAGE}; docker buildx build -t "$IMAGE" --label "a #b" --push .\n'),
+                     ("a container run before the login, as curatarr's check is",
+                      SCRIPT_HEAD.replace("DOCKER_CONFIG=", 'docker run --rm --entrypoint node "$IMAGE:x" /check.cjs\nDOCKER_CONFIG=')
+                      + 'docker push "$IMAGE"\n')]:
     check(f"a forge build script with {name} passes", rr.forge_script_faults(script) == [])
 for name, script, word in [
     ("a buildx build by digest without push=true", BY_DIGEST_SCRIPT.replace(",push=true", ""), "does not push"),
@@ -1006,6 +1013,14 @@ for name, script, word in [
     ("a by-digest push whose digest is never read", BY_DIGEST_SCRIPT[:BY_DIGEST_SCRIPT.index("digest=$(")], "reads no digest"),
     ("the old shape that only builds", DOCKER_PUSH_SCRIPT.replace('docker push "$IMAGE:sha-${GIT_SHA:0:7}"', "true"),
      "does not push"),
+    # bash ends a command at a comment, and a backslash before a space escapes the space, not the newline.
+    ("--push only in a trailing comment", SCRIPT_HEAD + 'docker buildx build -t "$IMAGE" . # --push\n', "does not push"),
+    ("a backslash then a space before --push", SCRIPT_HEAD + 'docker buildx build -t "$IMAGE" . \\ \n--push\n', "does not push"),
+    # After the login, the config file holds the token as much as the variable does.
+    ("its login config mounted into a container", GOOD_SCRIPT + 'docker run --rm -v "$DOCKER_CONFIG:/root/.docker:ro" scanner "$IMAGE"\n',
+     "hands the registry login on"),
+    ("a config.json passed into a container", GOOD_SCRIPT + 'docker create -v "$HOME/.docker/config.json:/c.json" alpine\n',
+     "hands the registry login on"),
 ]:
     faults = rr.forge_script_faults(script)
     check(f"a forge build script with {name} is refused", any(word in f for f in faults))

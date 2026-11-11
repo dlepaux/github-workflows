@@ -284,6 +284,10 @@ FORGE_BUILD_LEG = (
     "# network=host: the builder's own container network does not use the runner's resolver, so it found\n"
     "# the forge by its public record, hairpinned through the CPE and met /v2's LAN-only rule (a 403;\n"
     "# mako-spawner v5.8.6, MK-1472, HL-877). On the host network it reaches the LAN address, as the daemon does.\n"
+    "# The trade, declared: with no CNI config in the builder, a Dockerfile's RUN steps share that host network\n"
+    "# too, so a build on the runner can reach the runner's own loopback listeners. Only main's pushes and the\n"
+    "# schedule run this leg. Narrowing it (a CNI network for RUN, or the LAN resolver handed to buildkitd)\n"
+    "# needs a test on a runner, so it is left for its own card.\n"
     'docker buildx create --name "$builder" --driver docker-container --driver-opt network=host --bootstrap >/dev/null\n'
     "# --pull: a rebuild exists to take a patched base, so a cached one must not stand in for it.\n"
     'docker buildx build --builder "$builder" --pull --platform "$PLATFORM" \\\n'
@@ -498,30 +502,46 @@ FORGE_SCRIPT_LOGIN = (
 
 
 def forge_script_commands(script):
-    """The script's commands, comment lines dropped and backslash continuations joined, so that a
-    multi-line `docker buildx build` is read as the one command it is."""
-    commands, pending = [], ""
-    for line in script.splitlines():
-        stripped = line.strip()
-        if not pending and (not stripped or stripped.startswith("#")):
+    """The script's commands as bash splits them at newlines: comments dropped (a `#` that starts a word
+    outside quotes, to the end of its line), a backslash-newline joined, and a newline inside quotes
+    kept within its command. So a multi-line `docker buildx build` is read as the one command it is,
+    and neither `... . # --push` nor a backslash followed by a space passes as a push (HL-881)."""
+    commands, cur, quote, i, n = [], [], "", 0, len(script)
+    while i < n:
+        ch = script[i]
+        if quote == "'":
+            quote = "" if ch == "'" else quote
+        elif ch == "\\" and i + 1 < n:
+            if script[i + 1] != "\n":
+                cur.append(script[i:i + 2])
+            i += 2
             continue
-        if stripped.endswith("\\"):
-            pending += stripped[:-1].rstrip() + " "
+        elif quote == '"':
+            quote = "" if ch == '"' else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (not cur or cur[-1][-1] in " \t;&|()"):
+            while i < n and script[i] != "\n":
+                i += 1
             continue
-        commands.append(pending + stripped)
-        pending = ""
-    if pending:
-        commands.append(pending.rstrip())
-    return commands
+        elif ch == "\n":
+            commands.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(" " if ch == "\n" else ch)
+        i += 1
+    commands.append("".join(cur))
+    return [c.strip() for c in commands if c.strip()]
 
 
 def forge_command_pushes(command):
-    """Whether one command pushes an image. A `docker buildx build` pushes only through --push, an
-    --output carrying push=true, or type=registry (which implies it). Without one it only builds, which
-    is how a push-by-digest leg goes wrong when push=true is dropped (HL-881)."""
-    if re.search(r'docker (push|manifest push|buildx imagetools create)\b', command):
+    """Whether one command pushes an image. A `docker buildx build` (or bake) pushes only through
+    --push, an --output carrying push=true, or type=registry (which implies it). Without one it only
+    builds, which is how a push-by-digest leg goes wrong when push=true is dropped (HL-881)."""
+    if re.search(r'docker (image push|push|manifest push|buildx imagetools create)\b', command):
         return True
-    if not re.search(r'docker buildx build\b', command):
+    if not re.search(r'docker buildx (build|bake)\b', command):
         return False
     return bool(re.search(r'--push\b|(?<![\w-])push=true\b|(?<![\w-])type=registry\b', command))
 
@@ -545,6 +565,13 @@ def forge_script_faults(script):
         faults.append("does not push to $IMAGE")
     if FORGE_SCRIPT_LOGIN not in script:
         faults.append("does not log in with the token on stdin")
+    # After the login the token also sits in $DOCKER_CONFIG/config.json, so a container given that
+    # config holds it too. This reads names only: a host tool that finds the exported DOCKER_CONFIG
+    # on its own (a host-side `trivy image` after the login) is beyond a static check, which is why
+    # the contract puts any scan before the login.
+    for cmd in code:
+        if re.search(r'docker (run|create)\b', cmd) and re.search(r'DOCKER_CONFIG|config\.json|\.docker\b', cmd):
+            faults.append(f"hands the registry login on: {cmd}")
     for line in script.splitlines():
         stripped = line.strip()
         if "FORGE_REGISTRY_TOKEN" not in stripped or stripped == FORGE_SCRIPT_LOGIN:
