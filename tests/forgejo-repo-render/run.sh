@@ -980,6 +980,37 @@ for name, script, word in [
 ]:
     faults = rr.forge_script_faults(script)
     check(f"a forge build script with {name} is refused", any(word in f for f in faults))
+# Each shape a port pushes by (HL-881): the old build-then-`docker push`, and MK-1472's untagged
+# push-by-digest leg, whose push is its --output's push=true and whose digest is read from --metadata-file.
+SCRIPT_HEAD = GOOD_SCRIPT[:GOOD_SCRIPT.index("docker buildx build")]
+DOCKER_PUSH_SCRIPT = SCRIPT_HEAD + 'docker build -t "$IMAGE:sha-${GIT_SHA:0:7}" .\ndocker push "$IMAGE:sha-${GIT_SHA:0:7}"\n'
+BY_DIGEST_SCRIPT = SCRIPT_HEAD + (
+    'docker buildx build --builder "$builder" --platform "$PLATFORM" \\\n'
+    '  --provenance=false --metadata-file "$DOCKER_CONFIG/meta.json" \\\n'
+    '  --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" .\n'
+    """digest=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "$DOCKER_CONFIG/meta.json")\n"""
+)
+for name, script in [("the old docker push", DOCKER_PUSH_SCRIPT), ("a buildx push by digest", BY_DIGEST_SCRIPT),
+                     ("a buildx push to type=registry", SCRIPT_HEAD + 'docker buildx build --output type=registry,name="$IMAGE" .\n'),
+                     ("the forge leg's own push", SCRIPT_HEAD + rr.FORGE_BUILD_LEG),
+                     # bash still runs a last command left on a continuation
+                     ("a last push left on a continuation", SCRIPT_HEAD + 'docker push "$IMAGE" \\')]:
+    check(f"a forge build script with {name} passes", rr.forge_script_faults(script) == [])
+for name, script, word in [
+    ("a buildx build by digest without push=true", BY_DIGEST_SCRIPT.replace(",push=true", ""), "does not push"),
+    ("push=true only on a comment line", BY_DIGEST_SCRIPT.replace(",push=true", "")
+     + '# docker buildx build --output "type=image,name=$IMAGE,push=true" .\n', "does not push"),
+    ("push=true on a build that is not buildx's", SCRIPT_HEAD + 'docker build --label push=true -t "$IMAGE" .\n', "does not push"),
+    ("a by-digest push with no --metadata-file", BY_DIGEST_SCRIPT.replace('--metadata-file "$DOCKER_CONFIG/meta.json" ', ""),
+     "reads no digest"),
+    ("a by-digest push whose digest is never read", BY_DIGEST_SCRIPT[:BY_DIGEST_SCRIPT.index("digest=$(")], "reads no digest"),
+    ("the old shape that only builds", DOCKER_PUSH_SCRIPT.replace('docker push "$IMAGE:sha-${GIT_SHA:0:7}"', "true"),
+     "does not push"),
+]:
+    faults = rr.forge_script_faults(script)
+    check(f"a forge build script with {name} is refused", any(word in f for f in faults))
+check("the by-digest output's push=true is the push the check reads, not push-by-digest=true",
+      rr.forge_script_faults(BY_DIGEST_SCRIPT.replace(",push=true", ",push=false")) == ["does not push"])
 
 print(f"{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

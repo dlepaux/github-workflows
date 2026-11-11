@@ -497,6 +497,35 @@ FORGE_SCRIPT_LOGIN = (
 )
 
 
+def forge_script_commands(script):
+    """The script's commands, comment lines dropped and backslash continuations joined, so that a
+    multi-line `docker buildx build` is read as the one command it is."""
+    commands, pending = [], ""
+    for line in script.splitlines():
+        stripped = line.strip()
+        if not pending and (not stripped or stripped.startswith("#")):
+            continue
+        if stripped.endswith("\\"):
+            pending += stripped[:-1].rstrip() + " "
+            continue
+        commands.append(pending + stripped)
+        pending = ""
+    if pending:
+        commands.append(pending.rstrip())
+    return commands
+
+
+def forge_command_pushes(command):
+    """Whether one command pushes an image. A `docker buildx build` pushes only through --push, an
+    --output carrying push=true, or type=registry (which implies it). Without one it only builds, which
+    is how a push-by-digest leg goes wrong when push=true is dropped (HL-881)."""
+    if re.search(r'docker (push|manifest push|buildx imagetools create)\b', command):
+        return True
+    if not re.search(r'docker buildx build\b', command):
+        return False
+    return bool(re.search(r'--push\b|(?<![\w-])push=true\b|(?<![\w-])type=registry\b', command))
+
+
 def forge_script_faults(script):
     """What a forge build script does against that contract, one line per fault; empty if it holds."""
     faults = []
@@ -504,9 +533,14 @@ def forge_script_faults(script):
         faults.append("still names GHCR (ghcr.io or GHCR_WRITE_TOKEN)")
     # A static read, not dataflow: the script must push, and use $IMAGE beyond its `:?` guard. Comments
     # count for neither, and a guard alone once passed as a push (GS-116).
-    code = [ln.strip() for ln in script.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    if not any(re.search(r'docker (push|manifest push|buildx imagetools create)\b|--push\b', ln) for ln in code):
+    code = forge_script_commands(script)
+    if not any(forge_command_pushes(cmd) for cmd in code):
         faults.append("does not push")
+    # An untagged push is reachable only by the digest the build wrote out (MK-1472's legs, HL-881).
+    by_digest = [c for c in code if forge_command_pushes(c) and re.search(r'(?<![\w-])push-by-digest=true\b', c)]
+    reads_digest = any("containerimage.digest" in c for c in code)
+    if by_digest and not (reads_digest and all("--metadata-file" in c for c in by_digest)):
+        faults.append("pushes by digest but reads no digest back from --metadata-file")
     if not any(re.search(r'\$\{?IMAGE\b', ln) and not re.fullmatch(r': "\$\{IMAGE:\?[^}$`]*\}"', ln) for ln in code):
         faults.append("does not push to $IMAGE")
     if FORGE_SCRIPT_LOGIN not in script:
