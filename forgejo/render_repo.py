@@ -281,7 +281,10 @@ FORGE_BUILD_LEG = (
     '  --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)")\n'
     "# A released image names its version whether or not its Dockerfile labels one.\n"
     'if [ -n "${VERSION:-}" ]; then args+=(--label "org.opencontainers.image.version=$VERSION"); fi\n'
-    'docker buildx create --name "$builder" --driver docker-container --bootstrap >/dev/null\n'
+    "# network=host: the builder's own container network does not use the runner's resolver, so it found\n"
+    "# the forge by its public record, hairpinned through the CPE and met /v2's LAN-only rule (a 403;\n"
+    "# mako-spawner v5.8.6, MK-1472, HL-877). On the host network it reaches the LAN address, as the daemon does.\n"
+    'docker buildx create --name "$builder" --driver docker-container --driver-opt network=host --bootstrap >/dev/null\n'
     "# --pull: a rebuild exists to take a patched base, so a cached one must not stand in for it.\n"
     'docker buildx build --builder "$builder" --pull --platform "$PLATFORM" \\\n'
     '  --provenance=false --sbom=false "${args[@]}" --metadata-file "$DOCKER_CONFIG/meta.json" \\\n'

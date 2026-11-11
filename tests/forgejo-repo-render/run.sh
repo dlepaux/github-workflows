@@ -880,7 +880,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the forge leg logs in, builds in a builder of its own, reads its digest back and removes the builder",
           [" ".join(c.split(" ")[:2]) for c in calls]
           == ["login forgejo.lepaux.com", "buildx create", "buildx build", "manifest inspect", "buildx rm"]
-          and calls[1].startswith(f"buildx create --name {builder} --driver docker-container ")
+          and calls[1].startswith(f"buildx create --name {builder} --driver docker-container --driver-opt network=host ")
           and calls[3] == f"manifest inspect --verbose {IMG}@{ARM}" and calls[4] == f"buildx rm --force {builder}")
     # By digest and under no tag: a tag a later run of the commit re-pushed would delete the child
     # every live list built from it names (render_repo.py, FORGE_BUILD_LEG).
