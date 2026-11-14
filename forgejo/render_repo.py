@@ -74,6 +74,8 @@ ALWAYS_PRESENT = {
     "verify": {"family", "gates", "note"},
     "pages": {"family", "gates", "note", "site_dir", "served"},
 }
+# Triggers no workflow may carry (HL-921): each runs a fork's code, or its output, with the repo's secrets.
+FORK_UNSAFE_TRIGGERS = ("pull_request_target", "workflow_run")
 # A service's files are SERVICE_FILES'.
 WORKFLOW_FILE = {
     "package": "ci.yml",
@@ -1005,6 +1007,11 @@ def render_repo(repo, entry, deploy_step_run, events=SERVICE_EVENTS):
         workflow, note = pages_workflow(repo, entry)
     else:
         workflow, note = lint_workflow()
+    # HL-921: agent scopes push to forks of their own, and a fork's pull request runs the fork's code.
+    # pull_request runs it without the repo's secrets; these two run it, or what it left, with them.
+    unsafe = sorted(set(workflow["on"]) & set(FORK_UNSAFE_TRIGGERS))
+    if unsafe:
+        raise RenderError(f"{repo}: {', '.join(unsafe)} would hand a fork's pull request the repo's secrets")
     # Forgejo 15 mails a run only when its workflow opts in, and the forge is these repos' only CI.
     workflow = {"enable-email-notifications": True, **workflow}
     return HEADER + note + yaml.dump(workflow, Dumper=BlockDumper, sort_keys=False, width=1000, allow_unicode=True)

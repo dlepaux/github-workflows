@@ -48,6 +48,22 @@ def checkouts(job):
 
 rendered = {r: yaml.safe_load(rr.render_repo(r, e, DEPLOY)) for r, e in table.items()}
 
+# HL-921: an agent scope proposes its changes from forks, and a fork's pull request runs the fork's code
+# on the forge's runners. pull_request runs it without the repo's secrets. pull_request_target runs it
+# with them, and workflow_run hands a later run with them whatever the first one left. So no rendered
+# workflow uses either, and the render refuses a family that would.
+FORK_UNSAFE = ("pull_request_target", "workflow_run")
+check("no rendered workflow runs on pull_request_target or workflow_run",
+      all(isinstance(wf["on"], dict) and not set(wf["on"]) & set(FORK_UNSAFE) for wf in rendered.values()))
+pkg_repo, pkg_entry = next((r, e) for r, e in table.items() if e.get("family") == "package")
+for trigger in FORK_UNSAFE:
+    saved = rr.GATED_TRIGGERS
+    rr.GATED_TRIGGERS = {**saved, trigger: {}}
+    try:
+        refuses(f"a workflow on {trigger}", pkg_repo, pkg_entry, trigger)
+    finally:
+        rr.GATED_TRIGGERS = saved
+
 for repo, wf in rendered.items():
     for job_id, job in wf["jobs"].items():
         for step in checkouts(job):
