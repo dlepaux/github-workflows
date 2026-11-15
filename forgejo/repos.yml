@@ -389,8 +389,10 @@ homelab-schema:
             console.log('dist loads and parses YAML');
           " "$smoke"
   release_install: true
+  # The forge npm registry's push login (homelab HL-946): owner-wide write:package, so it carries the
+  # guard the image pushes do (render_repo.py FORGE_TOKEN) and is empty off main.
   release_env:
-    NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+    NODE_AUTH_TOKEN: "${{ ((github.event_name == 'schedule' && (github.ref == 'main' || github.ref == 'refs/heads/main')) || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')) && secrets.FORGE_REGISTRY_TOKEN || '' }}"
 srv-apps:
   family: lint
 srv-core:

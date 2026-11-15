@@ -302,6 +302,17 @@ for repo, wf in rendered.items():
     if table[repo]["family"] == "images":
         images_family_checks(repo, table[repo], wf)
 
+# Every env value that reads the owner-wide push token carries FORGE_TOKEN's main-only guard, a
+# hand-written release_env included (homelab HL-946), so no branch or pull request run can hold it.
+for repo, wf in rendered.items():
+    for job_id, job in wf["jobs"].items():
+        for step in job.get("steps", []):
+            for key, value in step.get("env", {}).items():
+                if "secrets.FORGE_REGISTRY_TOKEN" in str(value):
+                    check(f"{repo}/{job_id}/{key}: the push token is guarded", value == rr.FORGE_TOKEN)
+check("homelab-schema publishes with the forge push token",
+      rendered["homelab-schema"]["jobs"]["release"]["steps"][-1]["env"]["NODE_AUTH_TOKEN"] == rr.FORGE_TOKEN)
+
 # The tag-release family: only a pushed tag publishes, past every gate, and a tag runs the gates.
 for repo, wf in rendered.items():
     if table[repo]["family"] != "tag-release":
