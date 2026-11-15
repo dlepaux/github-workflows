@@ -353,7 +353,7 @@ homelab-nginx-generator:
       - checkout
       - name: Install
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.FORGE_PACKAGE_READ_TOKEN }}
         run: npm ci --no-audit --no-fund
       - name: Type check
         run: npm run typecheck
@@ -363,6 +363,14 @@ homelab-nginx-generator:
         run: npm test -- --run
       - name: Build
         run: npm run build
+  # Publishes to the forge npm registry (homelab HL-944), as grafana-generator does: the install reads
+  # the private @dlepaux/homelab-schema with the read token, and only the release step, on main, holds
+  # the owner-wide push token, behind the image pushes' guard (render_repo.py FORGE_TOKEN).
+  release_install: true
+  release_install_env:
+    NODE_AUTH_TOKEN: ${{ secrets.FORGE_PACKAGE_READ_TOKEN }}
+  release_env:
+    NODE_AUTH_TOKEN: "${{ ((github.event_name == 'schedule' && (github.ref == 'main' || github.ref == 'refs/heads/main')) || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')) && secrets.FORGE_REGISTRY_TOKEN || '' }}"
 homelab-schema:
   family: package
   gates:

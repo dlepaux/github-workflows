@@ -320,6 +320,12 @@ check("grafana-generator publishes with the forge push token",
       grafana_release["Run semantic-release (forge)"]["env"]["NODE_AUTH_TOKEN"] == rr.FORGE_TOKEN)
 check("grafana-generator's release install reads with the read token alone",
       grafana_release["Install"].get("env") == {"NODE_AUTH_TOKEN": "${{ secrets.FORGE_PACKAGE_READ_TOKEN }}"})
+# homelab-nginx-generator is the same shape (HL-944).
+nginx_release = {s["name"]: s for s in rendered["homelab-nginx-generator"]["jobs"]["release"]["steps"]}
+check("nginx-generator publishes with the forge push token",
+      nginx_release["Run semantic-release (forge)"]["env"]["NODE_AUTH_TOKEN"] == rr.FORGE_TOKEN)
+check("nginx-generator's release install reads with the read token alone",
+      nginx_release.get("Install", {}).get("env") == {"NODE_AUTH_TOKEN": "${{ secrets.FORGE_PACKAGE_READ_TOKEN }}"})
 check("a package without release_install_env keeps a bare release Install",
       all("env" not in s for s in rendered["homelab-schema"]["jobs"]["release"]["steps"] if s["name"] == "Install"))
 
