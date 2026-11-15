@@ -332,8 +332,11 @@ check("nginx-generator's release install reads with the read token alone",
 # job hands the same token to build-image.sh. @dlepaux installs read the forge, never NPM_TOKEN.
 hub = rendered["homelab-hub"]
 hub_quality = [s.get("name") for s in hub["jobs"]["quality"]["steps"]]
-check("hub quality fetches the sources, generates, then builds",
-      hub_quality[-3:] == ["Fetch the sources", "Generate data", "Build site"])
+# The fetch runs before the install, so no dependency code has run in the workspace when the
+# token's step executes the checked-out script (review of HL-948).
+check("hub quality fetches the sources first, then generates and builds last",
+      hub_quality[1:3] == ["Fetch the sources", "Install"]
+      and hub_quality[-2:] == ["Generate data", "Build site"])
 hub_steps = {s.get("name"): s for s in hub["jobs"]["quality"]["steps"]}
 check("hub's fetch step holds the sources token and nothing else",
       hub_steps["Fetch the sources"]["env"] == {"HUB_SOURCES_READ_TOKEN": "${{ secrets.HUB_SOURCES_READ_TOKEN }}"})
@@ -739,7 +742,7 @@ def npm_carrier(step, name):
     homelab HL-945, HL-948). Those read it unguarded, as NPM_TOKEN did; a registry login never does."""
     env, run = step.get("env", {}), step.get("run", "")
     return (name == "FORGE_PACKAGE_READ_TOKEN" and env.get("NODE_AUTH_TOKEN") == NPM_READ
-            and name not in env and (run.startswith("npm ci") or script_call(run)))
+            and name not in env and (re.fullmatch(r"npm ci( --[a-z-]+)*", run.strip()) or script_call(run)))
 
 
 def token_steps(wf, name):

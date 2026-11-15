@@ -9,6 +9,14 @@ homelab-hub:
       timeout: 20
       steps:
       - checkout
+      # docs/data is not in git (homelab HL-948): the build generates it from origin/main of each
+      # source, read with the hub's own token, which reaches neither homelab nor srv-media. It runs
+      # first, needing no install, so no dependency's install script or test code shares a step
+      # sequence with the token in the workspace before it is used.
+      - name: Fetch the sources
+        env:
+          HUB_SOURCES_READ_TOKEN: ${{ secrets.HUB_SOURCES_READ_TOKEN }}
+        run: node scripts/fetch-sources.mjs .hub-sources
       - name: Install
         env:
           NODE_AUTH_TOKEN: ${{ secrets.FORGE_PACKAGE_READ_TOKEN }}
@@ -21,12 +29,6 @@ homelab-hub:
         run: npm run lint
       - name: Test
         run: npm test
-      # docs/data is not in git (homelab HL-948): the build generates it from origin/main of each
-      # source, read with the hub's own token, which reaches neither homelab nor srv-media.
-      - name: Fetch the sources
-        env:
-          HUB_SOURCES_READ_TOKEN: ${{ secrets.HUB_SOURCES_READ_TOKEN }}
-        run: node scripts/fetch-sources.mjs .hub-sources
       - name: Generate data
         env:
           HUB_SOURCES_DIR: .hub-sources
