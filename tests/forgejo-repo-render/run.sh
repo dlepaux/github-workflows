@@ -162,7 +162,8 @@ for repo, wf in rendered.items():
         elif table[repo]["family"] != "pages":
             # A gate runs on the pull request, so only the read-only install token may reach it.
             names = set(re.findall(r"secrets\.([A-Z_]+)", yaml.safe_dump(job)))
-            check(f"{repo}/{job_id}: a gate holds no write secret", "if" not in job and names <= {"NPM_TOKEN"})
+            check(f"{repo}/{job_id}: a gate holds no write secret",
+                  "if" not in job and names <= {"NPM_TOKEN", "FORGE_PACKAGE_READ_TOKEN"})
 
 # A site builds on a pull request and publishes on main only: the key sits on the guarded step, and
 # what it uploads is what the gates in the same job just built.
@@ -312,6 +313,15 @@ for repo, wf in rendered.items():
                     check(f"{repo}/{job_id}/{key}: the push token is guarded", value == rr.FORGE_TOKEN)
 check("homelab-schema publishes with the forge push token",
       rendered["homelab-schema"]["jobs"]["release"]["steps"][-1]["env"]["NODE_AUTH_TOKEN"] == rr.FORGE_TOKEN)
+# homelab-grafana-generator installs a private package before it publishes (HL-945): its release
+# Install reads with the read token, and the push token stays on the semantic-release step alone.
+grafana_release = {s["name"]: s for s in rendered["homelab-grafana-generator"]["jobs"]["release"]["steps"]}
+check("grafana-generator publishes with the forge push token",
+      grafana_release["Run semantic-release (forge)"]["env"]["NODE_AUTH_TOKEN"] == rr.FORGE_TOKEN)
+check("grafana-generator's release install reads with the read token alone",
+      grafana_release["Install"].get("env") == {"NODE_AUTH_TOKEN": "${{ secrets.FORGE_PACKAGE_READ_TOKEN }}"})
+check("a package without release_install_env keeps a bare release Install",
+      all("env" not in s for s in rendered["homelab-schema"]["jobs"]["release"]["steps"] if s["name"] == "Install"))
 
 # The tag-release family: only a pushed tag publishes, past every gate, and a tag runs the gates.
 for repo, wf in rendered.items():
@@ -471,6 +481,14 @@ lint = next(r for r, e in table.items() if e["family"] == "lint")
 refuses("unknown family", service, {**table[service], "family": "nope"}, "unknown family")
 refuses("unknown repo key", service, {**table[service], "automerge": True}, "does not carry")
 refuses("a package key on a service", service, {**table[service], "release_install": True}, "does not carry")
+refuses("an install env with no release install", package,
+        {**{k: v for k, v in table[package].items() if k != "release_install"}, "release_install_env": {"X": "1"}},
+        "needs release_install")
+refuses("an empty install env", "homelab-grafana-generator",
+        {**table["homelab-grafana-generator"], "release_install_env": {}}, "non-empty mapping")
+refuses("the push token in the release install", "homelab-grafana-generator",
+        {**table["homelab-grafana-generator"], "release_install_env": {"NODE_AUTH_TOKEN": rr.FORGE_TOKEN}},
+        "must not carry FORGE_REGISTRY_TOKEN")
 pages = next(r for r, e in table.items() if e["family"] == "pages")
 refuses("a site with no served proof", pages, {k: v for k, v in table[pages].items() if k != "served"}, "missing")
 refuses("a site split over two jobs", pages, {**table[pages], "gates": {**table[pages]["gates"], "extra": table[pages]["gates"]["publish"]}}, "one job")

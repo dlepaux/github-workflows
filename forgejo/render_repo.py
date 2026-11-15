@@ -56,7 +56,7 @@ GATE_KEYS = GATE_REQUIRED | {"env"}
 FAMILY_KEYS = {
     "service": {"family", "gates", "image_timeout", "image_env", "deploy_url", "multi_arch", "image_smoke", "site",
                 "image_arch", "image_on_every_push", "deploy_rebuild", "registry"},
-    "package": {"family", "gates", "release_install", "release_env"},
+    "package": {"family", "gates", "release_install", "release_install_env", "release_env"},
     "image": {"family", "gates", "note", "image_timeout", "image_on_pull_request", "deploy_url", "registry"},
     "images": {"family", "gates", "note", "images", "deploy_url", "registry"},
     "tag-release": {"family", "gates", "note", "release_script", "release_timeout"},
@@ -203,7 +203,9 @@ FORGE_LOGIN_LINE = (
 # A forge smoke pulls with the owner's read:package token (homelab `packages-read`, which a repo that
 # installs from the forge in CI already carries under this name), never the push token. It is
 # owner-wide too, as Forgejo 15 lets no other account read a private user's packages, so it is
-# guarded as the push token is.
+# guarded as the push token is. The one exception is a gate's `npm ci` of a private @dlepaux package
+# (homelab HL-945): a gate runs on pull requests, so it reads `secrets.FORGE_PACKAGE_READ_TOKEN`
+# unguarded, as GitHub's owner-wide NPM_TOKEN did there before it.
 FORGE_READ_TOKEN = f"${{{{ ({FORGE_PUBLISHES}) && secrets.FORGE_PACKAGE_READ_TOKEN || '' }}}}"
 FORGE_READ_LOGIN = (
     ': "${FORGE_PACKAGE_READ_TOKEN:?FORGE_PACKAGE_READ_TOKEN is empty: not set on this repo (homelab forgejo_actions_repo_secrets), or the run is not on main}"\n'
@@ -393,13 +395,16 @@ def needing(jobs):
     return jobs[0] if len(jobs) == 1 else jobs
 
 
-def release_job(gates, install=False, release_env=None, version_output=False, push_only=False):
-    """`push_only`: the file triggers on a push alone, so the condition is the trigger's already."""
+def release_job(gates, install=False, release_env=None, version_output=False, push_only=False, install_env=None):
+    """`push_only`: the file triggers on a push alone, so the condition is the trigger's already.
+    `install_env`: the Install step's own env, for a package whose dependencies are private (homelab
+    HL-945: a read token), so the push token in release_env never reaches `npm ci`."""
     steps = [RELEASE_CHECKOUT]
     if install:
         # npm publish's prepublishOnly builds, so this job needs the dependencies too. No scripts,
         # as `prepare` would install husky before the release commit, which would then run the hooks.
-        steps.append({"name": "Install", "run": "npm ci --no-audit --no-fund --ignore-scripts"})
+        steps.append({"name": "Install", **({"env": install_env} if install_env else {}),
+                      "run": "npm ci --no-audit --no-fund --ignore-scripts"})
     steps.append({
         "name": "Run semantic-release (forge)",
         "env": {**GIT_AUTH, "FORGEJO_TOKEN": "${{ github.token }}", **(release_env or {})},
@@ -800,8 +805,18 @@ def service_workflow(repo, entry, deploy_step_run, events=SERVICE_EVENTS):
 def package_workflow(repo, entry):
     gates = gate_jobs(repo, entry)
     jobs = dict(gates)
+    install_env = entry.get("release_install_env")
+    if install_env is not None:
+        if not entry.get("release_install", False):
+            raise RenderError(f"{repo}: release_install_env needs release_install: true")
+        if not isinstance(install_env, dict) or not install_env:
+            raise RenderError(f"{repo}: release_install_env must be a non-empty mapping")
+        # An install only reads: the push token stays on the semantic-release step alone.
+        if "FORGE_REGISTRY_TOKEN" in str(install_env):
+            raise RenderError(f"{repo}: release_install_env must not carry FORGE_REGISTRY_TOKEN")
     jobs["release"] = release_job(
-        gates, install=entry.get("release_install", False), release_env=entry.get("release_env"))
+        gates, install=entry.get("release_install", False), release_env=entry.get("release_env"),
+        install_env=install_env)
     return {"name": "CI/CD", "on": GATED_TRIGGERS, "jobs": jobs}, ""
 
 
