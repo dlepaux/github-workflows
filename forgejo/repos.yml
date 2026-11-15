@@ -328,6 +328,13 @@ homelab-grafana-generator:
         run: npm run format:check
       - name: Test
         run: npm run test:coverage
+      - name: Build
+        run: npm run build
+      # Vitest runs the TypeScript source, so it cannot see a bin that does nothing behind
+      # node_modules/.bin's symlink, or a dist/ that fails to load (homelab HL-945). The smoke
+      # runs each packed bin through a symlink, with --workspace and --output-root on the fixtures.
+      - name: Smoke-test the packed bins
+        run: npm run smoke
 homelab-nginx-generator:
   family: package
   gates:
