@@ -162,8 +162,9 @@ for repo, wf in rendered.items():
         elif table[repo]["family"] != "pages":
             # A gate runs on the pull request, so only the read-only install token may reach it.
             names = set(re.findall(r"secrets\.([A-Z_]+)", yaml.safe_dump(job)))
+            # HUB_SOURCES_READ_TOKEN is read:repository on the hub's sources alone (homelab HL-947).
             check(f"{repo}/{job_id}: a gate holds no write secret",
-                  "if" not in job and names <= {"NPM_TOKEN", "FORGE_PACKAGE_READ_TOKEN"})
+                  "if" not in job and names <= {"NPM_TOKEN", "FORGE_PACKAGE_READ_TOKEN", "HUB_SOURCES_READ_TOKEN"})
 
 # A site builds on a pull request and publishes on main only: the key sits on the guarded step, and
 # what it uploads is what the gates in the same job just built.
@@ -326,6 +327,27 @@ check("nginx-generator publishes with the forge push token",
       nginx_release["Run semantic-release (forge)"]["env"]["NODE_AUTH_TOKEN"] == rr.FORGE_TOKEN)
 check("nginx-generator's release install reads with the read token alone",
       nginx_release.get("Install", {}).get("env") == {"NODE_AUTH_TOKEN": "${{ secrets.FORGE_PACKAGE_READ_TOKEN }}"})
+# homelab-hub generates docs/data in CI from origin/main of its sources (homelab HL-948): the
+# quality job fetches them with the hub's own read token, generates, then builds, and the image
+# job hands the same token to build-image.sh. @dlepaux installs read the forge, never NPM_TOKEN.
+hub = rendered["homelab-hub"]
+hub_quality = [s.get("name") for s in hub["jobs"]["quality"]["steps"]]
+check("hub quality fetches the sources, generates, then builds",
+      hub_quality[-3:] == ["Fetch the sources", "Generate data", "Build site"])
+hub_steps = {s.get("name"): s for s in hub["jobs"]["quality"]["steps"]}
+check("hub's fetch step holds the sources token and nothing else",
+      hub_steps["Fetch the sources"]["env"] == {"HUB_SOURCES_READ_TOKEN": "${{ secrets.HUB_SOURCES_READ_TOKEN }}"})
+check("hub's sources token never reaches the run line",
+      "HUB_SOURCES_READ_TOKEN" not in hub_steps["Fetch the sources"]["run"])
+check("hub generates from the fetched checkouts",
+      hub_steps["Generate data"]["env"] == {"HUB_SOURCES_DIR": ".hub-sources"})
+check("hub installs with the forge read token",
+      hub_steps["Install"]["env"] == {"NODE_AUTH_TOKEN": "${{ secrets.FORGE_PACKAGE_READ_TOKEN }}"})
+for job_id in ("docker", "rebuild"):
+    build = {s["name"]: s for s in hub["jobs"][job_id]["steps"]}["Build and push"]
+    check(f"hub {job_id} hands build-image.sh the sources token",
+          build["env"].get("HUB_SOURCES_READ_TOKEN") == "${{ secrets.HUB_SOURCES_READ_TOKEN }}")
+check("hub's render names NPM_TOKEN nowhere", "NPM_TOKEN" not in yaml.safe_dump(hub))
 check("a package without release_install_env keeps a bare release Install",
       all("env" not in s for s in rendered["homelab-schema"]["jobs"]["release"]["steps"] if s["name"] == "Install"))
 
@@ -708,11 +730,27 @@ def script_call(run):
     return re.fullmatch(re.escape(rr.BUILD_IMAGE) + r"( [a-z][a-z0-9-]*)?", run) is not None
 
 
+NPM_READ = "${{ secrets.FORGE_PACKAGE_READ_TOKEN }}"
+
+
+def npm_carrier(step, name):
+    """A step that holds the read token only as npm's install credential: a gate's `npm ci`, or the
+    build script whose image installs @dlepaux packages (render_repo.py's FORGE_READ_TOKEN note,
+    homelab HL-945, HL-948). Those read it unguarded, as NPM_TOKEN did; a registry login never does."""
+    env, run = step.get("env", {}), step.get("run", "")
+    return (name == "FORGE_PACKAGE_READ_TOKEN" and env.get("NODE_AUTH_TOKEN") == NPM_READ
+            and name not in env and (run.startswith("npm ci") or script_call(run)))
+
+
 def token_steps(wf, name):
     for job_id, job in wf["jobs"].items():
         for step in job.get("steps", []):
-            if name in yaml.safe_dump(step):
+            if name in yaml.safe_dump(step) and not npm_carrier(step, name):
                 yield job_id, step
+
+
+def npm_carriers(wf, name):
+    return [s for job in wf["jobs"].values() for s in job.get("steps", []) if npm_carrier(s, name)]
 
 
 single = next(r for r, e in table.items() if e["family"] == "service" and not e.get("multi_arch") and "image_env" not in e)
@@ -742,7 +780,8 @@ for (repo, events), text in forge_renders.items():
     check(f"{where}: no GHCR credential left", "GHCR_WRITE_TOKEN" not in text and "docker login ghcr.io" not in text)
     for name, (guarded, stdin_login, holders) in TOKENS.items():
         # Each mention of the secret is the guarded expression, so no step reads it bare.
-        check(f"{where}: {name} is read only behind FORGE_PUBLISHES", text.count(f"secrets.{name}") == text.count(guarded))
+        check(f"{where}: {name} is read only behind FORGE_PUBLISHES",
+              text.count(f"secrets.{name}") - len(npm_carriers(wf, name)) == text.count(guarded))
         steps = list(token_steps(wf, name))
         for job_id, step in steps:
             env, body = step.get("env", {}), step.get("run", "")

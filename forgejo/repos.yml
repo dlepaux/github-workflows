@@ -11,7 +11,7 @@ homelab-hub:
       - checkout
       - name: Install
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.FORGE_PACKAGE_READ_TOKEN }}
         run: npm ci --no-audit --no-fund
       - name: Type check
         run: npm run typecheck
@@ -19,11 +19,24 @@ homelab-hub:
         run: npm run format:check
       - name: Lint
         run: npm run lint
+      - name: Test
+        run: npm test
+      # docs/data is not in git (homelab HL-948): the build generates it from origin/main of each
+      # source, read with the hub's own token, which reaches neither homelab nor srv-media.
+      - name: Fetch the sources
+        env:
+          HUB_SOURCES_READ_TOKEN: ${{ secrets.HUB_SOURCES_READ_TOKEN }}
+        run: node scripts/fetch-sources.mjs .hub-sources
+      - name: Generate data
+        env:
+          HUB_SOURCES_DIR: .hub-sources
+        run: npm run generate
       - name: Build site
         run: npx vitepress build docs
   image_timeout: 30
   image_env:
-    NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    NODE_AUTH_TOKEN: ${{ secrets.FORGE_PACKAGE_READ_TOKEN }}
+    HUB_SOURCES_READ_TOKEN: ${{ secrets.HUB_SOURCES_READ_TOKEN }}
   deploy_url: https://apps.webhook.lepaux.com/deploy
   # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
   registry: forge
