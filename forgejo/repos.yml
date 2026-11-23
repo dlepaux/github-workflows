@@ -240,6 +240,56 @@ epubarr:
     [ "$minor" = "$patch" ] || { echo "::error::${VERSION%.*} is not $VERSION"; exit 1; }
   # Publishes to the forge registry (HL-843): GitHub and GHCR are leaving (HL-508).
   registry: forge
+scoparr:
+  family: service
+  multi_arch: true
+  gates:
+    quality:
+      class: heavy
+      timeout: 30
+      env:
+        CARGO_TERM_COLOR: always
+        CARGO_INCREMENTAL: '0'
+        RUSTFLAGS: -D warnings
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      - name: Advisory, license, ban and source audit
+        run: cargo deny check
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      # The release writes the new version into Cargo.toml and Cargo.lock; a lock file it left
+      # inconsistent would fail the image build after the version is already published. Without
+      # --no-deps, cargo resolves the lock file, so --locked fails on a stale one; the crates are
+      # cached by the tests above, hence --offline.
+      - name: Release version bump keeps the lock file consistent
+        run: |
+          set -euo pipefail
+          scripts/bump-cargo-version.sh 0.0.0-check
+          cargo metadata --locked --offline --format-version 1 > .metadata.json
+          grep -q '"version":"0.0.0-check"' .metadata.json
+          git checkout -- Cargo.toml Cargo.lock
+  image_timeout: 45
+  image_smoke: |
+    printed=$(docker run --rm --pull always --platform "$PLATFORM" "$IMAGE:$VERSION" --version)
+    label=$(docker image inspect "$IMAGE:$VERSION" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+    echo "$PLATFORM: $printed, label $label"
+    [ "$printed" = "scoparr $VERSION" ] || { echo "::error::$PLATFORM prints '$printed'"; exit 1; }
+    [ "$label" = "$VERSION" ] || { echo "::error::$PLATFORM is labelled '$label'"; exit 1; }
+    minor=$(docker buildx imagetools inspect "$IMAGE:${VERSION%.*}" --format '{{ json .Manifest.Digest }}')
+    patch=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{ json .Manifest.Digest }}')
+    [ "$minor" = "$patch" ] || { echo "::error::${VERSION%.*} is not $VERSION"; exit 1; }
+  # Born on the forge (MED-78): its image goes to the forge registry only, never GHCR.
+  registry: forge
 homelab-webhook:
   family: service
   multi_arch: true
