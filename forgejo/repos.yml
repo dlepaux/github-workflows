@@ -1167,15 +1167,27 @@ the-beret-game:
             echo "RUSTUP_HOME=/home/runner-ci/.rustup"
           } >> "$GITHUB_ENV"
       - checkout
-      # The assets are Git LFS objects, and a plain checkout leaves each one a ~130-byte pointer that
-      # `cargo test` reads as a corrupt glTF. git-lfs sends the checkout's header to the forge's LFS API.
+      # The assets are Git LFS objects, which `cargo test` reads as a corrupt glTF while they are
+      # ~130-byte pointers. The runner's global git-lfs filter smudges them during the checkout, and
+      # that failed run 1 (2026-11-26): the forge's LFS API reads the checkout's `Authorization: token`
+      # header as an LFS JWT and answers 401, though git's own fetch takes it. So the job sets
+      # GIT_LFS_SKIP_SMUDGE, the checkout leaves pointers, and this step fetches them with Basic auth,
+      # which the LFS API takes (the batch endpoint, same token: `token` 401, Basic 200). The header is
+      # built in the environment, never in a command's argv.
       - name: Fetch the LFS assets
         env:
-          GIT_CONFIG_COUNT: "1"
-          GIT_CONFIG_KEY_0: http.${{ github.server_url }}.extraHeader
-          GIT_CONFIG_VALUE_0: "Authorization: token ${{ github.token }}"
+          JOB_TOKEN: ${{ github.token }}
+          LFS_URL: ${{ github.server_url }}/${{ github.repository }}.git/info/lfs
+          SERVER_URL: ${{ github.server_url }}
         run: |
           set -eu
+          unset GIT_LFS_SKIP_SMUDGE
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.${SERVER_URL}.extraHeader"
+          GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$JOB_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_VALUE_0
+          unset JOB_TOKEN
+          git config lfs.url "$LFS_URL"
           git lfs install --local
           git lfs pull
           if git lfs ls-files | grep -q '^[0-9a-f]* - '; then
@@ -1216,6 +1228,8 @@ the-beret-game:
       - name: Dependencies (cargo deny)
         run: cargo deny check
       env:
+        # The checkout leaves LFS pointers, and the step after it fetches them (see there).
+        GIT_LFS_SKIP_SMUDGE: "1"
         # Full debuginfo multiplies the link's peak memory on the Pis, and CI needs only pass or fail.
         # lld keeps the link small; .cargo/config.toml's advice against it is about macOS.
         CARGO_PROFILE_DEV_DEBUG: "0"
