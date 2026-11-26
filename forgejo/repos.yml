@@ -1146,3 +1146,78 @@ vps-edge:
       # A variable referenced in compose but missing from .env.example fails here, not at deploy.
       - name: Compose validity + .env.example drift
         run: bash scripts/check-compose-validity.sh
+
+the-beret-game:
+  family: verify
+  note: |-
+    The game's gate (homelab HL-1116, BRT-18): every check GitHub's `check` job ran, on the forge's arm64 runners.
+    It is the context the béret main's branch rule requires, beside one approval from the other human.
+    Large: a Bevy 0.19 workspace compile passes the lean reservation, and clippy, test and the dummy
+    client each link the whole render graph. The pinned 1.96.0 comes from ci-toolchain's extra channels
+    (homelab group_vars/all.yml), and git-lfs from ci-toolchain too.
+  gates:
+    check:
+      class: large
+      timeout: 80
+      steps:
+      - name: Point at the runner's toolchain
+        run: |
+          {
+            echo "PATH=/home/runner-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+            echo "RUSTUP_HOME=/home/runner-ci/.rustup"
+          } >> "$GITHUB_ENV"
+      - checkout
+      # The assets are Git LFS objects, and a plain checkout leaves each one a ~130-byte pointer that
+      # `cargo test` reads as a corrupt glTF. git-lfs sends the checkout's header to the forge's LFS API.
+      - name: Fetch the LFS assets
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: http.${{ github.server_url }}.extraHeader
+          GIT_CONFIG_VALUE_0: "Authorization: token ${{ github.token }}"
+        run: |
+          set -eu
+          git lfs install --local
+          git lfs pull
+          if git lfs ls-files | grep -q '^[0-9a-f]* - '; then
+            echo "::error::an LFS object is still a pointer after git lfs pull"
+            git lfs ls-files | grep '^[0-9a-f]* - '
+            exit 1
+          fi
+      # rustup installs a channel it lacks instead of failing, and the one it fetches here is broken.
+      - name: Verify the pinned toolchain resolved
+        run: |
+          set -eu
+          rustc --version
+          rustc --version | grep -q '1\.96\.0' || {
+            echo "::error::rust-toolchain.toml pins 1.96.0 but rustc is not that: check ci_toolchain_rust_extra_channels in homelab"
+            exit 1
+          }
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      # The dummy bin has required-features = ["dummy"], so every --workspace command above skips it.
+      - name: Clippy, the scripted dummy client
+        run: cargo clippy -p beret-client --features dummy --all-targets -- -D warnings
+      # Its own invocation, never folded into a --workspace one: cargo unifies features across the
+      # selection, so with the viewer in it the render crates are present anyway and this proves nothing.
+      - name: Assert the dedicated server is render-free
+        run: |
+          set -eu
+          banned='^(wgpu|wgpu-core|wgpu-hal|naga|winit|bevy_render|bevy_pbr|bevy_core_pipeline|bevy_winit|bevy_ui_render|bevy_audio|alsa) '
+          found=$(cargo tree -p beret-server --edges normal --prefix none --format '{p}' | sort -u | grep -E "$banned" || true)
+          if [ -n "$found" ]; then
+            echo "::error::beret-server pulls render crates: the dedicated server must stay headless"
+            echo "$found"
+            exit 1
+          fi
+      - name: Dependencies (cargo deny)
+        run: cargo deny check
+      env:
+        # Full debuginfo multiplies the link's peak memory on the Pis, and CI needs only pass or fail.
+        # lld keeps the link small; .cargo/config.toml's advice against it is about macOS.
+        CARGO_PROFILE_DEV_DEBUG: "0"
+        CARGO_PROFILE_TEST_DEBUG: "0"
+        RUSTFLAGS: -C link-arg=-fuse-ld=lld
