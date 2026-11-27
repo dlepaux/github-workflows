@@ -1175,7 +1175,8 @@ the-beret-game:
       # which the LFS API takes (`token` 401, Basic 200 on the batch endpoint, same token). The
       # credentials come from a credential helper reading the environment, not an extra header: with
       # one, run 5's batch calls passed and every object download failed before reaching Forgejo.
-      # The token never enters a command's argv. GIT_TRACE prints URLs and status codes, not secrets.
+      # The token never enters a command's argv. Never set GIT_TRACE here: the batch response echoes
+      # the request's Authorization into each download action, and the trace prints it to the log.
       - name: Fetch the LFS assets
         env:
           JOB_TOKEN: ${{ github.token }}
@@ -1186,7 +1187,6 @@ the-beret-game:
           git config credential.helper '!f() { echo username=x-access-token; echo "password=$JOB_TOKEN"; }; f'
           git config lfs.url "$LFS_URL"
           git lfs install --local
-          GIT_TRACE=1 git lfs pull 2>&1 | grep -E 'HTTP: [0-9]{3}|Client error|Failed|error' | sort | uniq -c | head -40 || true
           git lfs pull
           if git lfs ls-files | grep -q '^[0-9a-f]* - '; then
             echo "::error::an LFS object is still a pointer after git lfs pull"
